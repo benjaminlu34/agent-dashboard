@@ -1,0 +1,12 @@
+{
+  "name": "@agent-hub/web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "echo \"apps/web scaffolded; implementation lands in milestone slice 6\"",
+    "test": "echo \"No tests configured for apps/web yet\"",
+    "lint": "echo \"No lint configured yet\"",
+    "typecheck": "echo \"No typecheck configured for apps/web yet\""
+  }
+}

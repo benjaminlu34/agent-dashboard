@@ -1,0 +1,12 @@
+{
+  "name": "@agent-hub/api",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "echo \"apps/api scaffolded; implementation lands in milestone slice 3\"",
+    "test": "echo \"No tests configured for apps/api yet\"",
+    "lint": "echo \"No lint configured yet\"",
+    "typecheck": "echo \"No typecheck configured for apps/api yet\""
+  }
+}
