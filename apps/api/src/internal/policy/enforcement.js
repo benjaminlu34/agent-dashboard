@@ -49,6 +49,14 @@ function findRolePermissions(rolePermissions, role) {
   return match ? match[1] : null;
 }
 
+function normalizeCapabilityMap(value) {
+  if (!value || typeof value !== "object") {
+    return {};
+  }
+
+  return Object.fromEntries(Object.entries(value).filter(([, enabled]) => typeof enabled === "boolean"));
+}
+
 export function isRoleAllowed(role, permissionFlag) {
   const { rolePermissions } = POLICY_DATA;
   const permissions = findRolePermissions(rolePermissions, role);
@@ -76,4 +84,18 @@ export function isStatusTransitionAllowed(role, fromStatus, toStatus) {
     allowed,
     automation_allowed: automationAllowed,
   };
+}
+
+export async function getRolePermissions(role, { repoRoot = DEFAULT_REPO_ROOT } = {}) {
+  const { rolePermissions } = await loadPolicies(repoRoot);
+  const permissions = findRolePermissions(rolePermissions, role);
+  if (!permissions || typeof permissions !== "object") {
+    return {};
+  }
+  return permissions;
+}
+
+export async function getAllowedCapabilities(role, { repoRoot = DEFAULT_REPO_ROOT } = {}) {
+  const permissions = await getRolePermissions(role, { repoRoot });
+  return normalizeCapabilityMap(permissions);
 }
