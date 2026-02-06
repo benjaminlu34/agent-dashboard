@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -38,6 +38,11 @@ async function writeBundleFiles(repoRoot) {
 
   await writeFile(join(repoRoot, "AGENTS.md"), "root governance\n", "utf8");
   await writeFile(join(repoRoot, "agents/PLANNER.md"), "planner overlay\n", "utf8");
+  await writeFile(
+    join(repoRoot, "policy/github-project.json"),
+    '{"owner_login":"benjaminlu34","owner_type":"user","project_name":"Codex Task Board"}\n',
+    "utf8",
+  );
   await writeFile(
     join(repoRoot, "policy/project-schema.json"),
     JSON.stringify(
@@ -211,4 +216,32 @@ test("GET /internal/preflight returns FAIL when project schema verification fail
   assert.equal(result.status, "FAIL");
   assert.equal(result.template.path, templatePath);
   assert.equal(result.errors.some((error) => error.source === "project_schema"), true);
+});
+
+test("GET /internal/preflight returns FAIL with project_identity source when github-project policy is missing", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "agent-preflight-project-identity-missing-"));
+  await writeBundleFiles(repoRoot);
+  await mkdir(join(repoRoot, ".github/ISSUE_TEMPLATE"), { recursive: true });
+  await writeFile(join(repoRoot, ".github/ISSUE_TEMPLATE/milestone-task.yml"), "name: Milestone Task\n", "utf8");
+
+  await unlink(join(repoRoot, "policy/github-project.json"));
+
+  const app = buildApp();
+  await registerInternalPreflightRoute(app, {
+    repoRoot,
+    projectSchemaReader: async () => ({ project_name: "", fields: [] }),
+  });
+
+  const reply = buildReply();
+  const result = await app.handler({ query: { role: "planner" } }, reply);
+
+  assert.equal(reply.statusCode, 200);
+  assert.equal(result.status, "FAIL");
+  assert.equal(result.project_schema.status, "FAIL");
+  assert.equal(result.errors.length, 1);
+  assert.deepEqual(result.errors[0], {
+    source: "project_identity",
+    path: "policy/github-project.json",
+    message: "required project identity policy is missing",
+  });
 });

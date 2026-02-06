@@ -1,0 +1,27 @@
+{
+  "Planner": {
+    "can_create_issues": true,
+    "can_set_project_fields": true,
+    "can_write_code": false,
+    "can_open_pr": false,
+    "can_merge": false,
+    "can_close_issues": false
+  },
+  "Executor": {
+    "can_create_issues": false,
+    "can_set_project_fields": false,
+    "can_update_status_only": true,
+    "can_write_code": true,
+    "can_open_pr": true,
+    "can_merge": false,
+    "can_close_issues": false
+  },
+  "Reviewer": {
+    "can_write_code": false,
+    "can_open_pr": false,
+    "can_merge": false,
+    "can_close_issues": false,
+    "can_comment_on_pr": true,
+    "can_request_changes": true
+  }
+}

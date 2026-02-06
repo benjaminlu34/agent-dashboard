@@ -46,30 +46,8 @@ async function runGraphqlQuery({ endpoint, githubToken, query, variables }) {
   return payload.data;
 }
 
-async function resolveOwnerLogin({ endpoint, githubToken }) {
-  const data = await runGraphqlQuery({
-    endpoint,
-    githubToken,
-    query: `
-      query {
-        viewer {
-          login
-        }
-      }
-    `,
-  });
-
-  const login = data?.viewer?.login;
-  if (typeof login !== "string" || login.length === 0) {
-    throw new ProjectSchemaReadError("failed to resolve GitHub viewer login");
-  }
-
-  return login;
-}
-
 export async function readProjectSchemaFromGitHub({
-  projectName,
-  projectOwner,
+  projectIdentity,
   githubToken = process.env.GITHUB_PAT ?? process.env.GITHUB_TOKEN,
   endpoint = GITHUB_GRAPHQL_URL,
 } = {}) {
@@ -77,44 +55,28 @@ export async function readProjectSchemaFromGitHub({
     throw new ProjectSchemaReadError("missing GitHub token for project schema read");
   }
 
-  if (typeof projectName !== "string" || projectName.trim().length === 0) {
-    throw new ProjectSchemaReadError("missing project name");
+  const ownerLogin = typeof projectIdentity?.owner_login === "string" ? projectIdentity.owner_login.trim() : "";
+  const ownerType = typeof projectIdentity?.owner_type === "string" ? projectIdentity.owner_type.trim() : "";
+  const projectName = typeof projectIdentity?.project_name === "string" ? projectIdentity.project_name.trim() : "";
+
+  if (!ownerLogin || !projectName || (ownerType !== "user" && ownerType !== "org")) {
+    throw new ProjectSchemaReadError(
+      "invalid project identity: expected owner_login, owner_type (user|org), and project_name",
+    );
   }
 
-  const ownerLogin =
-    typeof projectOwner === "string" && projectOwner.trim().length > 0
-      ? projectOwner.trim()
-      : await resolveOwnerLogin({ endpoint, githubToken });
+  const queryRoot =
+    ownerType === "user"
+      ? "user(login: $ownerLogin)"
+      : "organization(login: $ownerLogin)";
+  const nodeKey = ownerType === "user" ? "user" : "organization";
 
   const data = await runGraphqlQuery({
     endpoint,
     githubToken,
     query: `
       query($ownerLogin: String!) {
-        user(login: $ownerLogin) {
-          projectsV2(first: 100) {
-            nodes {
-              title
-              fields(first: 100) {
-                nodes {
-                  __typename
-                  ... on ProjectV2Field {
-                    name
-                    dataType
-                  }
-                  ... on ProjectV2SingleSelectField {
-                    name
-                    dataType
-                    options {
-                      name
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-        organization(login: $ownerLogin) {
+        ${queryRoot} {
           projectsV2(first: 100) {
             nodes {
               title
@@ -142,9 +104,9 @@ export async function readProjectSchemaFromGitHub({
     variables: { ownerLogin },
   });
 
-  const projects = data?.user?.projectsV2?.nodes ?? data?.organization?.projectsV2?.nodes;
+  const projects = data?.[nodeKey]?.projectsV2?.nodes;
   if (!Array.isArray(projects)) {
-    throw new ProjectSchemaReadError(`owner not found for project schema read: ${ownerLogin}`);
+    throw new ProjectSchemaReadError(`owner not found for project schema read: ${ownerType}/${ownerLogin}`);
   }
 
   const project = projects.find((entry) => entry?.title === projectName);
@@ -155,6 +117,7 @@ export async function readProjectSchemaFromGitHub({
   return {
     project_name: projectName,
     project_owner: ownerLogin,
+    project_owner_type: ownerType,
     fields: mapProjectFields(project),
   };
 }

@@ -11,6 +11,7 @@ export class AgentContextBundleError extends Error {
 }
 
 const POLICY_JSON_PATHS = new Set([
+  "policy/github-project.json",
   "policy/project-schema.json",
   "policy/transitions.json",
   "policy/role-permissions.json",
@@ -24,6 +25,7 @@ function orderedBundlePaths(role) {
   return [
     "AGENTS.md",
     `agents/${role}.md`,
+    "policy/github-project.json",
     "policy/project-schema.json",
     "policy/transitions.json",
     "policy/role-permissions.json",

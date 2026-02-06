@@ -11,11 +11,11 @@ const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../../");
 const UPPERCASE_ROLE_RE = /^[A-Z][A-Z0-9_]*$/;
 const PROJECT_SCHEMA_PATH = "policy/project-schema.json";
 
-function mapRequiredSchemaToLiveSchema(policySchema, fallbackProjectName) {
+function mapRequiredSchemaToLiveSchema(policySchema, projectIdentity) {
   const requiredFields = Array.isArray(policySchema?.required_fields) ? policySchema.required_fields : [];
 
   return {
-    project_name: policySchema?.project_name ?? fallbackProjectName,
+    project_name: projectIdentity?.project_name ?? policySchema?.project_name,
     fields: requiredFields
       .filter((field) => typeof field?.name === "string" && field.name.length > 0)
       .map((field) => ({
@@ -26,10 +26,10 @@ function mapRequiredSchemaToLiveSchema(policySchema, fallbackProjectName) {
   };
 }
 
-async function readProjectSchemaSnapshot({ repoRoot, projectName }) {
+async function readProjectSchemaSnapshot({ repoRoot, projectIdentity }) {
   const content = await readFile(resolve(repoRoot, PROJECT_SCHEMA_PATH), "utf8");
   const policySchema = JSON.parse(content);
-  return mapRequiredSchemaToLiveSchema(policySchema, projectName);
+  return mapRequiredSchemaToLiveSchema(policySchema, projectIdentity);
 }
 
 function createReplyRecorder() {
@@ -48,7 +48,7 @@ export function buildInternalRunHandler({ repoRoot = DEFAULT_REPO_ROOT, prefligh
     buildPreflightHandler({
       repoRoot,
       // Runner v0 uses local policy snapshot only. Runner v1+ should switch back to live GitHub read-only preflight.
-      projectSchemaReader: ({ projectName }) => readProjectSchemaSnapshot({ repoRoot, projectName }),
+      projectSchemaReader: ({ projectIdentity }) => readProjectSchemaSnapshot({ repoRoot, projectIdentity }),
     });
 
   return async function internalRunHandler(request, reply) {

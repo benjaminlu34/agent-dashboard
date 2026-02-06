@@ -1,0 +1,57 @@
+{
+  "status_field": "Status",
+  "transitions": [
+    {
+      "from": "Backlog",
+      "to": "Ready",
+      "allowed_roles": [
+        "Planner"
+      ]
+    },
+    {
+      "from": "Ready",
+      "to": "In Progress",
+      "allowed_roles": [
+        "Executor"
+      ]
+    },
+    {
+      "from": "In Progress",
+      "to": "In Review",
+      "allowed_roles": [
+        "Executor"
+      ]
+    },
+    {
+      "from": "In Review",
+      "to": "Blocked",
+      "allowed_roles": [
+        "Planner",
+        "Executor"
+      ]
+    },
+    {
+      "from": "Blocked",
+      "to": "Ready",
+      "allowed_roles": [
+        "Planner"
+      ]
+    },
+    {
+      "from": "In Review",
+      "to": "Done",
+      "allowed_roles": [
+        "Human"
+      ],
+      "automation_allowed": false
+    },
+    {
+      "from": "*",
+      "to": "Backlog",
+      "allowed_roles": [
+        "Planner"
+      ],
+      "optional_rollback": true
+    }
+  ]
+}

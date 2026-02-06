@@ -36,6 +36,11 @@ async function writeBundleFiles(repoRoot) {
   await writeFile(join(repoRoot, "AGENTS.md"), "root governance\n", "utf8");
   await writeFile(join(repoRoot, "agents/PLANNER.md"), "planner overlay\n", "utf8");
   await writeFile(
+    join(repoRoot, "policy/github-project.json"),
+    '{"owner_login":"benjaminlu34","owner_type":"user","project_name":"Codex Task Board"}\n',
+    "utf8",
+  );
+  await writeFile(
     join(repoRoot, "policy/project-schema.json"),
     JSON.stringify(
       {

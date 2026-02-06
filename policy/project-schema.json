@@ -1,0 +1,58 @@
+{
+  "project_name": "Codex Task Board",
+  "required_fields": [
+    {
+      "name": "Status",
+      "type": "single_select",
+      "allowed_options": [
+        "Backlog",
+        "Ready",
+        "In Progress",
+        "In Review",
+        "Blocked",
+        "Done"
+      ]
+    },
+    {
+      "name": "Size",
+      "type": "single_select",
+      "allowed_options": [
+        "S",
+        "M",
+        "L"
+      ]
+    },
+    {
+      "name": "Area",
+      "type": "single_select",
+      "allowed_options": [
+        "db",
+        "api",
+        "web",
+        "providers",
+        "infra",
+        "docs"
+      ]
+    },
+    {
+      "name": "Priority",
+      "type": "single_select",
+      "allowed_options": [
+        "P0",
+        "P1",
+        "P2"
+      ]
+    },
+    {
+      "name": "Sprint",
+      "type": "single_select",
+      "allowed_options": [
+        "M1",
+        "M2",
+        "M3",
+        "M4"
+      ]
+    }
+  ],
+  "note": "Automation uses Sprint, not GitHub Milestone"
+}
