@@ -1,0 +1,15 @@
+{
+  "name": "agent-dashboard",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "node apps/api/src/index.js",
+    "test": "node --test apps/api/test/*.test.js"
+  },
+  "dependencies": {
+    "fastify": "^4.26.0"
+  }
+}

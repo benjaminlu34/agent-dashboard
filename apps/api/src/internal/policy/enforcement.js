@@ -68,6 +68,10 @@ export function isRoleAllowed(role, permissionFlag) {
 
 export function isStatusTransitionAllowed(role, fromStatus, toStatus) {
   const { transitions } = POLICY_DATA;
+  return evaluateStatusTransition({ transitions, role, fromStatus, toStatus });
+}
+
+function evaluateStatusTransition({ transitions, role, fromStatus, toStatus }) {
   const transition =
     transitions.find((item) => item.from === fromStatus && item.to === toStatus) ??
     transitions.find((item) => item.from === "*" && item.to === toStatus);
@@ -98,4 +102,19 @@ export async function getRolePermissions(role, { repoRoot = DEFAULT_REPO_ROOT } 
 export async function getAllowedCapabilities(role, { repoRoot = DEFAULT_REPO_ROOT } = {}) {
   const permissions = await getRolePermissions(role, { repoRoot });
   return normalizeCapabilityMap(permissions);
+}
+
+export async function isRoleAllowedForRepo(role, permissionFlag, { repoRoot = DEFAULT_REPO_ROOT } = {}) {
+  const permissions = await getRolePermissions(role, { repoRoot });
+  return permissions[permissionFlag] === true;
+}
+
+export async function isStatusTransitionAllowedForRepo(
+  role,
+  fromStatus,
+  toStatus,
+  { repoRoot = DEFAULT_REPO_ROOT } = {},
+) {
+  const { transitions } = await loadPolicies(repoRoot);
+  return evaluateStatusTransition({ transitions, role, fromStatus, toStatus });
 }
