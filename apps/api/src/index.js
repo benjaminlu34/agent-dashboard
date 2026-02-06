@@ -7,6 +7,7 @@ import { registerInternalRunRoute } from "./routes/internal-run.js";
 import { registerInternalPlanApplyRoute } from "./routes/internal-plan-apply.js";
 import { registerInternalProjectItemUpdateFieldRoute } from "./routes/internal-project-item-update-field.js";
 import { registerInternalAgentContextRoute } from "./routes/internal-agent-context.js";
+import { registerInternalExecutorClaimReadyItemRoute } from "./routes/internal-executor-claim-ready-item.js";
 
 const MODULE_DIRNAME = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../");
@@ -20,6 +21,7 @@ export async function buildApp({ repoRoot = DEFAULT_REPO_ROOT, logger = true } =
   await registerInternalPlanApplyRoute(app, routeOptions);
   await registerInternalProjectItemUpdateFieldRoute(app, routeOptions);
   await registerInternalAgentContextRoute(app, routeOptions);
+  await registerInternalExecutorClaimReadyItemRoute(app, routeOptions);
 
   return app;
 }

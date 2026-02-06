@@ -184,6 +184,18 @@ function parseIssueResult(payload) {
   };
 }
 
+function parseProjectItemFields(fieldValuesNodes) {
+  const fields = {};
+  for (const node of fieldValuesNodes ?? []) {
+    const fieldName = node?.field?.name;
+    const optionName = node?.name;
+    if (isNonEmptyString(fieldName) && isNonEmptyString(optionName)) {
+      fields[fieldName] = optionName;
+    }
+  }
+  return fields;
+}
+
 function requireOptionId(fieldsByName, fieldName, optionName) {
   const field = fieldsByName[fieldName];
   const optionId = field?.options_by_name?.[optionName];
@@ -378,6 +390,205 @@ export async function createGitHubPlanApplyClient({
 
       const fieldName = data?.node?.fieldValueByName?.name;
       return isNonEmptyString(fieldName) ? fieldName : "";
+    },
+
+    async listProjectItems() {
+      const items = [];
+      let cursor = null;
+
+      do {
+        const data = await requestGraphql({
+          token: githubToken,
+          endpoint: graphqlEndpoint,
+          query: `
+            query($projectId: ID!, $cursor: String) {
+              node(id: $projectId) {
+                ... on ProjectV2 {
+                  items(first: 100, after: $cursor) {
+                    pageInfo {
+                      hasNextPage
+                      endCursor
+                    }
+                    nodes {
+                      id
+                      content {
+                        ... on Issue {
+                          number
+                          url
+                          repository {
+                            name
+                            owner {
+                              login
+                            }
+                          }
+                        }
+                      }
+                      fieldValues(first: 50) {
+                        nodes {
+                          ... on ProjectV2ItemFieldSingleSelectValue {
+                            name
+                            field {
+                              ... on ProjectV2SingleSelectField {
+                                name
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          `,
+          variables: {
+            projectId: project.id,
+            cursor,
+          },
+        });
+
+        const connection = data?.node?.items;
+        const nodes = connection?.nodes ?? [];
+
+        for (const node of nodes) {
+          const issueNumber = node?.content?.number;
+          const issueUrl = node?.content?.url;
+          if (!Number.isInteger(issueNumber) || !isNonEmptyString(issueUrl)) {
+            continue;
+          }
+
+          items.push({
+            project_item_id: node.id,
+            issue_number: issueNumber,
+            issue_url: issueUrl,
+            fields: parseProjectItemFields(node?.fieldValues?.nodes),
+          });
+        }
+
+        if (!connection?.pageInfo?.hasNextPage) {
+          break;
+        }
+
+        cursor = connection.pageInfo.endCursor;
+      } while (cursor);
+
+      return items;
+    },
+
+    async listPullRequests({ state = "all" } = {}) {
+      const allowedState = state === "open" || state === "closed" || state === "all" ? state : "all";
+      const all = [];
+      let page = 1;
+
+      while (true) {
+        const payload = await requestJson(
+          `${restEndpoint}/repos/${ownerLogin}/${repositoryName}/pulls?state=${allowedState}&per_page=100&page=${page}`,
+          {
+            method: "GET",
+            token: githubToken,
+          },
+        );
+
+        if (!Array.isArray(payload) || payload.length === 0) {
+          break;
+        }
+
+        for (const pr of payload) {
+          if (!Number.isInteger(pr?.number)) {
+            continue;
+          }
+          all.push({
+            number: pr.number,
+            html_url: pr?.html_url ?? "",
+            body: typeof pr?.body === "string" ? pr.body : "",
+            state: typeof pr?.state === "string" ? pr.state : "",
+          });
+        }
+
+        if (payload.length < 100) {
+          break;
+        }
+
+        page += 1;
+      }
+
+      all.sort((left, right) => left.number - right.number);
+      return all;
+    },
+
+    async listIssueComments({ issueNumber }) {
+      if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+        throw new GitHubPlanApplyError("issueNumber must be a positive integer");
+      }
+
+      const comments = [];
+      let page = 1;
+
+      while (true) {
+        const payload = await requestJson(
+          `${restEndpoint}/repos/${ownerLogin}/${repositoryName}/issues/${issueNumber}/comments?per_page=100&page=${page}`,
+          {
+            method: "GET",
+            token: githubToken,
+          },
+        );
+
+        if (!Array.isArray(payload) || payload.length === 0) {
+          break;
+        }
+
+        for (const comment of payload) {
+          if (!Number.isInteger(comment?.id)) {
+            continue;
+          }
+          comments.push({
+            id: comment.id,
+            body: typeof comment?.body === "string" ? comment.body : "",
+            created_at: typeof comment?.created_at === "string" ? comment.created_at : "",
+            html_url: typeof comment?.html_url === "string" ? comment.html_url : "",
+          });
+        }
+
+        if (payload.length < 100) {
+          break;
+        }
+
+        page += 1;
+      }
+
+      comments.sort((left, right) => left.id - right.id);
+      return comments;
+    },
+
+    async createIssueComment({ issueNumber, body }) {
+      if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+        throw new GitHubPlanApplyError("issueNumber must be a positive integer");
+      }
+      if (!isNonEmptyString(body)) {
+        throw new GitHubPlanApplyError("comment body is required");
+      }
+
+      const payload = await requestJson(
+        `${restEndpoint}/repos/${ownerLogin}/${repositoryName}/issues/${issueNumber}/comments`,
+        {
+          method: "POST",
+          token: githubToken,
+          body: {
+            body,
+          },
+        },
+      );
+
+      if (!Number.isInteger(payload?.id)) {
+        throw new GitHubPlanApplyError("unexpected issue comment response");
+      }
+
+      return {
+        id: payload.id,
+        body: typeof payload?.body === "string" ? payload.body : "",
+        created_at: typeof payload?.created_at === "string" ? payload.created_at : "",
+        html_url: typeof payload?.html_url === "string" ? payload.html_url : "",
+      };
     },
   };
 }
