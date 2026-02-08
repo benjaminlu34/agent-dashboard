@@ -1,15 +1,11 @@
-import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { GitHubTemplateReadError } from "../src/internal/github-template-reader.js";
 import { registerInternalPreflightRoute } from "../src/routes/internal-preflight.js";
-
-function sha256(value) {
-  return createHash("sha256").update(value).digest("hex");
-}
 
 function buildReply() {
   return {
@@ -37,10 +33,10 @@ async function writeBundleFiles(repoRoot) {
   await mkdir(join(repoRoot, "policy"), { recursive: true });
 
   await writeFile(join(repoRoot, "AGENTS.md"), "root governance\n", "utf8");
-  await writeFile(join(repoRoot, "agents/PLANNER.md"), "planner overlay\n", "utf8");
+  await writeFile(join(repoRoot, "agents/ORCHESTRATOR.md"), "orchestrator overlay\n", "utf8");
   await writeFile(
     join(repoRoot, "policy/github-project.json"),
-    '{"owner_login":"benjaminlu34","owner_type":"user","project_name":"Codex Task Board"}\n',
+    '{"owner_login":"benjaminlu34","owner_type":"user","project_name":"Codex Task Board","repository_name":"agent-dashboard"}\n',
     "utf8",
   );
   await writeFile(
@@ -82,19 +78,11 @@ async function writeBundleFiles(repoRoot) {
     "utf8",
   );
   await writeFile(join(repoRoot, "policy/transitions.json"), '{"status_field":"Status"}\n', "utf8");
-  await writeFile(join(repoRoot, "policy/role-permissions.json"), '{"Planner":{"can_create_issues":true}}\n', "utf8");
+  await writeFile(join(repoRoot, "policy/role-permissions.json"), '{"Orchestrator":{"can_create_issues":true}}\n', "utf8");
 }
 
-test("GET /internal/preflight returns PASS with template and FAIL when template is missing", async () => {
-  const templatePath = ".github/ISSUE_TEMPLATE/milestone-task.yml";
-
-  const passRepoRoot = await mkdtemp(join(tmpdir(), "agent-preflight-pass-"));
-  await writeBundleFiles(passRepoRoot);
-  await mkdir(join(passRepoRoot, ".github/ISSUE_TEMPLATE"), { recursive: true });
-  const templateContent = "name: Milestone Task\n";
-  await writeFile(join(passRepoRoot, templatePath), templateContent, "utf8");
-
-  const liveProjectSchema = {
+function buildMatchingProjectSchema() {
+  return {
     project_name: "Codex Task Board",
     fields: [
       {
@@ -124,106 +112,207 @@ test("GET /internal/preflight returns PASS with template and FAIL when template 
       },
     ],
   };
+}
 
-  const projectSchemaReader = async () => liveProjectSchema;
+test("GET /internal/preflight returns PASS when GitHub template metadata and project schema checks pass", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "agent-preflight-pass-"));
+  await writeBundleFiles(repoRoot);
 
-  const passApp = buildApp();
-  await registerInternalPreflightRoute(passApp, { repoRoot: passRepoRoot, projectSchemaReader });
-  assert.equal(passApp.routePath, "/internal/preflight");
+  let templateReadArgs = null;
+  const app = buildApp();
+  await registerInternalPreflightRoute(app, {
+    repoRoot,
+    projectSchemaReader: async () => buildMatchingProjectSchema(),
+    templateMetadataReader: async (args) => {
+      templateReadArgs = args;
+      return {
+        path: ".github/ISSUE_TEMPLATE/milestone-task.yml",
+        size_bytes: 123,
+        sha256: "abc123",
+      };
+    },
+  });
 
-  const passReply = buildReply();
-  const passResult = await passApp.handler({ query: { role: "planner" } }, passReply);
+  const reply = buildReply();
+  const result = await app.handler({ query: { role: "orchestrator" } }, reply);
 
-  assert.equal(passReply.statusCode, 200);
-  assert.equal(passResult.role, "PLANNER");
-  assert.equal(passResult.status, "PASS");
-  assert.deepEqual(passResult.errors, []);
-  assert.deepEqual(passResult.project_schema, { status: "PASS", mismatches: [] });
-  assert.equal(passResult.template.path, templatePath);
-  assert.equal(passResult.template.size_bytes, Buffer.byteLength(templateContent, "utf8"));
-  assert.equal(passResult.template.sha256, sha256(templateContent));
-  assert.equal(typeof passResult.bundle_hash, "string");
-  assert.equal(passResult.bundle_hash.length, 64);
+  assert.equal(reply.statusCode, 200);
+  assert.equal(result.role, "ORCHESTRATOR");
+  assert.equal(result.status, "PASS");
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(result.project_schema, { status: "PASS", mismatches: [] });
+  assert.deepEqual(result.template, {
+    path: ".github/ISSUE_TEMPLATE/milestone-task.yml",
+    size_bytes: 123,
+    sha256: "abc123",
+  });
+  assert.equal(templateReadArgs.owner_login, "benjaminlu34");
+  assert.equal(templateReadArgs.repo_name, "agent-dashboard");
+});
 
-  const failRepoRoot = await mkdtemp(join(tmpdir(), "agent-preflight-fail-"));
-  await writeBundleFiles(failRepoRoot);
+test("GET /internal/preflight returns FAIL when template is missing in target repo", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "agent-preflight-template-missing-"));
+  await writeBundleFiles(repoRoot);
 
-  const failApp = buildApp();
-  await registerInternalPreflightRoute(failApp, { repoRoot: failRepoRoot, projectSchemaReader });
+  const app = buildApp();
+  await registerInternalPreflightRoute(app, {
+    repoRoot,
+    projectSchemaReader: async () => buildMatchingProjectSchema(),
+    templateMetadataReader: async () => {
+      throw new GitHubTemplateReadError("required issue template is missing in target repo", {
+        code: "template_missing",
+      });
+    },
+  });
 
-  const failReply = buildReply();
-  const failResult = await failApp.handler({ query: { role: "PLANNER" } }, failReply);
+  const reply = buildReply();
+  const result = await app.handler({ query: { role: "ORCHESTRATOR" } }, reply);
 
-  assert.equal(failReply.statusCode, 200);
-  assert.equal(failResult.role, "PLANNER");
-  assert.equal(failResult.status, "FAIL");
-  assert.equal(failResult.errors.length, 1);
-  assert.equal(failResult.errors[0].path, templatePath);
-  assert.deepEqual(failResult.project_schema, { status: "PASS", mismatches: [] });
-  assert.equal(failResult.template.path, templatePath);
-  assert.equal(failResult.template.size_bytes, 0);
-  assert.equal(failResult.template.sha256, "");
-  assert.equal(typeof failResult.bundle_hash, "string");
-  assert.equal(failResult.bundle_hash.length, 64);
+  assert.equal(reply.statusCode, 200);
+  assert.equal(result.status, "FAIL");
+  assert.equal(result.template.path, ".github/ISSUE_TEMPLATE/milestone-task.yml");
+  assert.equal(result.errors.length, 1);
+  assert.equal(result.errors[0].source, "template");
+  assert.equal(result.errors[0].code, "template_missing");
+  assert.equal(result.errors[0].message, "required issue template is missing in target repo");
+});
+
+test("GET /internal/preflight returns FAIL when template transient retries are exhausted", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "agent-preflight-template-transient-"));
+  await writeBundleFiles(repoRoot);
+
+  const app = buildApp();
+  await registerInternalPreflightRoute(app, {
+    repoRoot,
+    projectSchemaReader: async () => buildMatchingProjectSchema(),
+    templateMetadataReader: async () => {
+      throw new GitHubTemplateReadError("template fetch transient failures exhausted retries", {
+        code: "template_fetch_transient_exhausted",
+      });
+    },
+  });
+
+  const reply = buildReply();
+  const result = await app.handler({ query: { role: "ORCHESTRATOR" } }, reply);
+
+  assert.equal(reply.statusCode, 200);
+  assert.equal(result.status, "FAIL");
+  assert.equal(result.errors[0].code, "template_fetch_transient_exhausted");
 });
 
 test("GET /internal/preflight returns FAIL when project schema verification fails", async () => {
-  const templatePath = ".github/ISSUE_TEMPLATE/milestone-task.yml";
   const repoRoot = await mkdtemp(join(tmpdir(), "agent-preflight-schema-fail-"));
   await writeBundleFiles(repoRoot);
-  await mkdir(join(repoRoot, ".github/ISSUE_TEMPLATE"), { recursive: true });
-  await writeFile(join(repoRoot, templatePath), "name: Milestone Task\n", "utf8");
-
-  const failingSchemaReader = async () => ({
-    project_name: "Codex Task Board",
-    fields: [
-      {
-        name: "Status",
-        type: "single_select",
-        options: ["Backlog", "Ready", "In Progress", "In Review", "Blocked", "Done"],
-      },
-      {
-        name: "Size",
-        type: "single_select",
-        options: ["S", "L", "M"],
-      },
-      {
-        name: "Area",
-        type: "single_select",
-        options: ["db", "api", "web", "providers", "infra", "docs"],
-      },
-      {
-        name: "Priority",
-        type: "single_select",
-        options: ["P0", "P1", "P2"],
-      },
-      {
-        name: "Sprint",
-        type: "single_select",
-        options: ["M1", "M2", "M3", "M4"],
-      },
-    ],
-  });
 
   const app = buildApp();
-  await registerInternalPreflightRoute(app, { repoRoot, projectSchemaReader: failingSchemaReader });
+  await registerInternalPreflightRoute(app, {
+    repoRoot,
+    projectSchemaReader: async () => ({
+      project_name: "Codex Task Board",
+      fields: [
+        {
+          name: "Status",
+          type: "single_select",
+          options: ["Backlog", "Ready", "In Progress", "In Review", "Blocked", "Done"],
+        },
+        {
+          name: "Size",
+          type: "single_select",
+          options: ["S", "L", "M"],
+        },
+      ],
+    }),
+    templateMetadataReader: async () => ({
+      path: ".github/ISSUE_TEMPLATE/milestone-task.yml",
+      size_bytes: 1,
+      sha256: "x",
+    }),
+  });
 
   const routeReply = buildReply();
-  const result = await app.handler({ query: { role: "planner" } }, routeReply);
+  const result = await app.handler({ query: { role: "orchestrator" } }, routeReply);
 
   assert.equal(routeReply.statusCode, 200);
   assert.equal(result.project_schema.status, "FAIL");
   assert.equal(result.status, "FAIL");
-  assert.equal(result.template.path, templatePath);
   assert.equal(result.errors.some((error) => error.source === "project_schema"), true);
+});
+
+test("GET /internal/preflight uses TARGET_* env override instead of policy/github-project.json identity", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "agent-preflight-target-override-"));
+  await writeBundleFiles(repoRoot);
+
+  let templateReadArgs = null;
+  let schemaReadArgs = null;
+
+  const app = buildApp();
+  await registerInternalPreflightRoute(app, {
+    repoRoot,
+    env: {
+      TARGET_OWNER_LOGIN: "target-owner",
+      TARGET_OWNER_TYPE: "org",
+      TARGET_REPO_NAME: "target-repo",
+      TARGET_PROJECT_NAME: "Target Board",
+      TARGET_TEMPLATE_PATH: ".github/ISSUE_TEMPLATE/custom.yml",
+      TARGET_REF: "main",
+    },
+    projectSchemaReader: async ({ projectIdentity }) => {
+      schemaReadArgs = projectIdentity;
+      return { project_name: "Codex Task Board", fields: [] };
+    },
+    templateMetadataReader: async (args) => {
+      templateReadArgs = args;
+      return {
+        path: args.path,
+        size_bytes: 32,
+        sha256: "override",
+      };
+    },
+  });
+
+  const reply = buildReply();
+  await app.handler({ query: { role: "ORCHESTRATOR" } }, reply);
+
+  assert.deepEqual(schemaReadArgs, {
+    owner_login: "target-owner",
+    owner_type: "org",
+    project_name: "Target Board",
+  });
+  assert.equal(templateReadArgs.repo_name, "target-repo");
+  assert.equal(templateReadArgs.path, ".github/ISSUE_TEMPLATE/custom.yml");
+  assert.equal(templateReadArgs.ref, "main");
+});
+
+test("GET /internal/preflight fails closed with missing TARGET_* vars list when override is partial", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "agent-preflight-target-partial-"));
+  await writeBundleFiles(repoRoot);
+
+  const app = buildApp();
+  await registerInternalPreflightRoute(app, {
+    repoRoot,
+    env: {
+      TARGET_OWNER_LOGIN: "only-owner",
+    },
+    projectSchemaReader: async () => buildMatchingProjectSchema(),
+    templateMetadataReader: async () => ({
+      path: ".github/ISSUE_TEMPLATE/milestone-task.yml",
+      size_bytes: 1,
+      sha256: "x",
+    }),
+  });
+
+  const reply = buildReply();
+  const result = await app.handler({ query: { role: "ORCHESTRATOR" } }, reply);
+
+  assert.equal(reply.statusCode, 200);
+  assert.equal(result.status, "FAIL");
+  assert.equal(result.errors[0].code, "target_identity_missing_env");
+  assert.deepEqual(result.errors[0].missing, ["TARGET_OWNER_TYPE", "TARGET_REPO_NAME", "TARGET_PROJECT_NAME"]);
 });
 
 test("GET /internal/preflight returns FAIL with project_identity source when github-project policy is missing", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "agent-preflight-project-identity-missing-"));
   await writeBundleFiles(repoRoot);
-  await mkdir(join(repoRoot, ".github/ISSUE_TEMPLATE"), { recursive: true });
-  await writeFile(join(repoRoot, ".github/ISSUE_TEMPLATE/milestone-task.yml"), "name: Milestone Task\n", "utf8");
-
   await unlink(join(repoRoot, "policy/github-project.json"));
 
   const app = buildApp();
@@ -233,7 +322,7 @@ test("GET /internal/preflight returns FAIL with project_identity source when git
   });
 
   const reply = buildReply();
-  const result = await app.handler({ query: { role: "planner" } }, reply);
+  const result = await app.handler({ query: { role: "orchestrator" } }, reply);
 
   assert.equal(reply.statusCode, 200);
   assert.equal(result.status, "FAIL");
@@ -242,6 +331,27 @@ test("GET /internal/preflight returns FAIL with project_identity source when git
   assert.deepEqual(result.errors[0], {
     source: "project_identity",
     path: "policy/github-project.json",
+    code: "target_identity_error",
     message: "required project identity policy is missing",
+  });
+});
+
+test("GET /internal/preflight returns 500 when role bundle is missing (PLANNER removed)", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "agent-preflight-planner-removed-"));
+  await writeBundleFiles(repoRoot);
+
+  const app = buildApp();
+  await registerInternalPreflightRoute(app, {
+    repoRoot,
+    projectSchemaReader: async () => ({ project_name: "Codex Task Board", fields: [] }),
+  });
+
+  const reply = buildReply();
+  const result = await app.handler({ query: { role: "PLANNER" } }, reply);
+
+  assert.equal(reply.statusCode, 500);
+  assert.deepEqual(result, {
+    error: "required file is missing",
+    path: "agents/PLANNER.md",
   });
 });

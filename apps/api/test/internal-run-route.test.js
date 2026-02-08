@@ -6,8 +6,6 @@ import test from "node:test";
 
 import { registerInternalRunRoute } from "../src/routes/internal-run.js";
 
-const TEMPLATE_PATH = ".github/ISSUE_TEMPLATE/milestone-task.yml";
-
 function buildReply() {
   return {
     statusCode: 200,
@@ -34,10 +32,10 @@ async function writeBundleFiles(repoRoot) {
   await mkdir(join(repoRoot, "policy"), { recursive: true });
 
   await writeFile(join(repoRoot, "AGENTS.md"), "root governance\n", "utf8");
-  await writeFile(join(repoRoot, "agents/PLANNER.md"), "planner overlay\n", "utf8");
+  await writeFile(join(repoRoot, "agents/ORCHESTRATOR.md"), "orchestrator overlay\n", "utf8");
   await writeFile(
     join(repoRoot, "policy/github-project.json"),
-    '{"owner_login":"benjaminlu34","owner_type":"user","project_name":"Codex Task Board"}\n',
+    '{"owner_login":"benjaminlu34","owner_type":"user","project_name":"Codex Task Board","repository_name":"agent-dashboard"}\n',
     "utf8",
   );
   await writeFile(
@@ -83,7 +81,7 @@ async function writeBundleFiles(repoRoot) {
     join(repoRoot, "policy/role-permissions.json"),
     JSON.stringify(
       {
-        Planner: {
+        Orchestrator: {
           can_create_issues: true,
           can_set_project_fields: true,
           can_write_code: false,
@@ -102,8 +100,6 @@ async function writeBundleFiles(repoRoot) {
 test("POST /internal/run returns 400 when role is missing", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-run-400-"));
   await writeBundleFiles(repoRoot);
-  await mkdir(join(repoRoot, ".github/ISSUE_TEMPLATE"), { recursive: true });
-  await writeFile(join(repoRoot, TEMPLATE_PATH), "name: Milestone Task\n", "utf8");
 
   const app = buildApp();
   await registerInternalRunRoute(app, { repoRoot });
@@ -121,33 +117,51 @@ test("POST /internal/run returns 409 with preflight payload when preflight fails
   await writeBundleFiles(repoRoot);
 
   const app = buildApp();
-  await registerInternalRunRoute(app, { repoRoot });
+  await registerInternalRunRoute(app, {
+    repoRoot,
+    preflightHandler: async () => ({
+      role: "ORCHESTRATOR",
+      bundle_hash: "bundle-hash",
+      template: { path: ".github/ISSUE_TEMPLATE/milestone-task.yml", size_bytes: 0, sha256: "" },
+      project_schema: { status: "PASS", mismatches: [] },
+      status: "FAIL",
+      errors: [{ source: "template", code: "template_missing", path: ".github/ISSUE_TEMPLATE/milestone-task.yml" }],
+    }),
+  });
 
   const reply = buildReply();
-  const result = await app.handler({ body: { role: "planner", task: "Implement task runner" } }, reply);
+  const result = await app.handler({ body: { role: "orchestrator", task: "Implement task runner" } }, reply);
 
   assert.equal(reply.statusCode, 409);
   assert.equal(result.status, "FAIL");
-  assert.equal(result.template.path, TEMPLATE_PATH);
+  assert.equal(result.template.path, ".github/ISSUE_TEMPLATE/milestone-task.yml");
   assert.equal(result.project_schema.status, "PASS");
-  assert.equal(result.errors.some((error) => error.path === TEMPLATE_PATH), true);
+  assert.equal(result.errors.some((error) => error.path === ".github/ISSUE_TEMPLATE/milestone-task.yml"), true);
 });
 
 test("POST /internal/run returns READY when preflight passes", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-run-200-"));
   await writeBundleFiles(repoRoot);
-  await mkdir(join(repoRoot, ".github/ISSUE_TEMPLATE"), { recursive: true });
-  await writeFile(join(repoRoot, TEMPLATE_PATH), "name: Milestone Task\n", "utf8");
 
   const app = buildApp();
-  await registerInternalRunRoute(app, { repoRoot });
+  await registerInternalRunRoute(app, {
+    repoRoot,
+    preflightHandler: async () => ({
+      role: "ORCHESTRATOR",
+      bundle_hash: "bundle-hash",
+      template: { path: ".github/ISSUE_TEMPLATE/milestone-task.yml", size_bytes: 12, sha256: "abc" },
+      project_schema: { status: "PASS", mismatches: [] },
+      status: "PASS",
+      errors: [],
+    }),
+  });
 
   const reply = buildReply();
-  const result = await app.handler({ body: { role: "planner", task: "Implement task runner" } }, reply);
+  const result = await app.handler({ body: { role: "orchestrator", task: "Implement task runner" } }, reply);
 
   assert.equal(reply.statusCode, 200);
   assert.equal(result.status, "READY");
-  assert.equal(result.role, "PLANNER");
+  assert.equal(result.role, "ORCHESTRATOR");
   assert.equal(result.task, "Implement task runner");
   assert.equal(typeof result.bundle_hash, "string");
   assert.equal(result.bundle_hash.length, 64);

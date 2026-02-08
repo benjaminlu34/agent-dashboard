@@ -516,6 +516,28 @@ export async function createGitHubPlanApplyClient({
       return all;
     },
 
+    async getPullRequest({ prNumber }) {
+      if (!Number.isInteger(prNumber) || prNumber <= 0) {
+        throw new GitHubPlanApplyError("prNumber must be a positive integer");
+      }
+
+      const payload = await requestJson(`${restEndpoint}/repos/${ownerLogin}/${repositoryName}/pulls/${prNumber}`, {
+        method: "GET",
+        token: githubToken,
+      });
+
+      if (!Number.isInteger(payload?.number)) {
+        throw new GitHubPlanApplyError("unexpected pull request response");
+      }
+
+      return {
+        number: payload.number,
+        html_url: typeof payload?.html_url === "string" ? payload.html_url : "",
+        body: typeof payload?.body === "string" ? payload.body : "",
+        state: typeof payload?.state === "string" ? payload.state : "",
+      };
+    },
+
     async listIssueComments({ issueNumber }) {
       if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
         throw new GitHubPlanApplyError("issueNumber must be a positive integer");

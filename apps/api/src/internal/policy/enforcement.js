@@ -5,7 +5,7 @@ import { loadAgentContextBundle } from "../agent-context-loader.js";
 
 const MODULE_DIRNAME = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../../../");
-const BUNDLE_ROLES = ["PLANNER", "EXECUTOR", "REVIEWER"];
+const BUNDLE_ROLES = ["ORCHESTRATOR", "EXECUTOR", "REVIEWER"];
 
 function normalizeRole(role) {
   return typeof role === "string" ? role.trim().toLowerCase() : "";

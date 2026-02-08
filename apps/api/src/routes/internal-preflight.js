@@ -1,11 +1,11 @@
-import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { AgentContextBundleError, loadAgentContextBundle } from "../internal/agent-context-loader.js";
+import { GitHubTemplateReadError, readTemplateMetadataFromGitHub } from "../internal/github-template-reader.js";
 import { ProjectSchemaReadError, readProjectSchemaFromGitHub } from "../internal/policy/github-project-schema-reader.js";
 import { compareProjectSchema } from "../internal/project-schema-compare.js";
+import { resolveTargetIdentity, TargetIdentityError, toProjectSchemaIdentity } from "../internal/target-identity.js";
 
 const MODULE_DIRNAME = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../../");
@@ -13,28 +13,12 @@ const UPPERCASE_ROLE_RE = /^[A-Z][A-Z0-9_]*$/;
 const TEMPLATE_PATH = ".github/ISSUE_TEMPLATE/milestone-task.yml";
 const PROJECT_IDENTITY_PATH = "policy/github-project.json";
 
-function sha256(value) {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-function emptyTemplateMetadata() {
+function emptyTemplateMetadata(path = TEMPLATE_PATH) {
   return {
-    path: TEMPLATE_PATH,
+    path,
     size_bytes: 0,
     sha256: "",
   };
-}
-
-function normalizeOwnerType(ownerType) {
-  if (typeof ownerType !== "string") {
-    return "";
-  }
-
-  const normalized = ownerType.trim().toLowerCase();
-  if (normalized === "organization") {
-    return "org";
-  }
-  return normalized;
 }
 
 function parseProjectIdentityPolicy(bundle) {
@@ -43,39 +27,18 @@ function parseProjectIdentityPolicy(bundle) {
     return { error: "required project identity policy is missing" };
   }
 
-  let parsed;
   try {
-    parsed = JSON.parse(projectIdentityFile.content);
+    return { repoPolicy: JSON.parse(projectIdentityFile.content) };
   } catch {
     return { error: "project identity policy is not valid JSON" };
   }
-
-  const ownerLogin = typeof parsed?.owner_login === "string" ? parsed.owner_login.trim() : "";
-  const ownerType = normalizeOwnerType(parsed?.owner_type);
-  const projectName = typeof parsed?.project_name === "string" ? parsed.project_name.trim() : "";
-
-  if (!ownerLogin || !projectName || (ownerType !== "user" && ownerType !== "org")) {
-    return {
-      error: "project identity policy must define owner_login, owner_type (user|org), and project_name",
-    };
-  }
-
-  return {
-    projectIdentity: {
-      owner_login: ownerLogin,
-      owner_type: ownerType,
-      project_name: projectName,
-    },
-  };
 }
 
-async function buildProjectIdentityFailure({ repoRoot, normalizedRole, bundleHash = "", message }) {
-  const template = await readTemplateMetadata(repoRoot);
-
+function buildProjectIdentityFailure({ normalizedRole, bundleHash = "", message, templatePath = TEMPLATE_PATH, details = {} }) {
   return {
     role: normalizedRole,
     bundle_hash: bundleHash,
-    template: template ?? emptyTemplateMetadata(),
+    template: emptyTemplateMetadata(templatePath),
     project_schema: {
       status: "FAIL",
       mismatches: [],
@@ -85,33 +48,19 @@ async function buildProjectIdentityFailure({ repoRoot, normalizedRole, bundleHas
       {
         source: "project_identity",
         path: PROJECT_IDENTITY_PATH,
+        code: "target_identity_error",
         message,
+        ...details,
       },
     ],
   };
 }
 
-async function readTemplateMetadata(repoRoot) {
-  const absolutePath = resolve(repoRoot, TEMPLATE_PATH);
-
-  try {
-    const content = await readFile(absolutePath, "utf8");
-    return {
-      path: TEMPLATE_PATH,
-      size_bytes: Buffer.byteLength(content, "utf8"),
-      sha256: sha256(content),
-    };
-  } catch (error) {
-    if (error && error.code === "ENOENT") {
-      return null;
-    }
-    throw error;
-  }
-}
-
 export function buildPreflightHandler({
   repoRoot = DEFAULT_REPO_ROOT,
+  env = process.env,
   projectSchemaReader = readProjectSchemaFromGitHub,
+  templateMetadataReader = readTemplateMetadataFromGitHub,
 } = {}) {
   return async function preflightHandler(request, reply) {
     const role = request?.query?.role;
@@ -132,9 +81,9 @@ export function buildPreflightHandler({
       bundle = await loadAgentContextBundle({ repoRoot, role: normalizedRole });
     } catch (error) {
       if (error instanceof AgentContextBundleError && error?.details?.path === PROJECT_IDENTITY_PATH) {
-        return await buildProjectIdentityFailure({
-          repoRoot,
+        return buildProjectIdentityFailure({
           normalizedRole,
+          templatePath: typeof env?.TARGET_TEMPLATE_PATH === "string" ? env.TARGET_TEMPLATE_PATH : TEMPLATE_PATH,
           message:
             error.message === "policy file is not valid JSON"
               ? "project identity policy is not valid JSON"
@@ -154,12 +103,31 @@ export function buildPreflightHandler({
 
     const projectIdentityPolicy = parseProjectIdentityPolicy(bundle);
     if (projectIdentityPolicy.error) {
-      return await buildProjectIdentityFailure({
-        repoRoot,
+      return buildProjectIdentityFailure({
         normalizedRole,
         bundleHash: bundle.bundle_hash,
+        templatePath: typeof env?.TARGET_TEMPLATE_PATH === "string" ? env.TARGET_TEMPLATE_PATH : TEMPLATE_PATH,
         message: projectIdentityPolicy.error,
       });
+    }
+
+    let targetIdentity;
+    try {
+      targetIdentity = resolveTargetIdentity({
+        env,
+        repoPolicy: projectIdentityPolicy.repoPolicy,
+      });
+    } catch (error) {
+      if (error instanceof TargetIdentityError) {
+        return buildProjectIdentityFailure({
+          normalizedRole,
+          bundleHash: bundle.bundle_hash,
+          templatePath: typeof env?.TARGET_TEMPLATE_PATH === "string" ? env.TARGET_TEMPLATE_PATH : TEMPLATE_PATH,
+          message: error.message,
+          details: error.details,
+        });
+      }
+      throw error;
     }
 
     const policyProjectSchemaFile = bundle.files.find((file) => file.path === "policy/project-schema.json");
@@ -168,7 +136,9 @@ export function buildPreflightHandler({
     let projectSchemaComparison;
     let projectSchemaReadErrorMessage = null;
     try {
-      const liveProjectSchema = await projectSchemaReader({ projectIdentity: projectIdentityPolicy.projectIdentity });
+      const liveProjectSchema = await projectSchemaReader({
+        projectIdentity: toProjectSchemaIdentity(targetIdentity),
+      });
       projectSchemaComparison = compareProjectSchema(policyProjectSchema, liveProjectSchema);
     } catch (error) {
       if (error instanceof ProjectSchemaReadError) {
@@ -182,13 +152,33 @@ export function buildPreflightHandler({
       }
     }
 
-    const template = await readTemplateMetadata(repoRoot);
+    let template = null;
+    let templateError = null;
+    try {
+      template = await templateMetadataReader({
+        owner_login: targetIdentity.owner_login,
+        owner_type: targetIdentity.owner_type,
+        repo_name: targetIdentity.repo_name,
+        project_name: targetIdentity.project_name,
+        path: targetIdentity.template_path,
+        ref: targetIdentity.ref,
+      });
+    } catch (error) {
+      if (error instanceof GitHubTemplateReadError) {
+        templateError = error;
+      } else {
+        throw error;
+      }
+    }
+
     const errors = [];
 
-    if (!template) {
+    if (templateError) {
       errors.push({
-        path: TEMPLATE_PATH,
-        message: "required issue template is missing",
+        source: "template",
+        path: targetIdentity.template_path,
+        code: templateError.code,
+        message: templateError.message,
       });
     }
 
@@ -213,7 +203,7 @@ export function buildPreflightHandler({
     return {
       role: normalizedRole,
       bundle_hash: bundle.bundle_hash,
-      template: template ?? emptyTemplateMetadata(),
+      template: template ?? emptyTemplateMetadata(targetIdentity.template_path),
       project_schema: projectSchemaComparison,
       status: overallStatus,
       errors,

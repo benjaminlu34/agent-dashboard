@@ -9,7 +9,7 @@ import { registerInternalProjectItemUpdateFieldRoute } from "../src/routes/inter
 
 function buildPreflightPass() {
   return async () => ({
-    role: "PLANNER",
+    role: "ORCHESTRATOR",
     bundle_hash: "bundle-hash",
     template: { path: ".github/ISSUE_TEMPLATE/milestone-task.yml", size_bytes: 10, sha256: "abc" },
     project_schema: { status: "PASS", mismatches: [] },
@@ -22,7 +22,7 @@ async function writeBundleFiles(repoRoot) {
   await mkdir(join(repoRoot, "agents"), { recursive: true });
   await mkdir(join(repoRoot, "policy"), { recursive: true });
   await writeFile(join(repoRoot, "AGENTS.md"), "root governance\n", "utf8");
-  await writeFile(join(repoRoot, "agents/PLANNER.md"), "planner overlay\n", "utf8");
+  await writeFile(join(repoRoot, "agents/ORCHESTRATOR.md"), "orchestrator overlay\n", "utf8");
   await writeFile(
     join(repoRoot, "policy/github-project.json"),
     '{"owner_login":"benjaminlu34","owner_type":"user","project_name":"Codex Task Board","repository_name":"agent-dashboard"}\n',
@@ -56,7 +56,7 @@ async function writeBundleFiles(repoRoot) {
       {
         status_field: "Status",
         transitions: [
-          { from: "Backlog", to: "Ready", allowed_roles: ["Planner"] },
+          { from: "Backlog", to: "Ready", allowed_roles: ["Orchestrator"] },
           { from: "Ready", to: "In Progress", allowed_roles: ["Executor"] },
         ],
       },
@@ -69,7 +69,7 @@ async function writeBundleFiles(repoRoot) {
     join(repoRoot, "policy/role-permissions.json"),
     JSON.stringify(
       {
-        Planner: { can_set_project_fields: true, can_update_status_only: false },
+        Orchestrator: { can_set_project_fields: true, can_update_status_only: false },
         Executor: { can_set_project_fields: false, can_update_status_only: true },
       },
       null,
@@ -113,7 +113,7 @@ test("POST /internal/project-item/update-field registers and updates Status from
     method: "POST",
     url: "/internal/project-item/update-field",
     payload: {
-      role: "PLANNER",
+      role: "ORCHESTRATOR",
       project_item_id: "PVTI_test_123",
       field: "Status",
       value: "Ready",
@@ -123,7 +123,7 @@ test("POST /internal/project-item/update-field registers and updates Status from
   assert.equal(response.statusCode, 200);
   assert.equal(response.headers["content-type"], "application/json; charset=utf-8");
   assert.deepEqual(response.json(), {
-    role: "PLANNER",
+    role: "ORCHESTRATOR",
     project_item_id: "PVTI_test_123",
     updated: {
       Status: "Ready",
@@ -153,7 +153,7 @@ test("POST /internal/project-item/update-field returns 400 for field/value outsi
     method: "POST",
     url: "/internal/project-item/update-field",
     payload: {
-      role: "PLANNER",
+      role: "ORCHESTRATOR",
       project_item_id: "PVTI_test_456",
       field: "Status",
       value: "UnknownStatus",
@@ -186,7 +186,7 @@ test("POST /internal/project-item/update-field returns 403 for disallowed transi
     method: "POST",
     url: "/internal/project-item/update-field",
     payload: {
-      role: "PLANNER",
+      role: "ORCHESTRATOR",
       project_item_id: "PVTI_test_789",
       field: "Status",
       value: "In Progress",
@@ -209,7 +209,7 @@ test("POST /internal/project-item/update-field returns 409 when preflight fails"
   const app = await buildTestApp({
     repoRoot,
     preflightHandler: async () => ({
-      role: "PLANNER",
+      role: "ORCHESTRATOR",
       status: "FAIL",
       errors: [{ source: "project_schema", message: "drift detected" }],
     }),
@@ -225,7 +225,7 @@ test("POST /internal/project-item/update-field returns 409 when preflight fails"
     method: "POST",
     url: "/internal/project-item/update-field",
     payload: {
-      role: "PLANNER",
+      role: "ORCHESTRATOR",
       project_item_id: "PVTI_test_999",
       field: "Status",
       value: "Ready",

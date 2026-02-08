@@ -176,9 +176,9 @@ export function buildInternalPlanApplyHandler({
     const role = request?.body?.role;
     const draft = request?.body?.draft;
 
-    if (typeof role !== "string" || role.trim().toUpperCase() !== "PLANNER") {
+    if (typeof role !== "string" || role.trim().toUpperCase() !== "ORCHESTRATOR") {
       reply.code(400);
-      return { error: "body.role must be PLANNER" };
+      return { error: "body.role must be ORCHESTRATOR" };
     }
 
     if (!draft || typeof draft !== "object") {
@@ -207,7 +207,7 @@ export function buildInternalPlanApplyHandler({
     }
 
     const preflightReply = createReplyRecorder();
-    const preflight = await resolvedPreflightHandler({ query: { role: "PLANNER" } }, preflightReply);
+    const preflight = await resolvedPreflightHandler({ query: { role: "ORCHESTRATOR" } }, preflightReply);
 
     if (preflightReply.statusCode !== 200) {
       reply.code(preflightReply.statusCode);
@@ -221,7 +221,7 @@ export function buildInternalPlanApplyHandler({
 
     let bundle;
     try {
-      bundle = await loadAgentContextBundle({ repoRoot, role: "PLANNER" });
+      bundle = await loadAgentContextBundle({ repoRoot, role: "ORCHESTRATOR" });
     } catch (error) {
       if (error instanceof AgentContextBundleError) {
         reply.code(500);
@@ -302,7 +302,7 @@ export function buildInternalPlanApplyHandler({
     }
 
     return {
-      role: "PLANNER",
+      role: "ORCHESTRATOR",
       sprint,
       created,
       status: "APPLIED",

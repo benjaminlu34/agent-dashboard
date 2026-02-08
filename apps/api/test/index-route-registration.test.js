@@ -12,7 +12,7 @@ async function writeFixtureFiles(repoRoot) {
   await mkdir(join(repoRoot, ".github/ISSUE_TEMPLATE"), { recursive: true });
 
   await writeFile(join(repoRoot, "AGENTS.md"), "root governance\n", "utf8");
-  await writeFile(join(repoRoot, "agents/PLANNER.md"), "planner overlay\n", "utf8");
+  await writeFile(join(repoRoot, "agents/ORCHESTRATOR.md"), "orchestrator overlay\n", "utf8");
   await writeFile(
     join(repoRoot, "policy/github-project.json"),
     '{"owner_login":"benjaminlu34","owner_type":"user","project_name":"Codex Task Board"}\n',
@@ -24,11 +24,11 @@ async function writeFixtureFiles(repoRoot) {
     "utf8",
   );
   await writeFile(join(repoRoot, "policy/transitions.json"), '{"transitions":[]}\n', "utf8");
-  await writeFile(join(repoRoot, "policy/role-permissions.json"), '{"Planner":{"can_create_issues":true}}\n', "utf8");
+  await writeFile(join(repoRoot, "policy/role-permissions.json"), '{"Orchestrator":{"can_create_issues":true}}\n', "utf8");
   await writeFile(join(repoRoot, ".github/ISSUE_TEMPLATE/milestone-task.yml"), "name: Milestone Task\n", "utf8");
 }
 
-test("buildApp registers routes and GET /internal/agent-context returns 200 for role=PLANNER", async () => {
+test("buildApp registers routes and GET /internal/agent-context returns 200 for role=ORCHESTRATOR", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "api-index-route-"));
   await writeFixtureFiles(repoRoot);
 
@@ -36,12 +36,12 @@ test("buildApp registers routes and GET /internal/agent-context returns 200 for 
 
   const response = await app.inject({
     method: "GET",
-    url: "/internal/agent-context?role=PLANNER",
+    url: "/internal/agent-context?role=ORCHESTRATOR",
   });
 
   assert.equal(response.statusCode, 200);
   const payload = response.json();
-  assert.equal(payload.role, "PLANNER");
+  assert.equal(payload.role, "ORCHESTRATOR");
   assert.equal(Array.isArray(payload.files), true);
   assert.equal(typeof payload.bundle_hash, "string");
   assert.equal(payload.bundle_hash.length, 64);

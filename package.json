@@ -7,7 +7,8 @@
   },
   "scripts": {
     "dev": "node apps/api/src/index.js",
-    "test": "node --test apps/api/test/*.test.js"
+    "test": "node --test apps/api/test/*.test.js",
+    "orchestrator": "node apps/orchestrator/src/cli.js --once"
   },
   "dependencies": {
     "fastify": "^4.26.0"

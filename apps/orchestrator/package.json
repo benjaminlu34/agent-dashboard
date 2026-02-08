@@ -1,0 +1,10 @@
+{
+  "name": "@agent-hub/orchestrator",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node src/cli.js --loop",
+    "start": "node src/cli.js --once"
+  }
+}

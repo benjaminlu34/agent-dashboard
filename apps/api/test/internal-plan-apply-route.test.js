@@ -29,7 +29,7 @@ function buildApp() {
 
 function buildPreflightPass() {
   return async () => ({
-    role: "PLANNER",
+    role: "ORCHESTRATOR",
     bundle_hash: "bundle-hash",
     template: { path: ".github/ISSUE_TEMPLATE/milestone-task.yml", size_bytes: 10, sha256: "abc" },
     project_schema: { status: "PASS", mismatches: [] },
@@ -42,7 +42,7 @@ async function writeBundleFiles(repoRoot) {
   await mkdir(join(repoRoot, "agents"), { recursive: true });
   await mkdir(join(repoRoot, "policy"), { recursive: true });
   await writeFile(join(repoRoot, "AGENTS.md"), "root governance\n", "utf8");
-  await writeFile(join(repoRoot, "agents/PLANNER.md"), "planner overlay\n", "utf8");
+  await writeFile(join(repoRoot, "agents/ORCHESTRATOR.md"), "orchestrator overlay\n", "utf8");
   await writeFile(
     join(repoRoot, "policy/github-project.json"),
     '{"owner_login":"benjaminlu34","owner_type":"user","project_name":"Codex Task Board","repository_name":"agent-dashboard"}\n',
@@ -50,7 +50,7 @@ async function writeBundleFiles(repoRoot) {
   );
   await writeFile(join(repoRoot, "policy/project-schema.json"), '{"project_name":"Codex Task Board","required_fields":[]}\n', "utf8");
   await writeFile(join(repoRoot, "policy/transitions.json"), '{"transitions":[]}\n', "utf8");
-  await writeFile(join(repoRoot, "policy/role-permissions.json"), '{"Planner":{"can_create_issues":true}}\n', "utf8");
+  await writeFile(join(repoRoot, "policy/role-permissions.json"), '{"Orchestrator":{"can_create_issues":true}}\n', "utf8");
 }
 
 test("POST /internal/plan-apply creates markdown body with headings and checkboxes, and defaults status to Backlog", async () => {
@@ -92,7 +92,7 @@ test("POST /internal/plan-apply creates markdown body with headings and checkbox
   const result = await app.handler(
     {
       body: {
-        role: "PLANNER",
+        role: "ORCHESTRATOR",
         draft: {
           sprint: "M1",
           issues: [
@@ -172,7 +172,7 @@ test("POST /internal/plan-apply returns PARTIAL_FAIL shape when a later issue fa
   const result = await app.handler(
     {
       body: {
-        role: "PLANNER",
+        role: "ORCHESTRATOR",
         draft: {
           sprint: "M2",
           issues: [
@@ -240,7 +240,7 @@ test("POST /internal/plan-apply returns 409 with preflight payload when prefligh
   await registerInternalPlanApplyRoute(app, {
     repoRoot,
     preflightHandler: async () => ({
-      role: "PLANNER",
+      role: "ORCHESTRATOR",
       bundle_hash: "bundle-hash",
       template: { path: ".github/ISSUE_TEMPLATE/milestone-task.yml", size_bytes: 0, sha256: "" },
       project_schema: { status: "FAIL", mismatches: [] },
@@ -257,7 +257,7 @@ test("POST /internal/plan-apply returns 409 with preflight payload when prefligh
   const result = await app.handler(
     {
       body: {
-        role: "PLANNER",
+        role: "ORCHESTRATOR",
         draft: {
           sprint: "M1",
           issues: [
@@ -283,4 +283,33 @@ test("POST /internal/plan-apply returns 409 with preflight payload when prefligh
   assert.equal(result.status, "FAIL");
   assert.equal(result.errors[0].source, "project_schema");
   assert.equal(githubClientFactoryCalled, false);
+});
+
+test("POST /internal/plan-apply rejects legacy PLANNER role", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-plan-apply-legacy-planner-"));
+  await writeBundleFiles(repoRoot);
+
+  const app = buildApp();
+  await registerInternalPlanApplyRoute(app, {
+    repoRoot,
+    preflightHandler: buildPreflightPass(),
+    githubClientFactory: async () => ({}),
+  });
+
+  const reply = buildReply();
+  const result = await app.handler(
+    {
+      body: {
+        role: "PLANNER",
+        draft: {
+          sprint: "M1",
+          issues: [],
+        },
+      },
+    },
+    reply,
+  );
+
+  assert.equal(reply.statusCode, 400);
+  assert.deepEqual(result, { error: "body.role must be ORCHESTRATOR" });
 });
