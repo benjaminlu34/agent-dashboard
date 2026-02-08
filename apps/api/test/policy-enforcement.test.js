@@ -16,16 +16,44 @@ test("Executor can transition Ready -> In Progress", async () => {
   });
 });
 
-test("In Review -> Done is Human-only and marked non-automation", async () => {
-  const executorResult = await isStatusTransitionAllowed("Executor", "In Review", "Done");
+test("In Review -> Needs Human Approval is Reviewer-only", async () => {
+  const reviewerResult = await isStatusTransitionAllowed("Reviewer", "In Review", "Needs Human Approval");
+  assert.deepEqual(reviewerResult, {
+    allowed: true,
+    automation_allowed: true,
+  });
+
+  const executorResult = await isStatusTransitionAllowed("Executor", "In Review", "Needs Human Approval");
+  assert.deepEqual(executorResult, {
+    allowed: false,
+    automation_allowed: true,
+  });
+});
+
+test("Needs Human Approval -> Done is Human-only and marked non-automation", async () => {
+  const executorResult = await isStatusTransitionAllowed("Executor", "Needs Human Approval", "Done");
   assert.deepEqual(executorResult, {
     allowed: false,
     automation_allowed: false,
   });
 
-  const humanResult = await isStatusTransitionAllowed("Human", "In Review", "Done");
+  const humanResult = await isStatusTransitionAllowed("Human", "Needs Human Approval", "Done");
   assert.deepEqual(humanResult, {
     allowed: true,
     automation_allowed: false,
+  });
+});
+
+test("In Progress -> Blocked is Orchestrator-only", async () => {
+  const orchestratorResult = await isStatusTransitionAllowed("Orchestrator", "In Progress", "Blocked");
+  assert.deepEqual(orchestratorResult, {
+    allowed: true,
+    automation_allowed: true,
+  });
+
+  const executorResult = await isStatusTransitionAllowed("Executor", "In Progress", "Blocked");
+  assert.deepEqual(executorResult, {
+    allowed: false,
+    automation_allowed: true,
   });
 });

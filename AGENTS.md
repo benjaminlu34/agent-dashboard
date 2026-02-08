@@ -4,7 +4,7 @@
 - One PR per issue: each implementation issue maps to exactly one pull request.
 - Issue template contract: `.github/ISSUE_TEMPLATE/milestone-task.yml` is required. If missing or altered from the expected contract, stop automation immediately and report.
 - Project schema contract: project `Codex Task Board` must include these fields/options exactly:
-  - `Status`: `Backlog`, `Ready`, `In Progress`, `In Review`, `Blocked`, `Done`
+  - `Status`: `Backlog`, `Ready`, `In Progress`, `In Review`, `Needs Human Approval`, `Blocked`, `Done`
   - `Size`: `S`, `M`, `L`
   - `Area`: `db`, `api`, `web`, `providers`, `infra`, `docs`
   - `Priority`: `P0`, `P1`, `P2`

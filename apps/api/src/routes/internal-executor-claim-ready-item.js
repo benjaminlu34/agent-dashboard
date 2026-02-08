@@ -13,6 +13,7 @@ const ROLE_TOKEN_RE = /^[A-Z][A-Z0-9_]*$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 const CLAIM_MARKER_START = "<!-- EXECUTOR_CLAIM_V1";
+const DEFAULT_CLAIM_TTL_MINUTES = 15;
 const PROJECT_SCHEMA_PATH = "policy/project-schema.json";
 const PROJECT_IDENTITY_PATH = "policy/github-project.json";
 
@@ -173,9 +174,34 @@ function parseClaimComment(body) {
   };
 }
 
+function resolveClaimTtlMinutes() {
+  const raw = process.env.EXECUTOR_CLAIM_TTL_MINUTES;
+  if (!isNonEmptyString(raw)) {
+    return DEFAULT_CLAIM_TTL_MINUTES;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new ExecutorClaimError("EXECUTOR_CLAIM_TTL_MINUTES must be a positive integer", { ambiguous: true });
+  }
+  return parsed;
+}
+
+function isClaimMarkerExpired({ claimedAt, ttlMinutes, nowMs }) {
+  const claimedAtMs = Date.parse(claimedAt);
+  if (Number.isNaN(claimedAtMs)) {
+    // parseClaimComment() should prevent this; treat as ambiguous if it happens.
+    throw new ExecutorClaimError("invalid claim marker claimed_at", { ambiguous: true });
+  }
+  const ageMinutes = Math.floor((nowMs - claimedAtMs) / 60000);
+  return ageMinutes >= ttlMinutes;
+}
+
 async function evaluateClaimState({ githubClient, issueNumber, projectItemId, runId }) {
   const comments = await githubClient.listIssueComments({ issueNumber });
   const claimMarkers = [];
+  const ttlMinutes = resolveClaimTtlMinutes();
+  const nowMs = Date.now();
 
   for (const comment of comments) {
     const marker = parseClaimComment(comment.body);
@@ -189,6 +215,12 @@ async function evaluateClaimState({ githubClient, issueNumber, projectItemId, ru
         project_item_id: projectItemId,
         marker_project_item_id: marker.project_item_id,
       });
+    }
+
+    // Lease semantics: ignore stale claim markers to prevent permanent deadlocks when an executor crashes
+    // after writing a claim marker but before transitioning Status to In Progress.
+    if (isClaimMarkerExpired({ claimedAt: marker.claimed_at, ttlMinutes, nowMs })) {
+      continue;
     }
 
     claimMarkers.push({
@@ -213,16 +245,6 @@ async function evaluateClaimState({ githubClient, issueNumber, projectItemId, ru
 }
 
 async function claimCandidate({ githubClient, normalizedRole, candidate, repoRoot, runId }) {
-  const linkage = await assertZeroLinkedPullRequests({
-    githubClient,
-    issueNumber: candidate.issue_number,
-    projectItemId: candidate.project_item_id,
-  });
-
-  if (linkage.linked) {
-    return { skipped: true, reason: linkage.reason ?? "linked_pr_exists", linkage };
-  }
-
   const initialClaimState = await evaluateClaimState({
     githubClient,
     issueNumber: candidate.issue_number,
@@ -230,11 +252,23 @@ async function claimCandidate({ githubClient, normalizedRole, candidate, repoRoo
     runId,
   });
 
-  if (initialClaimState.claimed && initialClaimState.ownedByRun) {
-    return { claimed: buildClaimPayload(candidate) };
-  }
+  const alreadyClaimedByThisRun = initialClaimState.claimed && initialClaimState.ownedByRun;
   if (initialClaimState.claimed && !initialClaimState.ownedByRun) {
     return { skipped: true, reason: "already_claimed_by_other_run" };
+  }
+
+  // Only enforce "zero linked PR" when *acquiring* a new claim.
+  // For idempotent reruns (claim marker already exists for runId), linkage may legitimately exist.
+  if (!alreadyClaimedByThisRun) {
+    const linkage = await assertZeroLinkedPullRequests({
+      githubClient,
+      issueNumber: candidate.issue_number,
+      projectItemId: candidate.project_item_id,
+    });
+
+    if (linkage.linked) {
+      return { skipped: true, reason: linkage.reason ?? "linked_pr_exists", linkage };
+    }
   }
 
   const transitionResult = await isStatusTransitionAllowedForRepo(normalizedRole, "Ready", "In Progress", { repoRoot });
@@ -249,26 +283,28 @@ async function claimCandidate({ githubClient, normalizedRole, candidate, repoRoo
     };
   }
 
-  const claimedAt = new Date().toISOString();
-  await githubClient.createIssueComment({
-    issueNumber: candidate.issue_number,
-    body: buildClaimComment({
+  if (!alreadyClaimedByThisRun) {
+    const claimedAt = new Date().toISOString();
+    await githubClient.createIssueComment({
+      issueNumber: candidate.issue_number,
+      body: buildClaimComment({
+        issueNumber: candidate.issue_number,
+        projectItemId: candidate.project_item_id,
+        runId,
+        claimedAt,
+      }),
+    });
+
+    const afterWriteClaimState = await evaluateClaimState({
+      githubClient,
       issueNumber: candidate.issue_number,
       projectItemId: candidate.project_item_id,
       runId,
-      claimedAt,
-    }),
-  });
+    });
 
-  const afterWriteClaimState = await evaluateClaimState({
-    githubClient,
-    issueNumber: candidate.issue_number,
-    projectItemId: candidate.project_item_id,
-    runId,
-  });
-
-  if (!afterWriteClaimState.claimed || !afterWriteClaimState.ownedByRun) {
-    return { skipped: true, reason: "already_claimed_by_other_run" };
+    if (!afterWriteClaimState.claimed || !afterWriteClaimState.ownedByRun) {
+      return { skipped: true, reason: "already_claimed_by_other_run" };
+    }
   }
 
   const currentStatus = await githubClient.getProjectItemFieldValue({

@@ -240,14 +240,26 @@ def _build_worker_prompt(*, role_bundle: Dict[str, Any], intent: Dict[str, Any],
 
     intent_json = json.dumps(intent, ensure_ascii=False, indent=2)
 
+    role_specific_rules = ""
+    if role == "REVIEWER":
+        role_specific_rules = (
+            "Reviewer-specific constraints:\n"
+            "- Leave feedback as GitHub ISSUE comments only.\n"
+            "- Do NOT call github.pull_request_review_write and do NOT submit approvals.\n"
+            "- For findings, use checklist IDs (R1, R2, ...) and include explicit done conditions.\n"
+            "- End feedback with: Reviewer: addressed (requesting evidence per item ID).\n"
+        )
+
     return (
         "You are a Codex worker executing exactly one RUN_INTENT.\n"
         "Non-negotiable rules:\n"
         "- Treat the provided bundle as executable contract; do not summarize, rewrite, or omit any content.\n"
         "- Do not merge PRs. Do not close issues. Do not use auto-close keywords.\n"
         "- Never bypass backend policy gates; all state changes must go through backend endpoints.\n"
+        "- Do NOT attempt to start or run the backend server; if the backend endpoint is unreachable, fail closed.\n"
         "- Fail closed on ambiguity.\n\n"
         f"Backend base URL: {backend_base_url}\n\n"
+        f"{role_specific_rules}\n"
         "RUN_INTENT (verbatim):\n"
         f"{intent_json}\n\n"
         "Execution requirement:\n"
@@ -272,6 +284,7 @@ def run_intent_with_codex_mcp(
     backend_base_url: str,
     role_bundle: Dict[str, Any],
     intent: Dict[str, Any],
+    tools_call_timeout_s: float = 600.0,
 ) -> WorkerResult:
     """Execute one intent by spawning `codex mcp-server` and calling the `codex` tool via MCP (stdio).
 
@@ -329,14 +342,17 @@ def run_intent_with_codex_mcp(
                     # Runner-level guardrails (bundle remains source-of-truth).
                     "developer-instructions": (
                         "Treat base-instructions as executable contract. Do not rewrite or summarize it. "
+                        "Do not attempt to start the backend server. "
                         "Never merge PRs or close issues. Fail closed on ambiguity."
                     ),
                     "cwd": ".",
-                    "sandbox": "workspace-write",
+                    # Codex sandbox restrictions can prevent reaching a locally running backend on localhost.
+                    # Worker must be able to call the backend endpoints to claim/transition safely.
+                    "sandbox": "danger-full-access",
                     "approval-policy": "never",
                 },
             },
-            timeout_s=600.0,
+            timeout_s=tools_call_timeout_s,
         )
 
         thread_id = _extract_thread_id_from_tool_result(tool_result)
@@ -382,6 +398,7 @@ def generate_json_with_codex_mcp(
     developer_instructions: str,
     sandbox: str = "read-only",
     approval_policy: str = "never",
+    tools_call_timeout_s: float = 600.0,
 ) -> Dict[str, Any]:
     """Spawn `codex mcp-server` and ask Codex to output a single JSON object (no prose)."""
     if not isinstance(prompt, str) or not prompt.strip():
@@ -432,7 +449,7 @@ def generate_json_with_codex_mcp(
                     "approval-policy": approval_policy,
                 },
             },
-            timeout_s=600.0,
+            timeout_s=tools_call_timeout_s,
         )
 
         thread_id = _extract_thread_id_from_tool_result(tool_result)

@@ -129,6 +129,7 @@ class KickoffValidationTests(unittest.TestCase):
         from apps.runner.runner import _apply_kickoff_plan  # pylint: disable=import-outside-toplevel
         import io  # pylint: disable=import-outside-toplevel
         import contextlib  # pylint: disable=import-outside-toplevel
+        import tempfile  # pylint: disable=import-outside-toplevel
 
         class BackendStub:
             def __init__(self) -> None:
@@ -142,26 +143,41 @@ class KickoffValidationTests(unittest.TestCase):
         draft = kickoff_plan_to_plan_apply_draft(plan)
         backend = BackendStub()
         stderr = io.StringIO()
+        plan_path = tempfile.NamedTemporaryFile(delete=True).name
         with contextlib.redirect_stderr(stderr):
-            result = _apply_kickoff_plan(backend=backend, plan=plan, draft=draft, dry_run=True)
+            result = _apply_kickoff_plan(
+                backend=backend,
+                plan=plan,
+                draft=draft,
+                dry_run=True,
+                sprint_plan_path=plan_path,
+            )
         self.assertEqual(result["status"], "DRY_RUN")
         self.assertEqual(backend.post_calls, 0)
 
     def test_apply_fails_when_ready_set_title_missing_mapping(self) -> None:
         from apps.runner.runner import _apply_kickoff_plan  # pylint: disable=import-outside-toplevel
+        import tempfile  # pylint: disable=import-outside-toplevel
 
         class BackendStub:
             def post_json(self, path: str, *, body):
                 if path == "/internal/plan-apply":
                     created = []
                     for idx, _issue in enumerate(body["draft"]["issues"]):
-                        created.append({"index": idx, "project_item_id": f"PVTI_{idx}"})
+                        created.append({"index": idx, "project_item_id": f"PVTI_{idx}", "issue_number": idx + 1})
                     return {"status": "APPLIED", "created": created}
                 raise AssertionError(f"unexpected backend call: {path}")
 
         plan = validate_kickoff_plan(_valid_plan(), sprint="M1", ready_limit=3)
         draft = kickoff_plan_to_plan_apply_draft(plan)
         plan["ready_set_titles"] = ["[TASK] Not in draft"]
+        plan_path = tempfile.NamedTemporaryFile(delete=True).name
         with self.assertRaises(KickoffError) as ctx:
-            _apply_kickoff_plan(backend=BackendStub(), plan=plan, draft=draft, dry_run=False)
+            _apply_kickoff_plan(
+                backend=BackendStub(),
+                plan=plan,
+                draft=draft,
+                dry_run=False,
+                sprint_plan_path=plan_path,
+            )
         self.assertEqual(ctx.exception.code, "kickoff_ready_set_missing_mapping")

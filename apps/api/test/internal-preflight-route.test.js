@@ -48,7 +48,7 @@ async function writeBundleFiles(repoRoot) {
           {
             name: "Status",
             type: "single_select",
-            allowed_options: ["Backlog", "Ready", "In Progress", "In Review", "Blocked", "Done"],
+            allowed_options: ["Backlog", "Ready", "In Progress", "In Review", "Needs Human Approval", "Blocked", "Done"],
           },
           {
             name: "Size",
@@ -88,7 +88,7 @@ function buildMatchingProjectSchema() {
       {
         name: "Status",
         type: "single_select",
-        options: ["Backlog", "Ready", "In Progress", "In Review", "Blocked", "Done"],
+        options: ["Backlog", "Ready", "In Progress", "In Review", "Needs Human Approval", "Blocked", "Done"],
       },
       {
         name: "Size",
@@ -213,7 +213,7 @@ test("GET /internal/preflight returns FAIL when project schema verification fail
         {
           name: "Status",
           type: "single_select",
-          options: ["Backlog", "Ready", "In Progress", "In Review", "Blocked", "Done"],
+          options: ["Backlog", "Ready", "In Progress", "In Review", "Needs Human Approval", "Blocked", "Done"],
         },
         {
           name: "Size",

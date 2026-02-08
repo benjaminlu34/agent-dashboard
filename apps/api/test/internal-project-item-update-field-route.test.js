@@ -37,7 +37,7 @@ async function writeBundleFiles(repoRoot) {
           {
             name: "Status",
             type: "single_select",
-            allowed_options: ["Backlog", "Ready", "In Progress", "In Review", "Blocked", "Done"],
+            allowed_options: ["Backlog", "Ready", "In Progress", "In Review", "Needs Human Approval", "Blocked", "Done"],
           },
           { name: "Size", type: "single_select", allowed_options: ["S", "M", "L"] },
           { name: "Area", type: "single_select", allowed_options: ["db", "api", "web", "providers", "infra", "docs"] },
@@ -58,6 +58,8 @@ async function writeBundleFiles(repoRoot) {
         transitions: [
           { from: "Backlog", to: "Ready", allowed_roles: ["Orchestrator"] },
           { from: "Ready", to: "In Progress", allowed_roles: ["Executor"] },
+          { from: "In Progress", to: "Blocked", allowed_roles: ["Orchestrator"] },
+          { from: "In Review", to: "Needs Human Approval", allowed_roles: ["Reviewer"] },
         ],
       },
       null,
@@ -71,6 +73,7 @@ async function writeBundleFiles(repoRoot) {
       {
         Orchestrator: { can_set_project_fields: true, can_update_status_only: false },
         Executor: { can_set_project_fields: false, can_update_status_only: true },
+        Reviewer: { can_set_project_fields: false, can_update_status_only: true },
       },
       null,
       2,
@@ -236,5 +239,132 @@ test("POST /internal/project-item/update-field returns 409 when preflight fails"
   const payload = response.json();
   assert.equal(payload.status, "FAIL");
   assert.equal(payload.errors[0].source, "project_schema");
+  await app.close();
+});
+
+test("POST /internal/project-item/update-field requires handoff metadata and writes issue comment for reviewer pass", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "project-item-update-reviewer-handoff-"));
+  await writeBundleFiles(repoRoot);
+  await writeFile(join(repoRoot, "agents/REVIEWER.md"), "reviewer overlay\n", "utf8");
+
+  const commentCalls = [];
+  const app = await buildTestApp({
+    repoRoot,
+    preflightHandler: buildPreflightPass(),
+    githubClientFactory: async () => ({
+      async getProjectItemFieldValue() {
+        return "In Review";
+      },
+      async updateProjectItemField() {},
+      async createIssueComment(payload) {
+        commentCalls.push(payload);
+        return {
+          id: 999,
+          html_url: "https://github.com/benjaminlu34/agent-dashboard/issues/123#issuecomment-999",
+        };
+      },
+    }),
+  });
+
+  const missingMetadata = await app.inject({
+    method: "POST",
+    url: "/internal/project-item/update-field",
+    payload: {
+      role: "REVIEWER",
+      project_item_id: "PVTI_test_123",
+      field: "Status",
+      value: "Needs Human Approval",
+    },
+  });
+  assert.equal(missingMetadata.statusCode, 400);
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/internal/project-item/update-field",
+    payload: {
+      role: "REVIEWER",
+      project_item_id: "PVTI_test_123",
+      field: "Status",
+      value: "Needs Human Approval",
+      issue_number: 123,
+      pr_url: "https://github.com/benjaminlu34/agent-dashboard/pull/456",
+      checks_performed: ["Acceptance Criteria checklist", "Changed files review"],
+      checks_passed: ["All acceptance criteria PASS", "Required tests pass"],
+      human_steps: ["Approve and merge PR #456", "Verify deployment in staging"],
+      run_id: "11111111-1111-4111-8111-111111111111",
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  const payload = response.json();
+  assert.equal(payload.updated.Status, "Needs Human Approval");
+  assert.equal(payload.handoff_comment.id, 999);
+  assert.equal(commentCalls.length, 1);
+  assert.equal(commentCalls[0].issueNumber, 123);
+  assert.match(commentCalls[0].body, /Reviewer handoff: Needs Human Approval/);
+  assert.match(commentCalls[0].body, /Linked PR: https:\/\/github.com\/benjaminlu34\/agent-dashboard\/pull\/456/);
+  assert.match(commentCalls[0].body, /Human steps:/);
+  await app.close();
+});
+
+test("POST /internal/project-item/update-field requires failure metadata and writes issue comment for executor failure handoff", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "project-item-update-executor-blocked-"));
+  await writeBundleFiles(repoRoot);
+
+  const commentCalls = [];
+  const app = await buildTestApp({
+    repoRoot,
+    preflightHandler: buildPreflightPass(),
+    githubClientFactory: async () => ({
+      async getProjectItemFieldValue() {
+        return "In Progress";
+      },
+      async updateProjectItemField() {},
+      async createIssueComment(payload) {
+        commentCalls.push(payload);
+        return {
+          id: 1001,
+          html_url: "https://github.com/benjaminlu34/agent-dashboard/issues/321#issuecomment-1001",
+        };
+      },
+    }),
+  });
+
+  const missingMetadata = await app.inject({
+    method: "POST",
+    url: "/internal/project-item/update-field",
+    payload: {
+      role: "ORCHESTRATOR",
+      project_item_id: "PVTI_test_321",
+      field: "Status",
+      value: "Blocked",
+    },
+  });
+  assert.equal(missingMetadata.statusCode, 400);
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/internal/project-item/update-field",
+    payload: {
+      role: "ORCHESTRATOR",
+      project_item_id: "PVTI_test_321",
+      field: "Status",
+      value: "Blocked",
+      issue_number: 321,
+      failure_classification: "ITEM_STOP",
+      failure_message: "mcp call timed out",
+      suggested_next_steps: ["Inspect logs for run_id", "Move back to Ready after fix"],
+      run_id: "22222222-2222-4222-8222-222222222222",
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  const payload = response.json();
+  assert.equal(payload.updated.Status, "Blocked");
+  assert.equal(payload.failure_comment.id, 1001);
+  assert.equal(commentCalls.length, 1);
+  assert.equal(commentCalls[0].issueNumber, 321);
+  assert.match(commentCalls[0].body, /Executor failure handoff: Blocked/);
+  assert.match(commentCalls[0].body, /Failure classification: ITEM_STOP/);
   await app.close();
 });

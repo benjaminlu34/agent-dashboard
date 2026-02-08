@@ -18,7 +18,15 @@ class _BackendStub:
 class RunnerDryRunTests(unittest.TestCase):
     def test_dry_run_never_fetches_bundle_or_executes(self) -> None:
         backend = _BackendStub()
-        runner = Runner(backend=backend, ledger=None, dry_run=True, codex_bin="codex", codex_mcp_args="mcp-server")
+        runner = Runner(
+            backend=backend,
+            ledger=None,
+            dry_run=True,
+            codex_bin="codex",
+            codex_mcp_args="mcp-server",
+            codex_tools_call_timeout_s=600.0,
+            orchestrator_state_path="./.orchestrator-state.json",
+        )
 
         intent = parse_intent(
             {

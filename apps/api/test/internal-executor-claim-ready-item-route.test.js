@@ -37,7 +37,7 @@ async function writeBundleFiles(repoRoot, { executorCanUpdateStatusOnly = true }
           {
             name: "Status",
             type: "single_select",
-            allowed_options: ["Backlog", "Ready", "In Progress", "In Review", "Blocked", "Done"],
+            allowed_options: ["Backlog", "Ready", "In Progress", "In Review", "Needs Human Approval", "Blocked", "Done"],
           },
           { name: "Size", type: "single_select", allowed_options: ["S", "M", "L"] },
           { name: "Area", type: "single_select", allowed_options: ["db", "api", "web", "providers", "infra", "docs"] },
@@ -229,6 +229,138 @@ test("POST /internal/executor/claim-ready-item is idempotent for same run_id", a
   await app.close();
 });
 
+test("POST /internal/executor/claim-ready-item repairs Ready status for an existing claim marker owned by run_id", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "executor-claim-repair-ready-"));
+  await writeBundleFiles(repoRoot);
+
+  const issueNumber = 61;
+  const projectItemId = "PVTI_ready_61";
+  const runId = "61616161-6161-4161-8161-616161616161";
+
+  const sharedClient = createMockGithubClient({
+    issueNumber,
+    issueUrl: "https://github.com/benjaminlu34/agent-dashboard/issues/61",
+    projectItemId,
+    initialStatus: "Ready",
+    initialComments: [
+      {
+        id: 42,
+        body: buildClaimMarkerBody({
+          issueNumber,
+          projectItemId,
+          runId,
+          claimedAt: "2026-02-08T17:00:00.000Z",
+        }),
+        created_at: "2026-02-08T17:00:00.000Z",
+        html_url: "https://github.com/benjaminlu34/agent-dashboard/issues/61#issuecomment-42",
+      },
+    ],
+  });
+
+  const app = await buildTestApp({
+    repoRoot,
+    preflightHandler: buildPreflightPass(),
+    githubClientFactory: async () => sharedClient,
+  });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/internal/executor/claim-ready-item",
+    payload: {
+      role: "EXECUTOR",
+      run_id: runId,
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.json(), {
+    role: "EXECUTOR",
+    run_id: runId,
+    claimed: {
+      issue_number: issueNumber,
+      issue_url: "https://github.com/benjaminlu34/agent-dashboard/issues/61",
+      project_item_id: projectItemId,
+      branch: "executor/issue-61",
+      fields_set: { Status: "In Progress" },
+    },
+  });
+
+  const status = await sharedClient.getProjectItemFieldValue({ projectItemId, field: "Status" });
+  assert.equal(status, "In Progress");
+
+  await app.close();
+});
+
+test("POST /internal/executor/claim-ready-item reclaims a Ready item when the existing claim marker is expired", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "executor-claim-expired-claim-"));
+  await writeBundleFiles(repoRoot);
+
+  const previousTtl = process.env.EXECUTOR_CLAIM_TTL_MINUTES;
+  process.env.EXECUTOR_CLAIM_TTL_MINUTES = "15";
+  try {
+    const issueNumber = 62;
+    const projectItemId = "PVTI_ready_62";
+    const oldRunId = "62626262-6262-4262-8262-626262626262";
+    const newRunId = "63636363-6363-4363-8363-636363636363";
+
+    const sharedClient = createMockGithubClient({
+      issueNumber,
+      issueUrl: "https://github.com/benjaminlu34/agent-dashboard/issues/62",
+      projectItemId,
+      initialStatus: "Ready",
+      initialComments: [
+        {
+          id: 40,
+          body: buildClaimMarkerBody({
+            issueNumber,
+            projectItemId,
+            runId: oldRunId,
+            claimedAt: "2026-02-08T00:00:00.000Z",
+          }),
+          created_at: "2026-02-08T00:00:00.000Z",
+          html_url: "https://github.com/benjaminlu34/agent-dashboard/issues/62#issuecomment-40",
+        },
+      ],
+    });
+
+    const app = await buildTestApp({
+      repoRoot,
+      preflightHandler: buildPreflightPass(),
+      githubClientFactory: async () => sharedClient,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/internal/executor/claim-ready-item",
+      payload: {
+        role: "EXECUTOR",
+        run_id: newRunId,
+      },
+    });
+
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.json(), {
+      role: "EXECUTOR",
+      run_id: newRunId,
+      claimed: {
+        issue_number: issueNumber,
+        issue_url: "https://github.com/benjaminlu34/agent-dashboard/issues/62",
+        project_item_id: projectItemId,
+        branch: "executor/issue-62",
+        fields_set: { Status: "In Progress" },
+      },
+    });
+
+    await app.close();
+  } finally {
+    if (previousTtl === undefined) {
+      delete process.env.EXECUTOR_CLAIM_TTL_MINUTES;
+    } else {
+      process.env.EXECUTOR_CLAIM_TTL_MINUTES = previousTtl;
+    }
+  }
+});
+
 test("POST /internal/executor/claim-ready-item skips when another run_id already claimed", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "executor-claim-other-run-"));
   await writeBundleFiles(repoRoot);
@@ -322,6 +454,7 @@ test("POST /internal/executor/claim-ready-item resolves dual claim markers by ea
   const projectItemId = "PVTI_ready_52";
   const winnerRunId = "52525252-5252-4252-8252-525252525252";
   const loserRunId = "53535353-5353-4353-8353-535353535353";
+  const freshClaimedAt = new Date().toISOString();
 
   let created = false;
   const comments = [];
@@ -351,15 +484,15 @@ test("POST /internal/executor/claim-ready-item resolves dual claim markers by ea
             issueNumber,
             projectItemId,
             runId: winnerRunId,
-            claimedAt: "2026-02-06T00:00:00.000Z",
+            claimedAt: freshClaimedAt,
           }),
-          created_at: "2026-02-06T00:00:00.000Z",
+          created_at: freshClaimedAt,
           html_url: "https://github.com/benjaminlu34/agent-dashboard/issues/52#issuecomment-10",
         });
         comments.push({
           id: 11,
           body,
-          created_at: "2026-02-06T00:00:01.000Z",
+          created_at: freshClaimedAt,
           html_url: "https://github.com/benjaminlu34/agent-dashboard/issues/52#issuecomment-11",
         });
       }

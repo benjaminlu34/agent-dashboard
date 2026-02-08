@@ -23,6 +23,27 @@
       ]
     },
     {
+      "from": "In Progress",
+      "to": "Blocked",
+      "allowed_roles": [
+        "Orchestrator"
+      ]
+    },
+    {
+      "from": "In Review",
+      "to": "Needs Human Approval",
+      "allowed_roles": [
+        "Reviewer"
+      ]
+    },
+    {
+      "from": "Needs Human Approval",
+      "to": "Blocked",
+      "allowed_roles": [
+        "Orchestrator"
+      ]
+    },
+    {
       "from": "In Review",
       "to": "Blocked",
       "allowed_roles": [
@@ -38,7 +59,7 @@
       ]
     },
     {
-      "from": "In Review",
+      "from": "Needs Human Approval",
       "to": "Done",
       "allowed_roles": [
         "Human"

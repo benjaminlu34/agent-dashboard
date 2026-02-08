@@ -9,11 +9,20 @@ import urllib.request
 
 
 class HttpError(Exception):
-    def __init__(self, message: str, *, code: str = "http_error", status_code: int = 0, payload: Any = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "http_error",
+        status_code: int = 0,
+        payload: Any = None,
+        details: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__(message)
         self.code = code
         self.status_code = status_code
         self.payload = payload
+        self.details = details or {}
 
 
 @dataclass(frozen=True)
@@ -70,7 +79,15 @@ def _request_json(method: str, url: str, *, timeout_s: float, body: Optional[Dic
         status_code = int(getattr(exc, "code", 0) or 0)
         raw = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
     except (urllib.error.URLError, TimeoutError) as exc:
-        raise HttpError("backend request failed", code="backend_unreachable") from exc
+        reason_obj = getattr(exc, "reason", None)
+        reason = str(reason_obj if reason_obj is not None else exc) or exc.__class__.__name__
+        details = {"reason": reason, "error_type": exc.__class__.__name__}
+        raise HttpError(
+            "backend request failed",
+            code="backend_unreachable",
+            payload=details,
+            details=details,
+        ) from exc
 
     try:
         payload = json.loads(raw) if raw else {}

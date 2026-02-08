@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { buildRunIntents, buildRunPlan } from "../../orchestrator/src/intents.js";
 
-const ALLOWED_STATUSES = ["Backlog", "Ready", "In Progress", "In Review", "Blocked", "Done"];
+const ALLOWED_STATUSES = ["Backlog", "Ready", "In Progress", "In Review", "Needs Human Approval", "Blocked", "Done"];
 
 test("buildRunPlan filters one sprint and emits deterministic intents with role caps", () => {
   const runIds = ["run-1", "run-2", "run-3"];

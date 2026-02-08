@@ -10,11 +10,13 @@ import { buildRunPlan } from "./intents.js";
 const MODULE_DIRNAME = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../");
 const DEFAULT_BACKEND_BASE_URL = "http://localhost:4000";
-const DEFAULT_MAX_EXECUTORS = 1;
-const DEFAULT_MAX_REVIEWERS = 1;
+const DEFAULT_MAX_EXECUTORS = 2;
+const DEFAULT_MAX_REVIEWERS = 2;
 const DEFAULT_POLL_INTERVAL_MS = 15000;
 const DEFAULT_STALL_MINUTES = 120;
 const DEFAULT_REVIEW_CHURN_POLLS = 3;
+const DEFAULT_REVIEWER_RETRY_POLLS = 20;
+const DEFAULT_MAX_REVIEWER_DISPATCHES_PER_STATUS = 2;
 const DEFAULT_STATE_PATH = ".orchestrator-state.json";
 
 function hasNonEmptyString(value) {
@@ -35,6 +37,20 @@ function parsePositiveIntEnv(name, fallback, env) {
   const parsed = Number(rawValue);
   if (!Number.isInteger(parsed) || parsed <= 0) {
     throw withErrorCode(new Error(`${name} must be a positive integer`), "validation_failed");
+  }
+
+  return parsed;
+}
+
+function parseNonNegativeIntEnv(name, fallback, env) {
+  const rawValue = env[name];
+  if (!hasNonEmptyString(rawValue)) {
+    return fallback;
+  }
+
+  const parsed = Number(rawValue);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw withErrorCode(new Error(`${name} must be a non-negative integer`), "validation_failed");
   }
 
   return parsed;
@@ -193,7 +209,7 @@ function writeEndOfSprintSummary(summary) {
       status_counts: summary.status_counts,
       processed_items: summary.processed_items,
       awaiting_humans:
-        "No Ready/In Progress/In Review items remain in Sprint; humans may merge approved PRs and move items to Done.",
+        "No Ready/In Progress/In Review items remain in Sprint; humans should process Needs Human Approval items, merge approved PRs, verify deployment, and move items to Done.",
     })}\n`,
   );
 }
@@ -267,6 +283,16 @@ async function runCycle({
     previousState,
     stallMinutes,
     reviewChurnPolls,
+    maxReviewerDispatchesPerStatus: parsePositiveIntEnv(
+      "ORCHESTRATOR_MAX_REVIEWER_DISPATCHES_PER_STATUS",
+      DEFAULT_MAX_REVIEWER_DISPATCHES_PER_STATUS,
+      env,
+    ),
+    reviewerRetryPolls: parseNonNegativeIntEnv(
+      "ORCHESTRATOR_REVIEWER_RETRY_POLLS",
+      DEFAULT_REVIEWER_RETRY_POLLS,
+      env,
+    ),
   });
 }
 

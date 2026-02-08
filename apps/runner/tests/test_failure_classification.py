@@ -2,6 +2,7 @@ import unittest
 
 from apps.runner.http_client import HttpError
 from apps.runner.intents import IntentError
+from apps.runner.codex_worker import CodexWorkerError
 from apps.runner.runner import classify_failure
 
 
@@ -24,3 +25,5 @@ class FailureClassificationTests(unittest.TestCase):
     def test_unreachable_is_transient(self) -> None:
         self.assertEqual(classify_failure(HttpError("down", code="backend_unreachable")), "TRANSIENT")
 
+    def test_codex_timeout_is_item_stop(self) -> None:
+        self.assertEqual(classify_failure(CodexWorkerError("timeout", code="mcp_timeout")), "ITEM_STOP")

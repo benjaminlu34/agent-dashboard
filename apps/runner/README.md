@@ -17,11 +17,16 @@ Required:
 Optional:
 - `RUNNER_MAX_EXECUTORS` (default `1`)
 - `RUNNER_MAX_REVIEWERS` (default `1`)
+- `RUNNER_READY_BUFFER` (default `2`) - minimum number of `Ready` items runner tries to maintain via promotion
 - `RUNNER_DRY_RUN` (default `false`)
 - `RUNNER_LEDGER_PATH` (default `./.runner-ledger.json`)
+- `RUNNER_SPRINT_PLAN_PATH` (default `./.runner-sprint-plan.json`)
+- `RUNNER_AUTOPROMOTE` (default `true`) - auto-promotes Backlog tasks to `Ready` to maintain buffer
+- `ORCHESTRATOR_STATE_PATH` (default `./.orchestrator-state.json`)
 - `RUNNER_ORCHESTRATOR_CMD` (default `node apps/orchestrator/src/cli.js --loop`)
 - `CODEX_BIN` (default `codex`)
 - `CODEX_MCP_ARGS` (default `mcp-server`)
+- `CODEX_TOOLS_CALL_TIMEOUT_S` (default `1800`) - timeout for a single Codex MCP `tools/call` worker run
 
 Target repo identity config (`TARGET_*`) is passed through to `apps/orchestrator` and the backend via env.
 

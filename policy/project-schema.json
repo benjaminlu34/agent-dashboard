@@ -9,6 +9,7 @@
         "Ready",
         "In Progress",
         "In Review",
+        "Needs Human Approval",
         "Blocked",
         "Done"
       ]

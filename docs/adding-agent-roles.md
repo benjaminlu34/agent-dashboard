@@ -131,7 +131,7 @@ Role capability matrix (reference model; policy remains source of truth):
 | SECURITY_SENTRY | ✅ | ❌ | ❌ | ✅ | ❌ |
 | ORCHESTRATOR | ❌ | ❌ | ✅ | ✅ | Backlog -> Ready |
 | EXECUTOR | ❌ | ✅ | ✅ | ✅ | Ready -> In Review |
-| REVIEWER | ❌ | ❌ | ❌ | ✅ | ❌ |
+| REVIEWER | ❌ | ❌ | ✅ | ✅ | In Review -> Needs Human Approval |
 
 ## 6) Wire runner endpoint(s)
 You MUST choose one of:

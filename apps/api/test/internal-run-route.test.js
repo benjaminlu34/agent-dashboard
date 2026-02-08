@@ -47,7 +47,7 @@ async function writeBundleFiles(repoRoot) {
           {
             name: "Status",
             type: "single_select",
-            allowed_options: ["Backlog", "Ready", "In Progress", "In Review", "Blocked", "Done"],
+            allowed_options: ["Backlog", "Ready", "In Progress", "In Review", "Needs Human Approval", "Blocked", "Done"],
           },
           {
             name: "Size",

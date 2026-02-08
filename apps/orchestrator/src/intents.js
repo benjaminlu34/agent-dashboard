@@ -156,6 +156,8 @@ export function buildRunPlan({
   nowIso = new Date().toISOString(),
   stallMinutes = 120,
   reviewChurnPolls = 3,
+  maxReviewerDispatchesPerStatus = 1,
+  reviewerRetryPolls = 0,
 } = {}) {
   if (!Array.isArray(projectItems)) {
     throw new Error("projectItems must be an array");
@@ -170,6 +172,10 @@ export function buildRunPlan({
   assertPositiveInteger(maxReviewers, "maxReviewers");
   assertPositiveInteger(stallMinutes, "stallMinutes");
   assertPositiveInteger(reviewChurnPolls, "reviewChurnPolls");
+  assertPositiveInteger(maxReviewerDispatchesPerStatus, "maxReviewerDispatchesPerStatus");
+  if (!Number.isInteger(reviewerRetryPolls) || reviewerRetryPolls < 0) {
+    throw new Error("reviewerRetryPolls must be a non-negative integer");
+  }
 
   const normalizedNowIso = toIsoTimestamp(nowIso);
   if (!normalizedNowIso) {
@@ -194,6 +200,7 @@ export function buildRunPlan({
       Ready: 0,
       "In Progress": 0,
       "In Review": 0,
+      "Needs Human Approval": 0,
       Blocked: 0,
       Done: 0,
     },
@@ -277,8 +284,16 @@ export function buildRunPlan({
       stateItem.last_dispatched_poll >= stateItem.status_since_poll;
 
     if (wasDispatchedForCurrentStatusSinceLastChange) {
-      summary.skipped.dedupe_same_status += 1;
-      return;
+      const canRetryReviewer =
+        role === "REVIEWER" &&
+        item.status === "In Review" &&
+        stateItem.reviewer_dispatches_for_current_status < maxReviewerDispatchesPerStatus &&
+        pollCount - stateItem.last_dispatched_poll >= reviewerRetryPolls;
+
+      if (!canRetryReviewer) {
+        summary.skipped.dedupe_same_status += 1;
+        return;
+      }
     }
 
     if (summary.intents_emitted[role] >= maxCount) {
