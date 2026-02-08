@@ -1,4 +1,6 @@
 import unittest
+import io
+import contextlib
 
 from apps.runner.runner import Runner
 from apps.runner.intents import parse_intent
@@ -28,6 +30,8 @@ class RunnerDryRunTests(unittest.TestCase):
             }
         )
 
-        runner._handle_intent(intent)  # pylint: disable=protected-access
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            runner._handle_intent(intent)  # pylint: disable=protected-access
         self.assertEqual(backend.get_agent_context_calls, 0)
-
+        self.assertIn('"type":"DRY_RUN_WOULD_EXECUTE"', stderr.getvalue())

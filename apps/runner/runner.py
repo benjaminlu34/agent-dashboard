@@ -104,7 +104,7 @@ class Runner:
         if self._dry_run:
             _log_stderr(
                 {
-                    "type": "DRY_RUN_INTENT",
+                    "type": "DRY_RUN_WOULD_EXECUTE",
                     "role": intent.role,
                     "run_id": intent.run_id,
                     "endpoint": intent.endpoint,
@@ -320,6 +320,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             except IntentError as exc:
                 runner.hard_stop(f"intent_error: {exc.code}: {exc}")
                 break
+
+            _log_stderr(
+                {
+                    "type": "INTENT_RECEIVED",
+                    "role": intent.role,
+                    "run_id": intent.run_id,
+                    "endpoint": intent.endpoint,
+                    "intent_hash": intent.intent_hash,
+                }
+            )
 
             if ledger and ledger.get(intent.run_id) and ledger.get(intent.run_id).get("status") == "succeeded":
                 _log_stderr({"type": "LEDGER_SKIP", "run_id": intent.run_id, "reason": "already_succeeded"})
