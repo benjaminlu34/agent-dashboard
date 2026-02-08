@@ -27,11 +27,34 @@ Target repo identity config (`TARGET_*`) is passed through to `apps/orchestrator
 
 ## Run
 
-Dry run (no Codex spawn, no backend write endpoints):
+Dry run (no backend write endpoints; does not execute worker intents):
 
 ```bash
 BACKEND_BASE_URL=http://localhost:4000 ORCHESTRATOR_SPRINT=M1 \
 python3 -m apps.runner --dry-run --once
+```
+
+Kickoff (goal -> issues via `/internal/plan-apply` -> auto-promote up to 3 tasks to `Ready`):
+
+Dry-run kickoff (generates kickoff JSON + draft, no backend writes):
+
+```bash
+BACKEND_BASE_URL=http://localhost:4000 \
+python3 -m apps.runner --kickoff --sprint M1 --goal "Sprint M1 should ship X" --dry-run
+```
+
+Live kickoff + run orchestrator once:
+
+```bash
+BACKEND_BASE_URL=http://localhost:4000 \
+python3 -m apps.runner --kickoff --sprint M1 --goal-file ./goal.txt --once
+```
+
+Live kickoff + loop:
+
+```bash
+BACKEND_BASE_URL=http://localhost:4000 \
+python3 -m apps.runner --kickoff --sprint M1 --goal-file ./goal.txt --loop
 ```
 
 Loop mode:

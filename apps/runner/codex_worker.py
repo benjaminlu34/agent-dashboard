@@ -371,3 +371,107 @@ def run_intent_with_codex_mcp(
             proc.terminate()
         except Exception:
             pass
+
+
+def generate_json_with_codex_mcp(
+    *,
+    codex_bin: str,
+    codex_mcp_args: str,
+    role_bundle: Dict[str, Any],
+    prompt: str,
+    developer_instructions: str,
+    sandbox: str = "read-only",
+    approval_policy: str = "never",
+) -> Dict[str, Any]:
+    """Spawn `codex mcp-server` and ask Codex to output a single JSON object (no prose)."""
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise CodexWorkerError("prompt is required", code="codex_invalid_prompt")
+    if not isinstance(developer_instructions, str) or not developer_instructions.strip():
+        raise CodexWorkerError("developer_instructions is required", code="codex_invalid_prompt")
+
+    proc = _spawn_codex_mcp_server(codex_bin=codex_bin, codex_mcp_args=codex_mcp_args)
+    client = _JsonRpcClient(proc)
+    try:
+        init = client.call(
+            "initialize",
+            {
+                "protocolVersion": _MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "agent-swarm-runner", "version": "0.1.0"},
+            },
+            timeout_s=30.0,
+        )
+        if init.get("protocolVersion") != _MCP_PROTOCOL_VERSION:
+            raise CodexWorkerError(
+                "mcp protocol version mismatch",
+                code="mcp_protocol_mismatch",
+                details={"expected": _MCP_PROTOCOL_VERSION, "actual": init.get("protocolVersion")},
+            )
+
+        client.notify("notifications/initialized", {})
+
+        tools = client.call("tools/list", {}, timeout_s=30.0).get("tools")
+        if not isinstance(tools, list):
+            raise CodexWorkerError("mcp tools/list returned invalid tools", code="mcp_invalid_tools")
+
+        codex_tool = next((t for t in tools if isinstance(t, dict) and t.get("name") == "codex"), None)
+        if not codex_tool:
+            raise CodexWorkerError("codex tool not available on mcp server", code="mcp_missing_codex_tool")
+
+        bundle_instructions = _bundle_to_base_instructions(role_bundle)
+        tool_result = client.call(
+            "tools/call",
+            {
+                "name": "codex",
+                "arguments": {
+                    "prompt": prompt,
+                    "base-instructions": bundle_instructions,
+                    "developer-instructions": developer_instructions,
+                    "cwd": ".",
+                    "sandbox": sandbox,
+                    "approval-policy": approval_policy,
+                },
+            },
+            timeout_s=600.0,
+        )
+
+        thread_id = _extract_thread_id_from_tool_result(tool_result)
+        text = _extract_codex_text_from_tool_result(tool_result)
+        try:
+            parsed = json.loads(text.strip())
+        except json.JSONDecodeError:
+            tool_result_2 = client.call(
+                "tools/call",
+                {
+                    "name": "codex-reply",
+                    "arguments": {
+                        "threadId": thread_id,
+                        "prompt": "Re-output the final result as JSON only. No prose. No markdown.",
+                    },
+                },
+                timeout_s=180.0,
+            )
+            text2 = _extract_codex_text_from_tool_result(tool_result_2)
+            try:
+                parsed = json.loads(text2.strip())
+            except json.JSONDecodeError as exc:
+                raise CodexWorkerError(
+                    "codex output was not valid JSON",
+                    code="worker_invalid_output",
+                    details={"error": str(exc), "content": text2[:2000]},
+                ) from None
+
+        if not isinstance(parsed, dict):
+            raise CodexWorkerError("codex kickoff output must be a JSON object", code="worker_invalid_output")
+
+        return parsed
+    finally:
+        try:
+            client.call("shutdown", {}, timeout_s=5.0)
+            client.notify("exit", {})
+        except Exception:
+            pass
+        try:
+            proc.terminate()
+        except Exception:
+            pass

@@ -10,12 +10,14 @@ import time
 from datetime import datetime, timezone
 import os
 from typing import Any, Dict, Optional
+from pathlib import Path
 
-from .codex_worker import CodexWorkerError, run_intent_with_codex_mcp
+from .codex_worker import CodexWorkerError, generate_json_with_codex_mcp, run_intent_with_codex_mcp
 from .config import load_config
 from .http_client import BackendClient, HttpError
 from .intents import IntentError, RunIntent, parse_intent, parse_json_line
 from .ledger import LedgerEntry, RunLedger
+from .kickoff import KickoffError, kickoff_plan_to_plan_apply_draft, validate_kickoff_plan
 
 
 def _utc_now_iso() -> str:
@@ -222,14 +224,172 @@ def _assert_codex_github_mcp_available(*, codex_bin: str) -> None:
         )
 
 
+def _build_kickoff_prompt(*, sprint: str, goal_text: str, ready_limit: int) -> tuple[str, str]:
+    schema = (
+        "{\n"
+        f'  \"sprint\": \"{sprint}\",\n'
+        '  \"goal_issue\": {\n'
+        f'    \"title\": \"[SPRINT GOAL] {sprint}: <short>\",\n'
+        "    \"body_markdown\": \"<markdown>\",\n"
+        "    \"labels\": [\"meta:sprint-goal\"],\n"
+        f'    \"fields\": {{\"Sprint\":\"{sprint}\",\"Status\":\"Backlog\",\"Priority\":\"P0\",\"Size\":\"S\",\"Area\":\"docs\"}}\n'
+        "  },\n"
+        "  \"tasks\": [\n"
+        "    {\n"
+        "      \"title\": \"[TASK] <short>\",\n"
+        "      \"body_markdown\": \"<markdown>\",\n"
+        "      \"priority\": \"P0|P1|P2\",\n"
+        "      \"size\": \"S|M|L\",\n"
+        "      \"area\": \"infra|api|orchestrator|runner|docs|tests\",\n"
+        "      \"depends_on_titles\": [\"[TASK] ...\"],\n"
+        "      \"initial_status\": \"Backlog\"\n"
+        "    }\n"
+        "  ],\n"
+        "  \"ready_set_titles\": [\"[TASK] ...\"],\n"
+        "  \"prioritization_rationale\": \"...\"\n"
+        "}\n"
+    )
+
+    markdown_requirements = (
+        "For every body_markdown (goal + tasks), you MUST use this exact section structure with these exact headings:\n"
+        "## Goal\n"
+        "<one or more lines>\n"
+        "## Non-goals\n"
+        "- <bullet>\n"
+        "## Acceptance Criteria\n"
+        "- [ ] <checkbox item>\n"
+        "## Files Likely Touched\n"
+        "- <path>\n"
+        "## Definition of Done\n"
+        "- [ ] <checkbox item>\n"
+    )
+
+    prompt = (
+        "You are ORCHESTRATOR (kickoff-only). Your output is a machine-validated JSON plan.\n"
+        "Return JSON only. No prose. No markdown code fences.\n"
+        "Do not use auto-close keywords (Closes/Fixes/Resolves #N).\n\n"
+        f"Sprint: {sprint}\n"
+        f"Ready limit: {ready_limit} (ready_set_titles length must be <= {ready_limit} and <= 3)\n\n"
+        "Goal text (verbatim):\n"
+        f"{goal_text.strip()}\n\n"
+        "Hard constraints:\n"
+        "- tasks length must be between 3 and 25\n"
+        "- Every task must set initial_status=Backlog\n"
+        "- depends_on_titles must reference exact task titles (including [TASK] prefix)\n"
+        "- ready_set_titles must reference existing tasks with zero dependencies and priority=P0 only\n"
+        "- goal_issue.labels must include meta:sprint-goal\n"
+        "- goal_issue.fields must be exactly: Sprint=sprint, Status=Backlog, Priority=P0, Size=S, Area=docs\n\n"
+        f"Output schema (exact keys):\n{schema}\n"
+        f"\n{markdown_requirements}\n"
+        "Notes:\n"
+        "- Task count should be intelligently sized for the goal (within bounds).\n"
+        "- Prefer dependency-light P0 tasks in ready_set_titles.\n"
+    )
+
+    developer_instructions = (
+        "Return JSON only (single object) matching the provided schema exactly. "
+        "Do not include any additional keys. "
+        "No prose, no markdown, no code fences. "
+        "Do not use auto-close keywords. "
+        "Ensure body_markdown uses the required headings and list formats."
+    )
+
+    return prompt, developer_instructions
+
+
+def _read_goal_text(*, goal: Optional[str], goal_file: Optional[str]) -> str:
+    if goal_file:
+        raw = Path(goal_file).read_text(encoding="utf8")
+        if not raw.strip():
+            raise KickoffError("goal file is empty", code="kickoff_goal_missing", details={"path": goal_file})
+        return raw.strip()
+    if goal is not None:
+        if not goal.strip():
+            raise KickoffError("--goal must be non-empty", code="kickoff_goal_missing")
+        return goal.strip()
+    raise KickoffError("kickoff requires --goal or --goal-file", code="kickoff_goal_missing")
+
+
+def _apply_kickoff_plan(
+    *,
+    backend: BackendClient,
+    plan: Dict[str, Any],
+    draft: Dict[str, Any],
+    dry_run: bool,
+) -> Dict[str, Any]:
+    ready_titles: list[str] = list(plan.get("ready_set_titles") or [])
+
+    if dry_run:
+        _log_stderr({"type": "KICKOFF_DRY_RUN", "ready_set_titles": ready_titles})
+        return {"status": "DRY_RUN", "ready_set_titles": ready_titles}
+
+    apply_payload = backend.post_json("/internal/plan-apply", body={"role": "ORCHESTRATOR", "draft": draft})
+    if apply_payload.get("status") != "APPLIED":
+        raise KickoffError("plan-apply did not return APPLIED", code="kickoff_plan_apply_failed", details={"payload": apply_payload})
+
+    created = apply_payload.get("created")
+    if not isinstance(created, list) or len(created) != len(draft.get("issues") or []):
+        raise KickoffError(
+            "plan-apply response created list mismatch",
+            code="kickoff_plan_apply_failed",
+            details={"created_count": len(created) if isinstance(created, list) else None},
+        )
+
+    title_to_project_item_id: Dict[str, str] = {}
+    issues = list(draft.get("issues") or [])
+    for idx, issue in enumerate(issues):
+        title = issue.get("title")
+        if not isinstance(title, str) or not title.strip():
+            raise KickoffError("draft issue missing title", code="kickoff_invalid_draft")
+        if title in title_to_project_item_id:
+            raise KickoffError("title collision exists in draft issues", code="kickoff_title_collision", details={"title": title})
+
+        created_entry = created[idx] if idx < len(created) else None
+        project_item_id = created_entry.get("project_item_id") if isinstance(created_entry, dict) else None
+        if not isinstance(project_item_id, str) or not project_item_id.strip():
+            raise KickoffError("plan-apply response missing project_item_id", code="kickoff_plan_apply_failed", details={"index": idx})
+        title_to_project_item_id[title] = project_item_id
+
+    promoted: List[Dict[str, Any]] = []
+    for title in ready_titles:
+        project_item_id = title_to_project_item_id.get(title)
+        if not project_item_id:
+            raise KickoffError(
+                "ready_set task not found in plan-apply results",
+                code="kickoff_ready_set_missing_mapping",
+                details={"title": title},
+            )
+
+        update_payload = backend.post_json(
+            "/internal/project-item/update-field",
+            body={"role": "ORCHESTRATOR", "project_item_id": project_item_id, "field": "Status", "value": "Ready"},
+        )
+        promoted.append({"title": title, "project_item_id": project_item_id, "update_payload": update_payload})
+
+    return {"status": "APPLIED", "plan_apply": apply_payload, "promoted": promoted}
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="runner")
-    parser.add_argument("--dry-run", action="store_true", help="do not spawn Codex or call backend write endpoints")
-    parser.add_argument("--once", action="store_true", help="run orchestrator once and exit")
+    parser.add_argument("--dry-run", action="store_true", help="do not call backend write endpoints or execute worker intents")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true", help="run orchestrator once and exit")
+    mode.add_argument("--loop", action="store_true", help="run orchestrator loop (default for non-kickoff)")
+    parser.add_argument("--kickoff", action="store_true", help="generate and apply a sprint plan before running orchestrator")
+    parser.add_argument("--sprint", type=str, help="sprint value M1..M4 (overrides ORCHESTRATOR_SPRINT)")
+    goal_group = parser.add_mutually_exclusive_group()
+    goal_group.add_argument("--goal", type=str, help="kickoff goal text")
+    goal_group.add_argument("--goal-file", type=str, help="path to kickoff goal text file")
+    parser.add_argument("--ready-limit", type=int, default=3, help="max dependency-free tasks to auto-promote to Ready (max 3)")
     args = parser.parse_args(argv)
 
+    sprint_override = args.sprint.strip() if isinstance(args.sprint, str) else None
     try:
-        config = load_config(dry_run_flag=args.dry_run, once_flag=args.once)
+        config = load_config(
+            dry_run_flag=args.dry_run,
+            once_flag=args.once,
+            orchestrator_sprint_override=sprint_override,
+        )
     except ValueError as exc:
         _log_stderr({"type": "CONFIG_ERROR", "error": str(exc)})
         return 2
@@ -256,6 +416,49 @@ def main(argv: Optional[list[str]] = None) -> int:
     if preflight.get("status") != "PASS":
         _log_stderr({"type": "HARD_STOP", "reason": "preflight_fail", "payload": preflight})
         return 2
+
+    if args.kickoff:
+        try:
+            sprint = config.orchestrator_sprint
+            goal_text = _read_goal_text(goal=args.goal, goal_file=args.goal_file)
+            ready_limit = int(args.ready_limit)
+            bundle = backend.get_agent_context("ORCHESTRATOR")
+            prompt, developer_instructions = _build_kickoff_prompt(
+                sprint=sprint,
+                goal_text=goal_text,
+                ready_limit=ready_limit,
+            )
+            kickoff_raw = generate_json_with_codex_mcp(
+                codex_bin=config.codex_bin,
+                codex_mcp_args=config.codex_mcp_args,
+                role_bundle=bundle,
+                prompt=prompt,
+                developer_instructions=developer_instructions,
+                sandbox="read-only",
+                approval_policy="never",
+            )
+            kickoff_plan = validate_kickoff_plan(kickoff_raw, sprint=sprint, ready_limit=ready_limit)
+            draft = kickoff_plan_to_plan_apply_draft(kickoff_plan)
+            _log_stderr({"type": "KICKOFF_PLAN", "plan": kickoff_plan})
+            _log_stderr({"type": "KICKOFF_DRAFT", "draft": draft})
+
+            try:
+                apply_result = _apply_kickoff_plan(backend=backend, plan=kickoff_plan, draft=draft, dry_run=config.dry_run)
+            except HttpError as exc:
+                # Treat any kickoff write failure as hard stop (including 409 preflight/policy failures).
+                raise KickoffError(
+                    "kickoff backend request failed",
+                    code="kickoff_backend_error",
+                    details={"code": exc.code, "status_code": exc.status_code, "payload": exc.payload},
+                ) from None
+            _log_stderr({"type": "KICKOFF_RESULT", **apply_result})
+        except (KickoffError, CodexWorkerError) as exc:
+            _log_stderr({"type": "HARD_STOP", "reason": "kickoff_failed", "code": getattr(exc, "code", "kickoff_failed"), "details": getattr(exc, "details", {}), "error": str(exc)})
+            return 2
+
+        # In kickoff mode, we only run the scheduler if explicitly requested.
+        if not (args.once or args.loop):
+            return 0
 
     if not config.dry_run:
         try:

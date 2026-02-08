@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { AgentContextBundleError, loadAgentContextBundle } from "../internal/agent-context-loader.js";
 import { createGitHubPlanApplyClient, GitHubPlanApplyError } from "../internal/github-plan-apply-client.js";
 import { buildPreflightHandler } from "./internal-preflight.js";
+import { resolveTargetIdentity, TargetIdentityError } from "../internal/target-identity.js";
 
 const MODULE_DIRNAME = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../../");
@@ -32,34 +33,17 @@ function createReplyRecorder() {
   };
 }
 
-function parseProjectIdentityFromBundle(bundle) {
+function parseProjectIdentityPolicyFromBundle(bundle) {
   const identityFile = bundle.files.find((file) => file.path === PROJECT_IDENTITY_PATH);
   if (!identityFile) {
     throw new GitHubPlanApplyError("missing project identity policy");
   }
 
-  let parsed;
   try {
-    parsed = JSON.parse(identityFile.content);
+    return JSON.parse(identityFile.content);
   } catch {
     throw new GitHubPlanApplyError("invalid project identity policy JSON");
   }
-
-  const ownerLogin = typeof parsed.owner_login === "string" ? parsed.owner_login.trim() : "";
-  const ownerType = typeof parsed.owner_type === "string" ? parsed.owner_type.trim().toLowerCase() : "";
-  const projectName = typeof parsed.project_name === "string" ? parsed.project_name.trim() : "";
-  const repositoryName = typeof parsed.repository_name === "string" ? parsed.repository_name.trim() : "";
-
-  if (!ownerLogin || !projectName || (ownerType !== "user" && ownerType !== "org")) {
-    throw new GitHubPlanApplyError("project identity must define owner_login, owner_type, and project_name");
-  }
-
-  return {
-    owner_login: ownerLogin,
-    owner_type: ownerType,
-    project_name: projectName,
-    ...(repositoryName ? { repository_name: repositoryName } : {}),
-  };
 }
 
 function normalizeIssue(issue) {
@@ -76,6 +60,7 @@ function normalizeIssue(issue) {
     area: issue?.area,
     priority: issue?.priority,
     initial_status: normalizedStatus === "Ready" ? "Ready" : "Backlog",
+    labels: issue?.labels,
   };
 }
 
@@ -109,6 +94,9 @@ function validateDraftIssue(issue, index) {
   }
   if (!VALID_INITIAL_STATUSES.has(issue.initial_status)) {
     return `draft.issues[${index}].initial_status must be Backlog or Ready`;
+  }
+  if (issue.labels !== undefined && !ensureStringArray(issue.labels)) {
+    return `draft.issues[${index}].labels must be a non-empty string array`;
   }
   return "";
 }
@@ -165,8 +153,17 @@ function buildPartialFailResponse({ created, index, step, error }) {
   };
 }
 
+function buildIssueTitle(rawTitle) {
+  const trimmed = rawTitle.trim();
+  if (trimmed.startsWith("[")) {
+    return trimmed;
+  }
+  return `[TASK] ${trimmed}`;
+}
+
 export function buildInternalPlanApplyHandler({
   repoRoot = DEFAULT_REPO_ROOT,
+  env = process.env,
   preflightHandler,
   githubClientFactory = createGitHubPlanApplyClient,
 } = {}) {
@@ -235,8 +232,19 @@ export function buildInternalPlanApplyHandler({
 
     let projectIdentity;
     try {
-      projectIdentity = parseProjectIdentityFromBundle(bundle);
+      const repoPolicy = parseProjectIdentityPolicyFromBundle(bundle);
+      const target = resolveTargetIdentity({ env, repoPolicy });
+      projectIdentity = {
+        owner_login: target.owner_login,
+        owner_type: target.owner_type,
+        project_name: target.project_name,
+        repository_name: target.repo_name,
+      };
     } catch (error) {
+      if (error instanceof TargetIdentityError) {
+        reply.code(500);
+        return { error: error.message, ...(error.details ?? {}) };
+      }
       if (error instanceof GitHubPlanApplyError) {
         reply.code(500);
         return { error: error.message };
@@ -264,8 +272,9 @@ export function buildInternalPlanApplyHandler({
       let createdIssue;
       try {
         createdIssue = await githubClient.createIssue({
-          title: `[TASK] ${issue.title}`,
+          title: buildIssueTitle(issue.title),
           body: formatIssueBody(issue),
+          ...(Array.isArray(issue.labels) ? { labels: issue.labels } : {}),
         });
       } catch (error) {
         reply.code(502);

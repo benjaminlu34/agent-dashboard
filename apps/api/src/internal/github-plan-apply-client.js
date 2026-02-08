@@ -312,13 +312,19 @@ export async function createGitHubPlanApplyClient({
   }
 
   return {
-    async createIssue({ title, body }) {
+    async createIssue({ title, body, labels }) {
+      if (labels !== undefined) {
+        if (!Array.isArray(labels) || labels.length === 0 || !labels.every((label) => isNonEmptyString(label))) {
+          throw new GitHubPlanApplyError("issue labels must be a non-empty array of strings");
+        }
+      }
       const payload = await requestJson(`${restEndpoint}/repos/${ownerLogin}/${repositoryName}/issues`, {
         method: "POST",
         token: githubToken,
         body: {
           title,
           body,
+          ...(Array.isArray(labels) ? { labels } : {}),
         },
       });
       return parseIssueResult(payload);

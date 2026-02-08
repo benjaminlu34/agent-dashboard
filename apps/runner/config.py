@@ -52,11 +52,17 @@ def load_config(
     env: Optional[dict[str, str]] = None,
     dry_run_flag: bool = False,
     once_flag: bool = False,
+    orchestrator_sprint_override: Optional[str] = None,
 ) -> RunnerConfig:
     resolved_env = dict(os.environ) if env is None else dict(env)
 
     backend_base_url = _require_non_empty(resolved_env, "BACKEND_BASE_URL").rstrip("/")
-    orchestrator_sprint = _require_non_empty(resolved_env, "ORCHESTRATOR_SPRINT")
+    if orchestrator_sprint_override is not None:
+        orchestrator_sprint = orchestrator_sprint_override.strip()
+        if not orchestrator_sprint:
+            raise ValueError("ORCHESTRATOR_SPRINT is required")
+    else:
+        orchestrator_sprint = _require_non_empty(resolved_env, "ORCHESTRATOR_SPRINT")
 
     runner_max_executors = _parse_positive_int(resolved_env, "RUNNER_MAX_EXECUTORS", 1)
     runner_max_reviewers = _parse_positive_int(resolved_env, "RUNNER_MAX_REVIEWERS", 1)
@@ -84,4 +90,3 @@ def load_config(
         codex_bin=codex_bin,
         codex_mcp_args=codex_mcp_args,
     )
-

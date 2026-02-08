@@ -84,6 +84,7 @@ test("POST /internal/plan-apply creates markdown body with headings and checkbox
   const app = buildApp();
   await registerInternalPlanApplyRoute(app, {
     repoRoot,
+    env: {},
     preflightHandler: buildPreflightPass(),
     githubClientFactory,
   });
@@ -164,6 +165,7 @@ test("POST /internal/plan-apply returns PARTIAL_FAIL shape when a later issue fa
   const app = buildApp();
   await registerInternalPlanApplyRoute(app, {
     repoRoot,
+    env: {},
     preflightHandler: buildPreflightPass(),
     githubClientFactory,
   });
@@ -239,6 +241,7 @@ test("POST /internal/plan-apply returns 409 with preflight payload when prefligh
   const app = buildApp();
   await registerInternalPlanApplyRoute(app, {
     repoRoot,
+    env: {},
     preflightHandler: async () => ({
       role: "ORCHESTRATOR",
       bundle_hash: "bundle-hash",
@@ -292,6 +295,7 @@ test("POST /internal/plan-apply rejects legacy PLANNER role", async () => {
   const app = buildApp();
   await registerInternalPlanApplyRoute(app, {
     repoRoot,
+    env: {},
     preflightHandler: buildPreflightPass(),
     githubClientFactory: async () => ({}),
   });
@@ -312,4 +316,79 @@ test("POST /internal/plan-apply rejects legacy PLANNER role", async () => {
 
   assert.equal(reply.statusCode, 400);
   assert.deepEqual(result, { error: "body.role must be ORCHESTRATOR" });
+});
+
+test("POST /internal/plan-apply preserves bracket-prefixed titles and passes labels when provided", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-plan-apply-labels-"));
+  await writeBundleFiles(repoRoot);
+
+  const createdIssues = [];
+  const githubClientFactory = async () => ({
+    async createIssue({ title, labels }) {
+      createdIssues.push({ title, labels });
+      return {
+        issue_number: 501 + createdIssues.length,
+        issue_url: `https://github.com/benjaminlu34/agent-dashboard/issues/${501 + createdIssues.length}`,
+        issue_node_id: `I_kw_test_${501 + createdIssues.length}`,
+      };
+    },
+    async addIssueToProject() {
+      return { project_item_id: `PVTI_test_${createdIssues.length}` };
+    },
+    async setProjectFields() {},
+  });
+
+  const app = buildApp();
+  await registerInternalPlanApplyRoute(app, {
+    repoRoot,
+    env: {},
+    preflightHandler: buildPreflightPass(),
+    githubClientFactory,
+  });
+
+  const reply = buildReply();
+  const result = await app.handler(
+    {
+      body: {
+        role: "ORCHESTRATOR",
+        draft: {
+          sprint: "M1",
+          issues: [
+            {
+              title: "[SPRINT GOAL] M1: Ship kickoff",
+              goal: "Define Sprint M1 scope and success criteria.",
+              non_goals: ["No major refactors"],
+              acceptance_criteria: ["Goal issue exists and is labeled meta:sprint-goal."],
+              files_likely_touched: ["docs/"],
+              definition_of_done: ["Kickoff artifacts are created and visible in project."],
+              size: "S",
+              area: "docs",
+              priority: "P0",
+              labels: ["meta:sprint-goal"],
+            },
+            {
+              title: "[TASK] Implement kickoff validator",
+              goal: "Validate kickoff JSON output schema.",
+              non_goals: ["No new dependencies"],
+              acceptance_criteria: ["Invalid kickoff JSON fails closed."],
+              files_likely_touched: ["apps/runner/"],
+              definition_of_done: ["Unit tests cover invalid shapes."],
+              size: "S",
+              area: "infra",
+              priority: "P0",
+              initial_status: "Backlog",
+            },
+          ],
+        },
+      },
+    },
+    reply,
+  );
+
+  assert.equal(reply.statusCode, 200);
+  assert.equal(result.status, "APPLIED");
+  assert.equal(createdIssues.length, 2);
+  assert.equal(createdIssues[0].title, "[SPRINT GOAL] M1: Ship kickoff");
+  assert.deepEqual(createdIssues[0].labels, ["meta:sprint-goal"]);
+  assert.equal(createdIssues[1].title, "[TASK] Implement kickoff validator");
 });

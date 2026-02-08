@@ -49,13 +49,28 @@ Backend endpoints are the sole authority for:
 
 Runner must not bypass backend policy gates.
 
+### 4) Kickoff mode (control-plane, optional)
+
+Runner may run a gated kickoff step before starting the scheduler loop:
+- Generates a sprint goal issue plus a bounded task set via Codex MCP (JSON-only contract).
+- Applies issues via `POST /internal/plan-apply` (role `ORCHESTRATOR`).
+- Auto-promotes up to `K<=3` dependency-free `P0` tasks to `Status=Ready` via `POST /internal/project-item/update-field`.
+
+Goal issue requirements:
+- Must be labeled `meta:sprint-goal`.
+- Must remain non-dispatchable by scheduler state (Status stays `Backlog`).
+
+Note: Scheduler dispatch is status-driven; the GitHub adapter used for `listProjectItems()` does not currently include issue labels, so labels are not used for dispatch filtering.
+
 ## Dry-run semantics
 
 In dry-run mode, runner:
-- does not spawn Codex
+- does not execute worker intents (EXECUTOR/REVIEWER)
 - does not call backend write endpoints
 - logs planned actions only
 - does not persist ledger updates
+
+In kickoff dry-run mode, runner may still spawn Codex MCP to generate the kickoff JSON plan, but must not apply it (no `plan-apply` or status updates).
 
 ## Ledger semantics
 
