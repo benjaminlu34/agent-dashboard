@@ -12,7 +12,6 @@
 - `apps/web` (Next.js): chat UI, per-agent response columns, per-turn SSE client.
 - `apps/api` (Fastify): turn orchestration, provider calls, SSE stream, persistence API.
 - `packages/adapters`: provider-specific clients behind one minimal interface.
-- `packages/domain`: shared types and deterministic state transitions.
 - `packages/db`: Postgres schema + repository layer.
 
 ## Request + stream flow

@@ -8,7 +8,9 @@
   "scripts": {
     "dev": "node apps/api/src/index.js",
     "test": "node --test apps/api/test/*.test.js",
-    "orchestrator": "node apps/orchestrator/src/cli.js --once"
+    "orchestrator": "node apps/orchestrator/src/cli.js --once",
+    "runner": "python3 -m apps.runner --once",
+    "runner:dry": "python3 -m apps.runner --dry-run --once"
   },
   "dependencies": {
     "fastify": "^4.26.0"

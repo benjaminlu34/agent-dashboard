@@ -1,5 +1,5 @@
 {
-  "Planner": {
+  "Orchestrator": {
     "can_create_issues": true,
     "can_set_project_fields": true,
     "can_write_code": false,
