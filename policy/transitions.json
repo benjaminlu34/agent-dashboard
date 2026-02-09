@@ -33,7 +33,7 @@
       "from": "In Review",
       "to": "Needs Human Approval",
       "allowed_roles": [
-        "Reviewer"
+        "Orchestrator"
       ]
     },
     {
