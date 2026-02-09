@@ -4,6 +4,14 @@ from apps.runner.config import load_config
 
 
 class RunnerConfigTests(unittest.TestCase):
+    def test_defaults_backend_base_url(self) -> None:
+        config = load_config(
+            env={
+                "ORCHESTRATOR_SPRINT": "M1",
+            }
+        )
+        self.assertEqual(config.backend_base_url, "http://localhost:4000")
+
     def test_accepts_backend_timeout_s(self) -> None:
         config = load_config(
             env={

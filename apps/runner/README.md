@@ -11,8 +11,10 @@ Python-based runner that consumes `apps/orchestrator` JSONL `RUN_INTENT` lines a
 ## Environment
 
 Required:
-- `BACKEND_BASE_URL` (e.g. `http://localhost:4000`)
 - `ORCHESTRATOR_SPRINT` (e.g. `M1`)
+
+Optional:
+- `BACKEND_BASE_URL` (default `http://localhost:4000`)
 
 Optional:
 - `RUNNER_MAX_EXECUTORS` (default `1`)

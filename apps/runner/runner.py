@@ -149,6 +149,16 @@ def isNonEmptyString(value: Any) -> bool:
     return isinstance(value, str) and value.strip() != ""
 
 
+def _extract_pr_url(urls: Any) -> str:
+    if not isinstance(urls, dict):
+        return ""
+    for key in ("pr_url", "pull_request", "pr", "resolved_pr"):
+        value = urls.get(key)
+        if isNonEmptyString(value):
+            return str(value).strip()
+    return ""
+
+
 def _maybe_autopromote_ready(
     *,
     summary: Dict[str, Any],
@@ -1149,7 +1159,7 @@ class Runner:
                         reason="Reviewer PASS outcome reached; awaiting human approval.",
                     )
             if intent.role == "EXECUTOR" and result.status == "succeeded":
-                if isinstance(result.urls, dict) and isNonEmptyString(result.urls.get("pr_url")):
+                if _extract_pr_url(result.urls):
                     if result.marker_verified is not True:
                         raise CodexWorkerError(
                             "executor must verify canonical PR marker/linkage for PR runs",

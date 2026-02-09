@@ -118,6 +118,91 @@ function sleep(ms) {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
+function toIsoTimestamp(value) {
+  if (!hasNonEmptyString(value)) {
+    return "";
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return "";
+  }
+  return parsed.toISOString();
+}
+
+function isAfterIso(leftValue, rightValue) {
+  const left = toIsoTimestamp(leftValue);
+  const right = toIsoTimestamp(rightValue);
+  if (!left || !right) {
+    return false;
+  }
+  return new Date(left).getTime() > new Date(right).getTime();
+}
+
+export function mergeRunnerManagedStateFields({ nextState, diskState }) {
+  if (!nextState || typeof nextState !== "object") {
+    return nextState;
+  }
+  const nextItems = nextState.items && typeof nextState.items === "object" ? nextState.items : {};
+  const diskItems = diskState?.items && typeof diskState.items === "object" ? diskState.items : {};
+  const mergedItems = { ...nextItems };
+
+  for (const [projectItemId, nextItem] of Object.entries(nextItems)) {
+    if (!nextItem || typeof nextItem !== "object") {
+      continue;
+    }
+    const diskItem = diskItems[projectItemId];
+    if (!diskItem || typeof diskItem !== "object") {
+      continue;
+    }
+
+    const sameStatusEpoch =
+      nextItem.last_seen_status === diskItem.last_seen_status &&
+      Number.isInteger(nextItem.status_since_poll) &&
+      Number.isInteger(diskItem.status_since_poll) &&
+      nextItem.status_since_poll === diskItem.status_since_poll;
+    if (!sameStatusEpoch) {
+      continue;
+    }
+
+    const merged = { ...nextItem };
+
+    const nextReviewCycleCount =
+      Number.isInteger(nextItem.review_cycle_count) && nextItem.review_cycle_count >= 0 ? nextItem.review_cycle_count : 0;
+    const diskReviewCycleCount =
+      Number.isInteger(diskItem.review_cycle_count) && diskItem.review_cycle_count >= 0 ? diskItem.review_cycle_count : 0;
+    merged.review_cycle_count = Math.max(nextReviewCycleCount, diskReviewCycleCount);
+
+    const nextReviewerFeedbackAt = toIsoTimestamp(nextItem.last_reviewer_feedback_at);
+    const diskReviewerFeedbackAt = toIsoTimestamp(diskItem.last_reviewer_feedback_at);
+    if (diskReviewerFeedbackAt && (!nextReviewerFeedbackAt || isAfterIso(diskReviewerFeedbackAt, nextReviewerFeedbackAt))) {
+      merged.last_reviewer_feedback_at = diskReviewerFeedbackAt;
+      if (hasNonEmptyString(diskItem.last_reviewer_outcome)) {
+        merged.last_reviewer_outcome = String(diskItem.last_reviewer_outcome).trim().toUpperCase();
+      }
+    } else if (nextReviewerFeedbackAt) {
+      merged.last_reviewer_feedback_at = nextReviewerFeedbackAt;
+      if (hasNonEmptyString(nextItem.last_reviewer_outcome)) {
+        merged.last_reviewer_outcome = String(nextItem.last_reviewer_outcome).trim().toUpperCase();
+      }
+    }
+
+    const nextExecutorResponseAt = toIsoTimestamp(nextItem.last_executor_response_at);
+    const diskExecutorResponseAt = toIsoTimestamp(diskItem.last_executor_response_at);
+    if (diskExecutorResponseAt && (!nextExecutorResponseAt || isAfterIso(diskExecutorResponseAt, nextExecutorResponseAt))) {
+      merged.last_executor_response_at = diskExecutorResponseAt;
+    } else if (nextExecutorResponseAt) {
+      merged.last_executor_response_at = nextExecutorResponseAt;
+    }
+
+    mergedItems[projectItemId] = merged;
+  }
+
+  return {
+    poll_count: Number.isInteger(nextState.poll_count) ? nextState.poll_count : 0,
+    items: mergedItems,
+  };
+}
+
 async function runPreflight({ backendBaseUrl }) {
   const response = await fetch(`${backendBaseUrl}/internal/preflight?role=ORCHESTRATOR`);
   let payload = null;
@@ -324,9 +409,8 @@ export async function runOrchestratorCli({
   const sprint = resolveSprint(env);
   const statePath = resolve(process.cwd(), env.ORCHESTRATOR_STATE_PATH || DEFAULT_STATE_PATH);
 
-  let currentState = await readStateFile(statePath);
-
   do {
+    const currentState = await readStateFile(statePath);
     const cycleResult = await runCycle({
       repoRoot,
       backendBaseUrl,
@@ -339,8 +423,12 @@ export async function runOrchestratorCli({
       env,
     });
 
-    currentState = cycleResult.nextState;
-    await writeStateFile(statePath, currentState);
+    const latestState = await readStateFile(statePath);
+    const mergedState = mergeRunnerManagedStateFields({
+      nextState: cycleResult.nextState,
+      diskState: latestState,
+    });
+    await writeStateFile(statePath, mergedState);
 
     for (const intent of cycleResult.intents) {
       process.stdout.write(`${JSON.stringify(intent)}\n`);

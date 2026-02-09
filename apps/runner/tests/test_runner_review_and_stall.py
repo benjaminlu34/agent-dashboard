@@ -182,6 +182,40 @@ class RunnerReviewAndStallTests(unittest.TestCase):
                 with self.assertRaises(Exception):
                     runner._handle_intent(intent)  # pylint: disable=protected-access
 
+    def test_executor_pr_run_requires_marker_verified_for_pull_request_url_key(self) -> None:
+        backend = _BackendStub()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ledger = RunLedger(f"{tmp_dir}/runner-ledger.json")
+            runner = _build_runner(backend=backend, state_path=f"{tmp_dir}/orchestrator-state.json", ledger=ledger)
+            intent = parse_intent(
+                {
+                    "type": "RUN_INTENT",
+                    "role": "EXECUTOR",
+                    "run_id": "2f2f2f2f-2222-4222-8222-222222222222",
+                    "endpoint": "/internal/executor/claim-ready-item",
+                    "body": {
+                        "role": "EXECUTOR",
+                        "run_id": "2f2f2f2f-2222-4222-8222-222222222222",
+                        "sprint": "M1",
+                    },
+                }
+            )
+            with patch(
+                "apps.runner.runner.run_intent_with_codex_mcp",
+                return_value=WorkerResult(
+                    run_id=intent.run_id,
+                    role="EXECUTOR",
+                    status="succeeded",
+                    outcome=None,
+                    summary="Opened PR.",
+                    urls={"pull_request": "https://github.com/example/repo/pull/2"},
+                    errors=[],
+                    marker_verified=False,
+                ),
+            ):
+                with self.assertRaises(Exception):
+                    runner._handle_intent(intent)  # pylint: disable=protected-access
+
     def test_reviewer_pass_moves_item_to_needs_human_approval(self) -> None:
         backend = _BackendStub()
         with tempfile.TemporaryDirectory() as tmp_dir:

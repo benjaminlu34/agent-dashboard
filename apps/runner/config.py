@@ -4,6 +4,8 @@ from dataclasses import dataclass
 import os
 from typing import Optional
 
+DEFAULT_BACKEND_BASE_URL = "http://localhost:4000"
+
 
 @dataclass(frozen=True)
 class RunnerConfig:
@@ -78,7 +80,8 @@ def load_config(
 ) -> RunnerConfig:
     resolved_env = dict(os.environ) if env is None else dict(env)
 
-    backend_base_url = _require_non_empty(resolved_env, "BACKEND_BASE_URL").rstrip("/")
+    backend_base_url = resolved_env.get("BACKEND_BASE_URL", DEFAULT_BACKEND_BASE_URL).strip() or DEFAULT_BACKEND_BASE_URL
+    backend_base_url = backend_base_url.rstrip("/")
     backend_timeout_s = _parse_positive_float(resolved_env, "BACKEND_TIMEOUT_S", 120.0)
     if orchestrator_sprint_override is not None:
         orchestrator_sprint = orchestrator_sprint_override.strip()

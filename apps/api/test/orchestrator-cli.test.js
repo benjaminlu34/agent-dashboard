@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 
+import { mergeRunnerManagedStateFields } from "../../orchestrator/src/cli.js";
+
 const REPO_ROOT = resolve(process.cwd());
 
 function runNodeProcess({ args, env }) {
@@ -170,4 +172,73 @@ test("orchestrator CLI prints end-of-sprint summary and exits 0 when sprint is c
   assert.match(result.stderr, /"type":"DISPATCH_SUMMARY"/);
   assert.match(result.stderr, /"type":"END_OF_SPRINT_SUMMARY"/);
   assert.match(result.stderr, /Awaiting Humans|awaiting_humans/);
+});
+
+test("mergeRunnerManagedStateFields preserves newer runner feedback in same status epoch", () => {
+  const nextState = {
+    poll_count: 9,
+    items: {
+      PVTI_1: {
+        last_seen_status: "In Review",
+        status_since_poll: 4,
+        review_cycle_count: 0,
+        last_reviewer_outcome: "",
+        last_reviewer_feedback_at: "",
+        last_executor_response_at: "",
+      },
+    },
+  };
+  const diskState = {
+    poll_count: 8,
+    items: {
+      PVTI_1: {
+        last_seen_status: "In Review",
+        status_since_poll: 4,
+        review_cycle_count: 1,
+        last_reviewer_outcome: "FAIL",
+        last_reviewer_feedback_at: "2026-02-07T12:01:00.000Z",
+        last_executor_response_at: "",
+      },
+    },
+  };
+
+  const merged = mergeRunnerManagedStateFields({ nextState, diskState });
+  assert.equal(merged.items.PVTI_1.last_reviewer_outcome, "FAIL");
+  assert.equal(merged.items.PVTI_1.last_reviewer_feedback_at, "2026-02-07T12:01:00.000Z");
+  assert.equal(merged.items.PVTI_1.review_cycle_count, 1);
+});
+
+test("mergeRunnerManagedStateFields does not carry feedback across status epoch changes", () => {
+  const nextState = {
+    poll_count: 9,
+    items: {
+      PVTI_1: {
+        last_seen_status: "Ready",
+        status_since_poll: 9,
+        review_cycle_count: 0,
+        last_reviewer_outcome: "",
+        last_reviewer_feedback_at: "",
+        last_executor_response_at: "",
+      },
+    },
+  };
+  const diskState = {
+    poll_count: 8,
+    items: {
+      PVTI_1: {
+        last_seen_status: "In Review",
+        status_since_poll: 4,
+        review_cycle_count: 2,
+        last_reviewer_outcome: "FAIL",
+        last_reviewer_feedback_at: "2026-02-07T12:01:00.000Z",
+        last_executor_response_at: "2026-02-07T12:02:00.000Z",
+      },
+    },
+  };
+
+  const merged = mergeRunnerManagedStateFields({ nextState, diskState });
+  assert.equal(merged.items.PVTI_1.last_reviewer_outcome, "");
+  assert.equal(merged.items.PVTI_1.last_reviewer_feedback_at, "");
+  assert.equal(merged.items.PVTI_1.last_executor_response_at, "");
+  assert.equal(merged.items.PVTI_1.review_cycle_count, 0);
 });
