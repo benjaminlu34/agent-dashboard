@@ -151,6 +151,7 @@ class KickoffValidationTests(unittest.TestCase):
                 draft=draft,
                 dry_run=True,
                 sprint_plan_path=plan_path,
+                ready_target=1,
             )
         self.assertEqual(result["status"], "DRY_RUN")
         self.assertEqual(backend.post_calls, 0)
@@ -179,5 +180,6 @@ class KickoffValidationTests(unittest.TestCase):
                 draft=draft,
                 dry_run=False,
                 sprint_plan_path=plan_path,
+                ready_target=1,
             )
         self.assertEqual(ctx.exception.code, "kickoff_ready_set_missing_mapping")

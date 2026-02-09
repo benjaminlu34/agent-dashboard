@@ -448,9 +448,10 @@ export function buildRunPlan({
     });
   }
 
-  const activeCount =
-    summary.status_counts.Ready + summary.status_counts["In Progress"] + summary.status_counts["In Review"];
-  const completed = activeCount === 0;
+  const activeCount = summary.status_counts.Ready + summary.status_counts["In Progress"] + summary.status_counts["In Review"];
+  // Sprint is not complete if there is remaining Backlog work; runner auto-promotion relies on
+  // continued polling to observe those promotions and emit executor intents.
+  const completed = activeCount === 0 && summary.status_counts.Backlog === 0;
   summary.completed = completed;
 
   return {

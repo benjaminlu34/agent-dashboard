@@ -36,7 +36,7 @@ function parseMarkerBlock(body) {
     return null;
   }
 
-  const markerMatch = body.match(/<!-- EXECUTOR_RUN_V1\s*\n([\s\S]*?)\n-->/);
+  const markerMatch = body.match(/<!--\s*EXECUTOR_RUN_V1\s*\r?\n([\s\S]*?)\r?\n\s*-->/);
   if (!markerMatch) {
     return null;
   }
@@ -94,22 +94,33 @@ export async function assertZeroLinkedPullRequests({ githubClient, issueNumber, 
   const linked = [];
 
   for (const pr of pulls) {
-    const body = typeof pr?.body === "string" ? pr.body : "";
+    let body = typeof pr?.body === "string" ? pr.body : "";
+    let prUrl = pr?.html_url ?? "";
+    const prNumber = pr?.number;
     const refsThisIssue = hasRefsIssue(body, issueNumber);
-    const marker = parseMarkerBlock(body);
+    let marker = parseMarkerBlock(body);
+
+    // Defensive: PR list endpoints can return incomplete bodies. If we see Refs #N but
+    // can't parse the marker, re-fetch the full PR body before treating it as unmarked.
+    if (refsThisIssue && !marker && typeof githubClient.getPullRequest === "function" && body.trim().length > 0) {
+      const hydrated = await githubClient.getPullRequest({ prNumber });
+      body = typeof hydrated?.body === "string" ? hydrated.body : body;
+      prUrl = typeof hydrated?.html_url === "string" && hydrated.html_url.length > 0 ? hydrated.html_url : prUrl;
+      marker = parseMarkerBlock(body);
+    }
 
     if (hasForbiddenAutoClose(body, issueNumber)) {
       throw new ExecutorPrLinkageError("forbidden auto-close keyword detected for issue linkage", {
-        pr_number: pr?.number,
-        pr_url: pr?.html_url ?? "",
+        pr_number: prNumber,
+        pr_url: prUrl,
       });
     }
 
     if (!refsThisIssue && marker?.issue === issueNumber) {
       throw new ExecutorPrLinkageError("executor marker references issue without Refs #N", {
         ambiguous: true,
-        pr_number: pr?.number,
-        pr_url: pr?.html_url ?? "",
+        pr_number: prNumber,
+        pr_url: prUrl,
       });
     }
 
@@ -120,8 +131,8 @@ export async function assertZeroLinkedPullRequests({ githubClient, issueNumber, 
     if (!marker) {
       linked.push({
         reason: "unmarked_refs",
-        pr_number: pr?.number,
-        pr_url: pr?.html_url ?? "",
+        pr_number: prNumber,
+        pr_url: prUrl,
       });
       continue;
     }
@@ -129,22 +140,22 @@ export async function assertZeroLinkedPullRequests({ githubClient, issueNumber, 
     if (marker.issue !== issueNumber) {
       throw new ExecutorPrLinkageError("executor marker issue mismatch for Refs #N", {
         ambiguous: true,
-        pr_number: pr?.number,
-        pr_url: pr?.html_url ?? "",
+        pr_number: prNumber,
+        pr_url: prUrl,
       });
     }
     if (marker.project_item_id !== projectItemId) {
       throw new ExecutorPrLinkageError("executor marker project_item_id mismatch for issue", {
         ambiguous: true,
-        pr_number: pr?.number,
-        pr_url: pr?.html_url ?? "",
+        pr_number: prNumber,
+        pr_url: prUrl,
       });
     }
 
     linked.push({
       reason: "marked_linked_pr",
-      pr_number: pr?.number,
-      pr_url: pr?.html_url ?? "",
+      pr_number: prNumber,
+      pr_url: prUrl,
     });
   }
 

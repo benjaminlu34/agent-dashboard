@@ -24,6 +24,8 @@ class CodexWorkerPromptTests(unittest.TestCase):
         self.assertIn("Do NOT change project status directly", prompt)
         self.assertIn("Reviewer: addressed", prompt)
         self.assertIn("treat them as N/A", prompt)
+        self.assertIn("Do NOT demand videos", prompt)
+        self.assertIn("pending with zero checks", prompt)
 
     def test_executor_prompt_requires_pr_marker_verification(self) -> None:
         prompt = _build_worker_prompt(
@@ -43,6 +45,9 @@ class CodexWorkerPromptTests(unittest.TestCase):
         )
         self.assertIn("EXECUTOR_RUN_V1 marker block", prompt)
         self.assertIn("re-fetch PR body and patch it", prompt)
+        self.assertIn("Only modify files within the task's Allowed touch paths", prompt)
+        self.assertIn("MUST set marker_verified=true", prompt)
+        self.assertIn("resolve-linked-pr returns the PR marker's run_id", prompt)
         self.assertIn('"marker_verified": true|false|null', prompt)
 
     def test_extract_worker_result_requires_reviewer_outcome(self) -> None:

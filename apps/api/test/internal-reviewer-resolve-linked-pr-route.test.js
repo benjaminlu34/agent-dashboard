@@ -101,6 +101,100 @@ test("POST /internal/reviewer/resolve-linked-pr returns exactly one linked PR", 
   await app.close();
 });
 
+test("POST /internal/reviewer/resolve-linked-pr accepts indented marker closing delimiter", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "reviewer-resolve-indented-marker-"));
+  await writeBundleFiles(repoRoot);
+
+  const app = await buildTestApp({
+    repoRoot,
+    preflightHandler: buildPreflightPass(),
+    githubClientFactory: async () => ({
+      async listProjectItems() {
+        return [{ project_item_id: "PVTI_44", issue_number: 44 }];
+      },
+      async listPullRequests() {
+        return [
+          {
+            number: 91,
+            html_url: "https://github.com/benjaminlu34/agent-dashboard/pull/91",
+            body: [
+              "Refs #44",
+              "<!-- EXECUTOR_RUN_V1",
+              "issue: 44",
+              "project_item_id: PVTI_44",
+              "run_id: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+              "  -->",
+            ].join("\n"),
+          },
+        ];
+      },
+    }),
+  });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/internal/reviewer/resolve-linked-pr",
+    payload: {
+      role: "REVIEWER",
+      issue_number: 44,
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().pr_number, 91);
+  assert.equal(response.json().issue_number, 44);
+  assert.equal(response.json().project_item_id, "PVTI_44");
+  await app.close();
+});
+
+test("POST /internal/reviewer/resolve-linked-pr accepts marker header without whitespace (fenced)", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "reviewer-resolve-fenced-marker-"));
+  await writeBundleFiles(repoRoot);
+
+  const app = await buildTestApp({
+    repoRoot,
+    preflightHandler: buildPreflightPass(),
+    githubClientFactory: async () => ({
+      async listProjectItems() {
+        return [{ project_item_id: "PVTI_44", issue_number: 44 }];
+      },
+      async listPullRequests() {
+        return [
+          {
+            number: 93,
+            html_url: "https://github.com/benjaminlu34/agent-dashboard/pull/93",
+            body: [
+              "Refs #44",
+              "```text",
+              "<!--EXECUTOR_RUN_V1",
+              "issue: 44",
+              "project_item_id: PVTI_44",
+              "run_id: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+              "-->",
+              "```",
+            ].join("\n"),
+          },
+        ];
+      },
+    }),
+  });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/internal/reviewer/resolve-linked-pr",
+    payload: {
+      role: "REVIEWER",
+      issue_number: 44,
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().pr_number, 93);
+  assert.equal(response.json().issue_number, 44);
+  assert.equal(response.json().project_item_id, "PVTI_44");
+  await app.close();
+});
+
 test("POST /internal/reviewer/resolve-linked-pr returns 409 for unmarked Refs #N", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "reviewer-resolve-unmarked-"));
   await writeBundleFiles(repoRoot);
@@ -228,6 +322,58 @@ test("POST /internal/reviewer/resolve-linked-pr hydrates PR body with getPullReq
   assert.equal(response.statusCode, 200);
   assert.equal(getPullRequestCalled, true);
   assert.equal(response.json().pr_number, 90);
+  await app.close();
+});
+
+test("POST /internal/reviewer/resolve-linked-pr hydrates PR body when list body is incomplete", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "reviewer-resolve-hydrate-incomplete-body-"));
+  await writeBundleFiles(repoRoot);
+
+  let getPullRequestCalled = false;
+  const app = await buildTestApp({
+    repoRoot,
+    preflightHandler: buildPreflightPass(),
+    githubClientFactory: async () => ({
+      async listProjectItems() {
+        return [{ project_item_id: "PVTI_44", issue_number: 44 }];
+      },
+      async listPullRequests() {
+        return [
+          {
+            number: 92,
+            html_url: "https://github.com/benjaminlu34/agent-dashboard/pull/92",
+            body: "Refs #44\nBody truncated before marker.",
+          },
+        ];
+      },
+      async getPullRequest({ prNumber }) {
+        getPullRequestCalled = true;
+        assert.equal(prNumber, 92);
+        return {
+          number: 92,
+          html_url: "https://github.com/benjaminlu34/agent-dashboard/pull/92",
+          body: buildMarkerBody({
+            issueNumber: 44,
+            projectItemId: "PVTI_44",
+            runId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          }),
+        };
+      },
+    }),
+  });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/internal/reviewer/resolve-linked-pr",
+    payload: {
+      role: "REVIEWER",
+      issue_number: 44,
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(getPullRequestCalled, true);
+  assert.equal(response.json().pr_number, 92);
   await app.close();
 });
 

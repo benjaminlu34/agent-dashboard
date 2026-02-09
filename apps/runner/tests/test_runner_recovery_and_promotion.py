@@ -45,6 +45,161 @@ class RunnerPromotionAndRecoveryTests(unittest.TestCase):
         self.assertEqual(first_body["value"], "Ready")
         self.assertEqual(second_body["value"], "Ready")
 
+    def test_disjoint_owned_paths_can_be_ready_concurrently(self) -> None:
+        backend = _BackendStub()
+        summary = {
+            "sprint": "M1",
+            "status_counts": {"Ready": 0},
+            "processed_items": [
+                {"issue_number": 2, "project_item_id": "PVTI_2", "status": "Backlog"},
+                {"issue_number": 4, "project_item_id": "PVTI_4", "status": "Backlog"},
+            ],
+        }
+        sprint_plan = {
+            "sprint": "M1",
+            "tasks": [
+                {"title": "[TASK] A", "issue_number": 2, "project_item_id": "PVTI_2", "priority": "P0", "depends_on_titles": []},
+                {"title": "[TASK] B", "issue_number": 4, "project_item_id": "PVTI_4", "priority": "P0", "depends_on_titles": []},
+            ],
+            "sprint_plan": {
+                "2": {
+                    "touch_paths": ["apps/api"],
+                    "owns_paths": ["apps/api"],
+                    "conflicts_with": [],
+                    "depends_on": [],
+                    "group_id": "component:apps/api",
+                    "isolation_mode": "ISOLATED",
+                },
+                "4": {
+                    "touch_paths": ["apps/runner"],
+                    "owns_paths": ["apps/runner"],
+                    "conflicts_with": [],
+                    "depends_on": [],
+                    "group_id": "component:apps/runner",
+                    "isolation_mode": "ISOLATED",
+                },
+            },
+        }
+
+        _maybe_autopromote_ready(
+            summary=summary,
+            sprint_plan=sprint_plan,
+            backend=backend,
+            dry_run=False,
+            ready_target=2,
+        )
+
+        self.assertEqual(len(backend.calls), 2)
+        promoted = [call[1]["project_item_id"] for call in backend.calls]
+        self.assertEqual(promoted, ["PVTI_2", "PVTI_4"])
+
+    def test_overlapping_owned_paths_are_chained_and_not_both_promoted(self) -> None:
+        backend = _BackendStub()
+        summary = {
+            "sprint": "M1",
+            "status_counts": {"Ready": 0},
+            "processed_items": [
+                {"issue_number": 2, "project_item_id": "PVTI_2", "status": "Backlog"},
+                {"issue_number": 3, "project_item_id": "PVTI_3", "status": "Backlog"},
+                {"issue_number": 4, "project_item_id": "PVTI_4", "status": "Backlog"},
+            ],
+        }
+        sprint_plan = {
+            "sprint": "M1",
+            "tasks": [
+                {"title": "[TASK] API-1", "issue_number": 2, "project_item_id": "PVTI_2", "priority": "P0", "depends_on_titles": []},
+                {"title": "[TASK] API-2", "issue_number": 3, "project_item_id": "PVTI_3", "priority": "P1", "depends_on_titles": []},
+                {"title": "[TASK] Runner", "issue_number": 4, "project_item_id": "PVTI_4", "priority": "P0", "depends_on_titles": []},
+            ],
+            "sprint_plan": {
+                "2": {
+                    "touch_paths": ["apps/api"],
+                    "owns_paths": ["apps/api"],
+                    "conflicts_with": [3],
+                    "depends_on": [],
+                    "group_id": "component:apps/api",
+                    "isolation_mode": "CHAINED",
+                },
+                "3": {
+                    "touch_paths": ["apps/api"],
+                    "owns_paths": ["apps/api"],
+                    "conflicts_with": [2],
+                    "depends_on": [2],
+                    "group_id": "component:apps/api",
+                    "isolation_mode": "CHAINED",
+                },
+                "4": {
+                    "touch_paths": ["apps/runner"],
+                    "owns_paths": ["apps/runner"],
+                    "conflicts_with": [],
+                    "depends_on": [],
+                    "group_id": "component:apps/runner",
+                    "isolation_mode": "ISOLATED",
+                },
+            },
+        }
+
+        _maybe_autopromote_ready(
+            summary=summary,
+            sprint_plan=sprint_plan,
+            backend=backend,
+            dry_run=False,
+            ready_target=2,
+        )
+
+        self.assertEqual(len(backend.calls), 2)
+        promoted = [call[1]["project_item_id"] for call in backend.calls]
+        self.assertEqual(promoted, ["PVTI_2", "PVTI_4"])
+
+    def test_chained_successor_promoted_after_dependency_needs_human_approval(self) -> None:
+        backend = _BackendStub()
+        summary = {
+            "sprint": "M1",
+            "status_counts": {"Ready": 0},
+            "processed_items": [
+                {"issue_number": 2, "project_item_id": "PVTI_2", "status": "Needs Human Approval"},
+                {"issue_number": 3, "project_item_id": "PVTI_3", "status": "Backlog"},
+            ],
+        }
+        sprint_plan = {
+            "sprint": "M1",
+            "tasks": [
+                {"title": "[TASK] API-1", "issue_number": 2, "project_item_id": "PVTI_2", "priority": "P0", "depends_on_titles": []},
+                {"title": "[TASK] API-2", "issue_number": 3, "project_item_id": "PVTI_3", "priority": "P1", "depends_on_titles": []},
+            ],
+            "sprint_plan": {
+                "2": {
+                    "touch_paths": ["apps/api"],
+                    "owns_paths": ["apps/api"],
+                    "conflicts_with": [3],
+                    "depends_on": [],
+                    "group_id": "component:apps/api",
+                    "isolation_mode": "CHAINED",
+                },
+                "3": {
+                    "touch_paths": ["apps/api"],
+                    "owns_paths": ["apps/api"],
+                    "conflicts_with": [2],
+                    "depends_on": [2],
+                    "group_id": "component:apps/api",
+                    "isolation_mode": "CHAINED",
+                },
+            },
+        }
+
+        _maybe_autopromote_ready(
+            summary=summary,
+            sprint_plan=sprint_plan,
+            backend=backend,
+            dry_run=False,
+            ready_target=1,
+        )
+
+        self.assertEqual(len(backend.calls), 1)
+        _path, body = backend.calls[0]
+        self.assertEqual(body["project_item_id"], "PVTI_3")
+        self.assertEqual(body["value"], "Ready")
+
     def test_executor_failure_moves_in_progress_item_to_blocked(self) -> None:
         backend = _BackendStub()
         with tempfile.TemporaryDirectory() as tmp_dir:

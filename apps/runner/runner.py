@@ -159,6 +159,67 @@ def _extract_pr_url(urls: Any) -> str:
     return ""
 
 
+def _normalize_scope_path(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    normalized = value.strip().replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    while normalized.startswith("/"):
+        normalized = normalized[1:]
+    while normalized.endswith("/") and len(normalized) > 1:
+        normalized = normalized[:-1]
+    return normalized
+
+
+def _paths_overlap(left: Any, right: Any) -> bool:
+    left_norm = _normalize_scope_path(left)
+    right_norm = _normalize_scope_path(right)
+    if not left_norm or not right_norm:
+        return False
+    if left_norm == right_norm:
+        return True
+    if left_norm.startswith(f"{right_norm}/"):
+        return True
+    if right_norm.startswith(f"{left_norm}/"):
+        return True
+    return False
+
+
+def _extract_scope_plan(sprint_plan: Optional[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    if not isinstance(sprint_plan, dict):
+        return {}
+    raw = sprint_plan.get("sprint_plan")
+    if isinstance(raw, dict):
+        out: Dict[int, Dict[str, Any]] = {}
+        for key, value in raw.items():
+            try:
+                issue_number = int(key)
+            except (TypeError, ValueError):
+                continue
+            if issue_number <= 0 or not isinstance(value, dict):
+                continue
+            out[issue_number] = value
+        if out:
+            return out
+
+    tasks = sprint_plan.get("tasks")
+    if not isinstance(tasks, list):
+        return {}
+    out2: Dict[int, Dict[str, Any]] = {}
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        issue_number = task.get("issue_number")
+        scope = task.get("scope")
+        if not isinstance(issue_number, int) or issue_number <= 0:
+            continue
+        if not isinstance(scope, dict):
+            continue
+        out2[issue_number] = scope
+    return out2
+
+
 def _maybe_autopromote_ready(
     *,
     summary: Dict[str, Any],
@@ -193,6 +254,8 @@ def _maybe_autopromote_ready(
             continue
         status_by_issue[issue_number] = status
         project_item_id_by_issue[issue_number] = project_item_id
+
+    scope_plan = _extract_scope_plan(sprint_plan)
 
     status_counts = summary.get("status_counts")
     current_ready = 0
@@ -282,11 +345,85 @@ def _maybe_autopromote_ready(
             )
 
     eligible.sort(key=lambda t: (_priority_rank(str(t["priority"])), int(t["issue_number"])))
-    promote = eligible[:deficit]
-    if not promote:
+    if not eligible:
         return
 
-    for item in promote:
+    # Determine which owned paths are already reserved by Ready/active items.
+    reserved: list[tuple[int, str]] = []
+    for issue_number, status in status_by_issue.items():
+        if status not in ("Ready", "In Progress", "In Review", "Needs Human Approval"):
+            continue
+        meta = scope_plan.get(issue_number)
+        if not isinstance(meta, dict):
+            continue
+        owns = meta.get("owns_paths")
+        if not isinstance(owns, list):
+            continue
+        for path in owns:
+            normalized = _normalize_scope_path(path)
+            if normalized:
+                reserved.append((issue_number, normalized))
+
+    promoted_count = 0
+    for item in eligible:
+        if promoted_count >= deficit:
+            break
+        issue_number = int(item["issue_number"])
+        meta = scope_plan.get(issue_number)
+        if isinstance(meta, dict):
+            isolation_mode = str(meta.get("isolation_mode") or "").strip().upper()
+            owns_paths = meta.get("owns_paths") if isinstance(meta.get("owns_paths"), list) else []
+
+            if isolation_mode == "CHAINED":
+                depends = meta.get("depends_on") if isinstance(meta.get("depends_on"), list) else []
+                blocked_dep = None
+                for dep in depends:
+                    if not isinstance(dep, int) or dep <= 0:
+                        continue
+                    dep_status = status_by_issue.get(dep)
+                    if dep_status not in ("Needs Human Approval", "Done"):
+                        blocked_dep = (dep, dep_status)
+                        break
+                if blocked_dep is not None:
+                    dep_issue, dep_status = blocked_dep
+                    _log_stderr(
+                        {
+                            "type": "BOARD_PROMOTION_SKIPPED_DEPENDENCY",
+                            "issue_number": issue_number,
+                            "depends_on": dep_issue,
+                            "depends_on_status": dep_status or "",
+                        }
+                    )
+                    continue
+
+            conflict = None
+            for owned in owns_paths:
+                for other_issue, other_path in reserved:
+                    if other_issue == issue_number:
+                        continue
+                    # CHAINED tasks are allowed to overlap prerequisites once they reach
+                    # Needs Human Approval (or Done). Keep blocking overlaps with work
+                    # that is still being actively executed/reviewed.
+                    if isolation_mode == "CHAINED" and status_by_issue.get(other_issue) == "Needs Human Approval":
+                        continue
+                    if _paths_overlap(owned, other_path):
+                        conflict = (other_issue, _normalize_scope_path(owned), other_path)
+                        break
+                if conflict:
+                    break
+            if conflict is not None:
+                other_issue, owned_path, other_path = conflict
+                _log_stderr(
+                    {
+                        "type": "BOARD_PROMOTION_SKIPPED_CONFLICT",
+                        "issue_number": issue_number,
+                        "conflict_issue_number": other_issue,
+                        "path": owned_path,
+                        "conflict_path": other_path,
+                    }
+                )
+                continue
+
         body = {
             "role": "ORCHESTRATOR",
             "project_item_id": item["project_item_id"],
@@ -296,7 +433,7 @@ def _maybe_autopromote_ready(
         if dry_run:
             _log_stderr(
                 {
-                    "type": "BOARD_PROMOTION",
+                    "type": "BOARD_PROMOTION_APPLIED",
                     "issue_number": item["issue_number"],
                     "project_item_id": item["project_item_id"],
                     "from": "Backlog",
@@ -311,7 +448,7 @@ def _maybe_autopromote_ready(
         payload = backend.post_json("/internal/project-item/update-field", body=body)
         _log_stderr(
             {
-                "type": "BOARD_PROMOTION",
+                "type": "BOARD_PROMOTION_APPLIED",
                 "issue_number": item["issue_number"],
                 "project_item_id": item["project_item_id"],
                 "from": "Backlog",
@@ -321,6 +458,13 @@ def _maybe_autopromote_ready(
                 "backend_payload": payload,
             }
         )
+        promoted_count += 1
+        if isinstance(meta, dict):
+            owns_paths = meta.get("owns_paths") if isinstance(meta.get("owns_paths"), list) else []
+            for owned in owns_paths:
+                normalized = _normalize_scope_path(owned)
+                if normalized:
+                    reserved.append((issue_number, normalized))
 
 
 class Runner:
@@ -365,10 +509,9 @@ class Runner:
         items = state.get("items")
         if not isinstance(items, dict):
             items = {}
-        return {
-            "poll_count": state.get("poll_count") if isinstance(state.get("poll_count"), int) else 0,
-            "items": items,
-        }
+        state["poll_count"] = state.get("poll_count") if isinstance(state.get("poll_count"), int) else 0
+        state["items"] = items
+        return state
 
     def _resolve_project_state_item(self, project_item_id: str) -> Optional[Dict[str, Any]]:
         state = self._read_orchestrator_state()
@@ -1361,6 +1504,7 @@ def _build_kickoff_prompt(*, sprint: str, goal_text: str, ready_limit: int) -> t
 
     prompt = (
         "You are ORCHESTRATOR (kickoff-only). Your output is a machine-validated JSON plan.\n"
+        "You are drafting sprint issues for EXECUTOR/REVIEWER runs. You are not implementing the work yourself.\n"
         "Return JSON only. No prose. No markdown code fences.\n"
         "Do not use auto-close keywords (Closes/Fixes/Resolves #N).\n\n"
         f"Sprint: {sprint}\n"
@@ -1374,6 +1518,12 @@ def _build_kickoff_prompt(*, sprint: str, goal_text: str, ready_limit: int) -> t
         "- ready_set_titles must reference existing tasks with zero dependencies and priority=P0 only\n"
         "- goal_issue.labels must include meta:sprint-goal\n"
         "- goal_issue.fields must be exactly: Sprint=sprint, Status=Backlog, Priority=P0, Size=S, Area=docs\n\n"
+        "Quality constraints (non-negotiable):\n"
+        "- Tasks MUST be direct, executable engineering work that implements the goal.\n"
+        "- Tasks MUST implement goal.txt in code. Do not create process/runbook/template tasks unless goal.txt is about process tooling.Do NOT create meta-process tasks like: defining templates, writing runbooks, creating a backlog map, or drafting reviewer/executor checklists.\n"
+        "- Do NOT make the sprint about improving this orchestration system; the sprint is about implementing the goal in the target repository.\n"
+        "- The sprint goal issue may touch docs, but sprint tasks should generally touch real product code/assets, not just markdown.\n"
+        "- ready_set_titles should include the most dependency-free P0 implementation tasks.\n\n"
         f"Output schema (exact keys):\n{schema}\n"
         f"\n{markdown_requirements}\n"
         "Notes:\n"
@@ -1412,6 +1562,7 @@ def _apply_kickoff_plan(
     draft: Dict[str, Any],
     dry_run: bool,
     sprint_plan_path: str,
+    ready_target: int,
 ) -> Dict[str, Any]:
     ready_titles: list[str] = list(plan.get("ready_set_titles") or [])
 
@@ -1422,6 +1573,9 @@ def _apply_kickoff_plan(
     apply_payload = backend.post_json("/internal/plan-apply", body={"role": "ORCHESTRATOR", "draft": draft})
     if apply_payload.get("status") != "APPLIED":
         raise KickoffError("plan-apply did not return APPLIED", code="kickoff_plan_apply_failed", details={"payload": apply_payload})
+
+    sprint_scope_plan = apply_payload.get("sprint_plan") if isinstance(apply_payload.get("sprint_plan"), dict) else {}
+    ownership_index = apply_payload.get("ownership_index") if isinstance(apply_payload.get("ownership_index"), dict) else {}
 
     created = apply_payload.get("created")
     if not isinstance(created, list) or len(created) != len(draft.get("issues") or []):
@@ -1473,6 +1627,7 @@ def _apply_kickoff_plan(
                 "project_item_id": project_item_id,
                 "priority": task_src.get("priority"),
                 "depends_on_titles": task_src.get("depends_on_titles") or [],
+                "scope": sprint_scope_plan.get(str(issue_number)) if sprint_scope_plan else None,
             }
         )
 
@@ -1487,11 +1642,18 @@ def _apply_kickoff_plan(
         },
         "tasks": tasks_plan,
         "ready_set_titles": ready_titles,
+        "sprint_plan": sprint_scope_plan,
+        "ownership_index": ownership_index,
     }
     _atomic_write_json(sprint_plan_path, plan_cache)
     _log_stderr({"type": "SPRINT_PLAN_SAVED", "path": sprint_plan_path, "sprint": plan_cache.get("sprint")})
 
     promoted: List[Dict[str, Any]] = []
+    scope_plan = _extract_scope_plan(plan_cache)
+    title_to_issue_number = {t.get("title"): t.get("issue_number") for t in tasks_plan if isinstance(t, dict)}
+    status_by_issue = {t.get("issue_number"): "Backlog" for t in tasks_plan if isinstance(t, dict) and isinstance(t.get("issue_number"), int)}
+    reserved: list[tuple[int, str]] = []
+
     for title in ready_titles:
         project_item_id = title_to_project_item_id.get(title)
         if not project_item_id:
@@ -1501,11 +1663,116 @@ def _apply_kickoff_plan(
                 details={"title": title},
             )
 
+        issue_number = title_to_issue_number.get(title)
+        if not isinstance(issue_number, int) or issue_number <= 0:
+            raise KickoffError(
+                "ready_set task missing issue_number mapping",
+                code="kickoff_ready_set_missing_mapping",
+                details={"title": title},
+            )
+
+        meta = scope_plan.get(issue_number)
+        if isinstance(meta, dict):
+            isolation_mode = str(meta.get("isolation_mode") or "").strip().upper()
+            owns_paths = meta.get("owns_paths") if isinstance(meta.get("owns_paths"), list) else []
+            if isolation_mode == "CHAINED":
+                depends = meta.get("depends_on") if isinstance(meta.get("depends_on"), list) else []
+                blocked_dep = None
+                for dep in depends:
+                    if not isinstance(dep, int) or dep <= 0:
+                        continue
+                    dep_status = status_by_issue.get(dep)
+                    if dep_status not in ("Needs Human Approval", "Done"):
+                        blocked_dep = (dep, dep_status)
+                        break
+                if blocked_dep is not None:
+                    dep_issue, dep_status = blocked_dep
+                    _log_stderr(
+                        {
+                            "type": "BOARD_PROMOTION_SKIPPED_DEPENDENCY",
+                            "issue_number": issue_number,
+                            "depends_on": dep_issue,
+                            "depends_on_status": dep_status or "",
+                            "reason": "kickoff_ready_set",
+                        }
+                    )
+                    continue
+
+            conflict = None
+            for owned in owns_paths:
+                for other_issue, other_path in reserved:
+                    if _paths_overlap(owned, other_path):
+                        conflict = (other_issue, _normalize_scope_path(owned), other_path)
+                        break
+                if conflict:
+                    break
+            if conflict is not None:
+                other_issue, owned_path, other_path = conflict
+                _log_stderr(
+                    {
+                        "type": "BOARD_PROMOTION_SKIPPED_CONFLICT",
+                        "issue_number": issue_number,
+                        "conflict_issue_number": other_issue,
+                        "path": owned_path,
+                        "conflict_path": other_path,
+                        "reason": "kickoff_ready_set",
+                    }
+                )
+                continue
+
         update_payload = backend.post_json(
             "/internal/project-item/update-field",
             body={"role": "ORCHESTRATOR", "project_item_id": project_item_id, "field": "Status", "value": "Ready"},
         )
         promoted.append({"title": title, "project_item_id": project_item_id, "update_payload": update_payload})
+        _log_stderr(
+            {
+                "type": "BOARD_PROMOTION_APPLIED",
+                "issue_number": issue_number,
+                "project_item_id": project_item_id,
+                "from": "Backlog",
+                "to": "Ready",
+                "reason": "kickoff_ready_set",
+                "backend_payload": update_payload,
+            }
+        )
+        status_by_issue[issue_number] = "Ready"
+        if isinstance(meta, dict):
+            owns_paths = meta.get("owns_paths") if isinstance(meta.get("owns_paths"), list) else []
+            for owned in owns_paths:
+                normalized = _normalize_scope_path(owned)
+                if normalized:
+                    reserved.append((issue_number, normalized))
+
+    if not promoted:
+        # Defensive: if ready_set titles are blocked by ownership chaining, fall back
+        # to auto-promoting the earliest eligible tasks so the sprint can start.
+        processed_items = []
+        for task in tasks_plan:
+            if not isinstance(task, dict):
+                continue
+            issue_number = task.get("issue_number")
+            project_item_id = task.get("project_item_id")
+            if not isinstance(issue_number, int) or issue_number <= 0:
+                continue
+            if not isinstance(project_item_id, str) or not project_item_id.strip():
+                continue
+            processed_items.append({"issue_number": issue_number, "project_item_id": project_item_id, "status": "Backlog"})
+
+        fallback_summary = {
+            "type": "DISPATCH_SUMMARY",
+            "sprint": str(plan_cache.get("sprint") or ""),
+            "status_counts": {"Ready": 0, "Backlog": len(processed_items)},
+            "processed_items": processed_items,
+        }
+        _log_stderr({"type": "KICKOFF_READY_SET_EMPTY", "ready_set_titles": ready_titles, "fallback_ready_target": int(ready_target)})
+        _maybe_autopromote_ready(
+            summary=fallback_summary,
+            sprint_plan=plan_cache,
+            backend=backend,
+            dry_run=False,
+            ready_target=int(ready_target),
+        )
 
     return {"status": "APPLIED", "plan_apply": apply_payload, "promoted": promoted}
 
@@ -1599,6 +1866,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     draft=draft,
                     dry_run=config.dry_run,
                     sprint_plan_path=config.sprint_plan_path,
+                    ready_target=ready_limit,
                 )
             except HttpError as exc:
                 # Treat any kickoff write failure as hard stop (including 409 preflight/policy failures).

@@ -43,6 +43,107 @@ test("assertZeroLinkedPullRequests returns linked=true for marked linked PR", as
   });
 });
 
+test("assertZeroLinkedPullRequests accepts marker header without whitespace", async () => {
+  const result = await assertZeroLinkedPullRequests({
+    githubClient: {
+      async listPullRequests() {
+        return [
+          {
+            number: 12,
+            html_url: "https://github.com/org/repo/pull/12",
+            body: [
+              "Refs #44",
+              "<!--EXECUTOR_RUN_V1",
+              "issue: 44",
+              "project_item_id: PVTI_44",
+              "run_id: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+              "-->",
+            ].join("\n"),
+          },
+        ];
+      },
+    },
+    issueNumber: 44,
+    projectItemId: "PVTI_44",
+  });
+
+  assert.deepEqual(result, {
+    linked: true,
+    reason: "marked_linked_pr",
+    pr_number: 12,
+    pr_url: "https://github.com/org/repo/pull/12",
+  });
+});
+
+test("assertZeroLinkedPullRequests accepts indented marker closing delimiter", async () => {
+  const result = await assertZeroLinkedPullRequests({
+    githubClient: {
+      async listPullRequests() {
+        return [
+          {
+            number: 10,
+            html_url: "https://github.com/org/repo/pull/10",
+            body: [
+              "Refs #12",
+              "<!-- EXECUTOR_RUN_V1",
+              "issue: 12",
+              "project_item_id: PVTI_12",
+              "run_id: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+              "  -->",
+            ].join("\n"),
+          },
+        ];
+      },
+    },
+    issueNumber: 12,
+    projectItemId: "PVTI_12",
+  });
+
+  assert.deepEqual(result, {
+    linked: true,
+    reason: "marked_linked_pr",
+    pr_number: 10,
+    pr_url: "https://github.com/org/repo/pull/10",
+  });
+});
+
+test("assertZeroLinkedPullRequests hydrates PR body when list body is incomplete", async () => {
+  const result = await assertZeroLinkedPullRequests({
+    githubClient: {
+      async listPullRequests() {
+        return [
+          {
+            number: 11,
+            html_url: "https://github.com/org/repo/pull/11",
+            body: "Refs #12\nBody truncated before marker.",
+          },
+        ];
+      },
+      async getPullRequest({ prNumber }) {
+        assert.equal(prNumber, 11);
+        return {
+          number: 11,
+          html_url: "https://github.com/org/repo/pull/11",
+          body: buildMarkedBody({
+            issueNumber: 12,
+            projectItemId: "PVTI_12",
+            runId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          }),
+        };
+      },
+    },
+    issueNumber: 12,
+    projectItemId: "PVTI_12",
+  });
+
+  assert.deepEqual(result, {
+    linked: true,
+    reason: "marked_linked_pr",
+    pr_number: 11,
+    pr_url: "https://github.com/org/repo/pull/11",
+  });
+});
+
 test("assertZeroLinkedPullRequests returns linked=true for unmarked Refs #N", async () => {
   const result = await assertZeroLinkedPullRequests({
     githubClient: {

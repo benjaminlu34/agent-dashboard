@@ -64,6 +64,33 @@ test("POST /internal/plan-apply creates markdown body with headings and checkbox
   };
 
   const githubClientFactory = async () => ({
+    async listRepoDirectory({ path }) {
+      if (!path) {
+        return [
+          { name: "apps", type: "dir" },
+          { name: "policy", type: "dir" },
+          { name: "docs", type: "dir" },
+          { name: "agents", type: "dir" },
+          { name: "package.json", type: "file" },
+          { name: "pnpm-lock.yaml", type: "file" },
+        ];
+      }
+      if (path === "apps") {
+        return [
+          { name: "api", type: "dir" },
+          { name: "runner", type: "dir" },
+          { name: "orchestrator", type: "dir" },
+        ];
+      }
+      if (path === "policy") {
+        return [
+          { name: "transitions.json", type: "file" },
+          { name: "project-schema.json", type: "file" },
+          { name: "role-permissions.json", type: "file" },
+        ];
+      }
+      return [];
+    },
     async createIssue({ title, body }) {
       captured.title = title;
       captured.body = body;
@@ -79,6 +106,7 @@ test("POST /internal/plan-apply creates markdown body with headings and checkbox
     async setProjectFields({ values }) {
       captured.fieldsValues = values;
     },
+    async updateIssue() {},
   });
 
   const app = buildApp();
@@ -145,6 +173,24 @@ test("POST /internal/plan-apply returns PARTIAL_FAIL shape when a later issue fa
 
   let issueCounter = 0;
   const githubClientFactory = async () => ({
+    async listRepoDirectory({ path }) {
+      if (!path) {
+        return [
+          { name: "apps", type: "dir" },
+          { name: "policy", type: "dir" },
+          { name: "docs", type: "dir" },
+          { name: "agents", type: "dir" },
+          { name: "package.json", type: "file" },
+        ];
+      }
+      if (path === "apps") {
+        return [{ name: "api", type: "dir" }];
+      }
+      if (path === "policy") {
+        return [{ name: "transitions.json", type: "file" }];
+      }
+      return [];
+    },
     async createIssue() {
       issueCounter += 1;
       return {
@@ -160,6 +206,7 @@ test("POST /internal/plan-apply returns PARTIAL_FAIL shape when a later issue fa
       return { project_item_id: `PVTI_${issueNodeId}` };
     },
     async setProjectFields() {},
+    async updateIssue() {},
   });
 
   const app = buildApp();
@@ -324,6 +371,27 @@ test("POST /internal/plan-apply preserves bracket-prefixed titles and passes lab
 
   const createdIssues = [];
   const githubClientFactory = async () => ({
+    async listRepoDirectory({ path }) {
+      if (!path) {
+        return [
+          { name: "apps", type: "dir" },
+          { name: "policy", type: "dir" },
+          { name: "docs", type: "dir" },
+          { name: "agents", type: "dir" },
+          { name: "package.json", type: "file" },
+        ];
+      }
+      if (path === "apps") {
+        return [
+          { name: "api", type: "dir" },
+          { name: "runner", type: "dir" },
+        ];
+      }
+      if (path === "policy") {
+        return [{ name: "transitions.json", type: "file" }];
+      }
+      return [];
+    },
     async createIssue({ title, labels }) {
       createdIssues.push({ title, labels });
       return {
@@ -336,6 +404,7 @@ test("POST /internal/plan-apply preserves bracket-prefixed titles and passes lab
       return { project_item_id: `PVTI_test_${createdIssues.length}` };
     },
     async setProjectFields() {},
+    async updateIssue() {},
   });
 
   const app = buildApp();

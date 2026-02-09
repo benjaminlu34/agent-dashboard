@@ -145,6 +145,9 @@ export function mergeRunnerManagedStateFields({ nextState, diskState }) {
   const nextItems = nextState.items && typeof nextState.items === "object" ? nextState.items : {};
   const diskItems = diskState?.items && typeof diskState.items === "object" ? diskState.items : {};
   const mergedItems = { ...nextItems };
+  const sprintPlan = nextState?.sprint_plan && typeof nextState.sprint_plan === "object" ? nextState.sprint_plan : diskState?.sprint_plan;
+  const ownershipIndex =
+    nextState?.ownership_index && typeof nextState.ownership_index === "object" ? nextState.ownership_index : diskState?.ownership_index;
 
   for (const [projectItemId, nextItem] of Object.entries(nextItems)) {
     if (!nextItem || typeof nextItem !== "object") {
@@ -200,6 +203,8 @@ export function mergeRunnerManagedStateFields({ nextState, diskState }) {
   return {
     poll_count: Number.isInteger(nextState.poll_count) ? nextState.poll_count : 0,
     items: mergedItems,
+    sprint_plan: sprintPlan && typeof sprintPlan === "object" ? sprintPlan : {},
+    ownership_index: ownershipIndex && typeof ownershipIndex === "object" ? ownershipIndex : {},
   };
 }
 
@@ -257,12 +262,16 @@ async function readStateFile(statePath) {
     return {
       poll_count: Number.isInteger(parsed.poll_count) && parsed.poll_count >= 0 ? parsed.poll_count : 0,
       items: parsed.items && typeof parsed.items === "object" ? parsed.items : {},
+      sprint_plan: parsed.sprint_plan && typeof parsed.sprint_plan === "object" ? parsed.sprint_plan : {},
+      ownership_index: parsed.ownership_index && typeof parsed.ownership_index === "object" ? parsed.ownership_index : {},
     };
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
       return {
         poll_count: 0,
         items: {},
+        sprint_plan: {},
+        ownership_index: {},
       };
     }
 

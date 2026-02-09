@@ -30,8 +30,9 @@ Implement a single ready issue into production code and move delivery to review 
 ## Canonical PR Linkage Contract (Hard Invariant)
 A PR is linked to issue `N` iff:
 - PR body contains exactly `Refs #N` (case-insensitive is OK).
-- PR body contains this marker block (exact header/footer; fields required):
-  ```
+- PR body contains this marker block (fields required). GitHub hides HTML comments in rendered views, so
+  wrap the marker in a fenced code block to keep it visible while preserving the exact text:
+  ```text
   <!-- EXECUTOR_RUN_V1
   issue: N
   project_item_id: <id>
@@ -68,15 +69,23 @@ Notes:
    - Title: `[EXECUTOR] <issue title>`
    - Body MUST include:
      - `Refs #<issue_number>`
-     - The `EXECUTOR_RUN_V1` marker block with `issue`, `project_item_id`, `run_id`
+     - The `EXECUTOR_RUN_V1` marker block (inside a fenced code block) with `issue`, `project_item_id`, `run_id`
      - A short `How to test` section.
 
 6. Comment on issue with PR link + run_id.
    - Use `Refs #N` only. No auto-close keywords.
+   - Include the same `<!-- EXECUTOR_RUN_V1 ... -->` marker block (inside a fenced code block) in the issue comment (in addition to the PR body) to make linkage auditable from the issue page.
 
 7. Transition project status to In Review (backend-only).
    - Call backend `POST /internal/project-item/update-field`:
      - `{"role":"EXECUTOR","project_item_id":"<id>","field":"Status","value":"In Review"}`
+
+## Notes For In-Review Fixup Runs
+When dispatched while an issue is already `In Review`, you may be asked to resolve the linked PR via backend:
+- Call `POST /internal/reviewer/resolve-linked-pr` with `{"role":"EXECUTOR","issue_number":<N>}`.
+- The response includes `run_id`, which is the PR marker's run_id and may differ from your current `run_id`. This is normal.
+- If you update the PR, re-fetch the PR body and ensure the canonical linkage marker block is present; then report `marker_verified=true` in your worker result if you include a PR URL.
+- You MUST read the latest reviewer checklist (R1, R2, ...) on the issue and address all applicable items in your fixup run. If an item requests tests/evidence and you cannot add tests, add a deterministic manual verification script to the PR and explain why automated coverage is not feasible.
 
 ## Definition of Done
 - Code implementation is complete for one issue.

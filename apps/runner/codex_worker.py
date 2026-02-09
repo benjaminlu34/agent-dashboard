@@ -271,17 +271,28 @@ def _build_worker_prompt(*, role_bundle: Dict[str, Any], intent: Dict[str, Any],
             "- If outcome is FAIL, leave actionable checklist feedback on the issue.\n"
             "- If outcome is INCOMPLETE, leave a diagnostic issue comment with blocker details.\n"
             "- End feedback with: Reviewer: addressed (requesting evidence per item ID).\n"
+            "- Use your current REVIEWER intent run_id in the feedback header; do not use the PR marker's run_id.\n"
             "- If lint/typecheck scripts are missing in package.json, treat them as N/A and do not fail for absence alone.\n"
-            "- Provide verification evidence from available tests/scripts/logs.\n"
+            "- Do NOT demand videos, screenshots, or other human-only artifacts.\n"
+            "- Prefer verification via: (1) automated tests added/updated in the PR, (2) deterministic manual verification steps in the PR body, (3) commands you can run locally and paste output.\n"
+            "- If CI/checks are missing or pending with zero checks, treat that as N/A (not a standalone failure).\n"
+            "- Canonical linkage note: the EXECUTOR_RUN_V1 marker is often an HTML comment and will be hidden in rendered views. Trust backend /internal/reviewer/resolve-linked-pr; do not claim the marker is missing if the backend resolved the PR.\n"
+            "- If executable behavior changed and there are no tests and no runnable verification steps, FAIL with a concrete request to add tests.\n"
         )
     elif role == "EXECUTOR":
         role_specific_rules = (
             "Executor-specific constraints:\n"
             "- For any created/updated PR, enforce canonical linkage in PR body:\n"
             "  1) Refs #<issue_number>\n"
-            "  2) EXECUTOR_RUN_V1 marker block with issue, project_item_id, run_id.\n"
+            "  2) EXECUTOR_RUN_V1 marker block (inside a fenced code block) with issue, project_item_id, run_id.\n"
+            "- Also include the EXECUTOR_RUN_V1 marker block (inside a fenced code block) in your issue comment that links the PR.\n"
             "- After opening or updating PR, re-fetch PR body and patch it if marker/linkage is missing.\n"
             "- This check must be idempotent.\n"
+            "- IMPORTANT: If you output any PR URL in urls (pr_url/pull_request/pr/resolved_pr), you MUST set marker_verified=true.\n"
+            "- Note: /internal/reviewer/resolve-linked-pr returns the PR marker's run_id, which may differ from your current run_id; this is normal.\n"
+            "- Only modify files within the task's Allowed touch paths (see the issue's ## Scope section). "
+            "If you need to modify files outside scope, comment on the issue requesting scope expansion "
+            "and stop the run.\n"
         )
 
     return (

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { buildRunIntents, buildRunPlan } from "../../orchestrator/src/intents.js";
+import { computeSprintPlanMetadata, pathsOverlap } from "../src/internal/sprint-ownership.js";
 
 const ALLOWED_STATUSES = ["Backlog", "Ready", "In Progress", "In Review", "Needs Human Approval", "Blocked", "Done"];
 
@@ -139,12 +140,11 @@ test("buildRunPlan emits again when status changes to a dispatchable role", () =
   assert.equal(third.intents[0].body.issue_number, 10);
 });
 
-test("buildRunPlan marks sprint complete when no active statuses remain", () => {
+test("buildRunPlan marks sprint complete when no active statuses remain and backlog is empty", () => {
   const result = buildRunPlan({
     projectItems: [
       { issue_number: 10, project_item_id: "PVTI_10", fields: { Sprint: "M1", Status: "Done" } },
       { issue_number: 20, project_item_id: "PVTI_20", fields: { Sprint: "M1", Status: "Blocked" } },
-      { issue_number: 30, project_item_id: "PVTI_30", fields: { Sprint: "M1", Status: "Backlog" } },
     ],
     allowedStatusOptions: ALLOWED_STATUSES,
     sprint: "M1",
@@ -154,6 +154,21 @@ test("buildRunPlan marks sprint complete when no active statuses remain", () => 
   assert.equal(result.completed, true);
   assert.equal(result.summary.completed, true);
   assert.equal(result.intents.length, 0);
+});
+
+test("buildRunPlan does not mark sprint complete when backlog remains", () => {
+  const result = buildRunPlan({
+    projectItems: [
+      { issue_number: 10, project_item_id: "PVTI_10", fields: { Sprint: "M1", Status: "Done" } },
+      { issue_number: 30, project_item_id: "PVTI_30", fields: { Sprint: "M1", Status: "Backlog" } },
+    ],
+    allowedStatusOptions: ALLOWED_STATUSES,
+    sprint: "M1",
+    nowIso: "2026-02-07T12:00:00.000Z",
+  });
+
+  assert.equal(result.completed, false);
+  assert.equal(result.summary.completed, false);
 });
 
 test("buildRunPlan includes stalled In Progress entries in summary", () => {
@@ -324,4 +339,133 @@ test("buildRunIntents returns only intents array for compatibility", () => {
   assert.equal(intents.length, 2);
   assert.equal(intents[0].run_id, "run-x");
   assert.equal(intents[1].run_id, "run-y");
+});
+
+test("computeSprintPlanMetadata uses prefix overlap and chains conflicting ownership", () => {
+  assert.equal(pathsOverlap("apps/api", "apps/api/src"), true);
+  assert.equal(pathsOverlap("apps/api/src", "apps/api/src/routes"), true);
+  assert.equal(pathsOverlap("apps/api", "apps/api2"), false);
+
+  const { sprintPlan, ownershipIndex } = computeSprintPlanMetadata({
+    issues: [
+      {
+        issue_number: 2,
+        title: "[TASK] API work",
+        priority: "P0",
+        files_likely_touched: ["apps/api/src/"],
+      },
+      {
+        issue_number: 3,
+        title: "[TASK] API follow-up",
+        priority: "P1",
+        files_likely_touched: ["apps/api/src/routes/"],
+      },
+      {
+        issue_number: 4,
+        title: "[TASK] Runner task",
+        priority: "P0",
+        files_likely_touched: ["apps/runner/src/"],
+      },
+    ],
+    buckets: ["apps/api", "apps/runner", "apps", "docs", "policy"],
+    sharedCorePaths: new Set(),
+  });
+  const second = computeSprintPlanMetadata({
+    issues: [
+      {
+        issue_number: 2,
+        title: "[TASK] API work",
+        priority: "P0",
+        files_likely_touched: ["apps/api/src/"],
+      },
+      {
+        issue_number: 3,
+        title: "[TASK] API follow-up",
+        priority: "P1",
+        files_likely_touched: ["apps/api/src/routes/"],
+      },
+      {
+        issue_number: 4,
+        title: "[TASK] Runner task",
+        priority: "P0",
+        files_likely_touched: ["apps/runner/src/"],
+      },
+    ],
+    buckets: ["apps/api", "apps/runner", "apps", "docs", "policy"],
+    sharedCorePaths: new Set(),
+  });
+  assert.deepEqual(second.sprintPlan, sprintPlan);
+  assert.deepEqual(second.ownershipIndex, ownershipIndex);
+
+  assert.equal(sprintPlan["2"].isolation_mode, "CHAINED");
+  assert.deepEqual(sprintPlan["2"].conflicts_with, [3]);
+  assert.deepEqual(sprintPlan["2"].depends_on, []);
+  assert.equal(sprintPlan["3"].isolation_mode, "CHAINED");
+  assert.deepEqual(sprintPlan["3"].conflicts_with, [2]);
+  assert.deepEqual(sprintPlan["3"].depends_on, [2]);
+  assert.equal(sprintPlan["4"].isolation_mode, "ISOLATED");
+  assert.deepEqual(sprintPlan["4"].conflicts_with, []);
+
+  assert.equal(ownershipIndex["apps/api"], 2);
+  assert.equal(ownershipIndex["apps/runner"], 4);
+});
+
+test("computeSprintPlanMetadata does not assign ownership to sprint goal issues", () => {
+  const { sprintPlan } = computeSprintPlanMetadata({
+    issues: [
+      {
+        issue_number: 1,
+        title: "[ORCHESTRATOR] [SPRINT GOAL] M1: Example goal",
+        priority: "P0",
+        labels: ["meta:sprint-goal"],
+        files_likely_touched: ["Assets/Game/Runtime/"],
+      },
+      {
+        issue_number: 2,
+        title: "[TASK] A",
+        priority: "P0",
+        files_likely_touched: ["Assets/Game/Runtime/Ship/"],
+      },
+    ],
+    buckets: ["Assets/Game/Runtime", "Assets"],
+    sharedCorePaths: new Set(),
+  });
+
+  assert.deepEqual(sprintPlan["1"].owns_paths, []);
+  assert.equal(sprintPlan["1"].isolation_mode, "ISOLATED");
+});
+
+test("computeSprintPlanMetadata orders chained dependencies by plan_order", () => {
+  const { sprintPlan } = computeSprintPlanMetadata({
+    issues: [
+      {
+        issue_number: 2,
+        plan_order: 1,
+        title: "[TASK] Zeta",
+        priority: "P0",
+        files_likely_touched: ["docs/a.md"],
+      },
+      {
+        issue_number: 3,
+        plan_order: 2,
+        title: "[TASK] Alpha",
+        priority: "P0",
+        files_likely_touched: ["docs/b.md"],
+      },
+      {
+        issue_number: 4,
+        plan_order: 3,
+        title: "[TASK] Beta",
+        priority: "P0",
+        files_likely_touched: ["docs/c.md"],
+      },
+    ],
+    buckets: ["docs"],
+    sharedCorePaths: new Set(),
+  });
+
+  assert.equal(sprintPlan["2"].isolation_mode, "CHAINED");
+  assert.deepEqual(sprintPlan["2"].depends_on, []);
+  assert.deepEqual(sprintPlan["3"].depends_on, [2]);
+  assert.deepEqual(sprintPlan["4"].depends_on, [3]);
 });

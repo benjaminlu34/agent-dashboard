@@ -49,7 +49,7 @@ class RunnerCliModeTests(unittest.TestCase):
             captured["env"] = dict(env)
             return _ProcStub()
 
-        with patch.dict(os.environ, {"BACKEND_BASE_URL": "http://localhost:4000"}, clear=False):
+        with patch.dict(os.environ, {"BACKEND_BASE_URL": "http://localhost:4000"}, clear=True):
             with patch("apps.runner.runner.BackendClient", _BackendStub):
                 with patch("apps.runner.runner._spawn_orchestrator", _spawn):
                     stderr = io.StringIO()

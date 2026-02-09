@@ -330,6 +330,58 @@ export async function createGitHubPlanApplyClient({
       return parseIssueResult(payload);
     },
 
+    async updateIssue({ issueNumber, body }) {
+      if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+        throw new GitHubPlanApplyError("issueNumber must be a positive integer");
+      }
+      if (!isNonEmptyString(body)) {
+        throw new GitHubPlanApplyError("issue body is required");
+      }
+
+      const payload = await requestJson(`${restEndpoint}/repos/${ownerLogin}/${repositoryName}/issues/${issueNumber}`, {
+        method: "PATCH",
+        token: githubToken,
+        body: { body },
+      });
+
+      return parseIssueResult(payload);
+    },
+
+    async listRepoDirectory({ path = "" } = {}) {
+      const normalizedPath = isNonEmptyString(path)
+        ? path
+            .trim()
+            .replace(/\\/g, "/")
+            .replace(/^\/+/, "")
+            .replace(/\/+$/, "")
+        : "";
+      const encodedPath = normalizedPath
+        ? normalizedPath
+            .split("/")
+            .filter((segment) => segment.length > 0)
+            .map((segment) => encodeURIComponent(segment))
+            .join("/")
+        : "";
+
+      const base = `${restEndpoint}/repos/${ownerLogin}/${repositoryName}/contents`;
+      const payload = await requestJson(encodedPath ? `${base}/${encodedPath}` : base, {
+        method: "GET",
+        token: githubToken,
+      });
+
+      if (!Array.isArray(payload)) {
+        throw new GitHubPlanApplyError("unexpected GitHub contents response (expected directory listing)");
+      }
+
+      return payload
+        .map((entry) => ({
+          name: typeof entry?.name === "string" ? entry.name : "",
+          type: typeof entry?.type === "string" ? entry.type : "",
+          path: typeof entry?.path === "string" ? entry.path : "",
+        }))
+        .filter((entry) => isNonEmptyString(entry.name) && isNonEmptyString(entry.type));
+    },
+
     async addIssueToProject({ issueNodeId }) {
       const data = await requestGraphql({
         token: githubToken,

@@ -1,10 +1,16 @@
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 
 import { AgentContextBundleError, loadAgentContextBundle } from "../internal/agent-context-loader.js";
 import { createGitHubPlanApplyClient, GitHubPlanApplyError } from "../internal/github-plan-apply-client.js";
 import { buildPreflightHandler } from "./internal-preflight.js";
 import { resolveTargetIdentity, TargetIdentityError } from "../internal/target-identity.js";
+import {
+  buildRepoArchitectureMap,
+  computeSprintPlanMetadata,
+  formatScopeSection,
+} from "../internal/sprint-ownership.js";
 
 const MODULE_DIRNAME = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../../");
@@ -161,6 +167,30 @@ function buildIssueTitle(rawTitle) {
   return `[TASK] ${trimmed}`;
 }
 
+async function readOrchestratorStateFile(statePath) {
+  try {
+    const raw = await readFile(statePath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") {
+      return { poll_count: 0, items: {} };
+    }
+    return parsed;
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return { poll_count: 0, items: {} };
+    }
+    throw error;
+  }
+}
+
+async function writeOrchestratorStateFile(statePath, state) {
+  const directoryPath = dirname(statePath);
+  await mkdir(directoryPath, { recursive: true });
+  const tempPath = `${statePath}.tmp-${process.pid}`;
+  await writeFile(tempPath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  await rename(tempPath, statePath);
+}
+
 export function buildInternalPlanApplyHandler({
   repoRoot = DEFAULT_REPO_ROOT,
   env = process.env,
@@ -263,6 +293,13 @@ export function buildInternalPlanApplyHandler({
       throw error;
     }
 
+    let repoArchitecture;
+    try {
+      repoArchitecture = await buildRepoArchitectureMap({ githubClient });
+    } catch {
+      repoArchitecture = { buckets: [], shared_core_paths: new Set() };
+    }
+
     const created = [];
 
     for (let index = 0; index < normalizedIssues.length; index += 1) {
@@ -310,10 +347,65 @@ export function buildInternalPlanApplyHandler({
       });
     }
 
+    const issuesForScope = created.map((entry) => {
+      const issue = normalizedIssues[entry.index];
+      return {
+        issue_number: entry.issue_number,
+        plan_order: entry.index,
+        title: buildIssueTitle(issue.title),
+        priority: issue.priority,
+        labels: issue.labels,
+        files_likely_touched: issue.files_likely_touched,
+      };
+    });
+
+    const { sprintPlan, ownershipIndex } = computeSprintPlanMetadata({
+      issues: issuesForScope,
+      buckets: repoArchitecture.buckets,
+      sharedCorePaths: repoArchitecture.shared_core_paths,
+    });
+
+    for (const entry of created) {
+      const issue = normalizedIssues[entry.index];
+      const issueNumber = entry.issue_number;
+      const meta = sprintPlan[String(issueNumber)];
+      if (!meta) {
+        continue;
+      }
+
+      try {
+        await githubClient.updateIssue({
+          issueNumber,
+          body: `${formatIssueBody(issue)}\n\n${formatScopeSection({ meta, issueNumber })}\n`,
+        });
+      } catch (error) {
+        reply.code(502);
+        return buildPartialFailResponse({ created, index: entry.index, step: "update_issue_scope", error });
+      }
+    }
+
+    const orchestratorStatePath = resolve(repoRoot, env.ORCHESTRATOR_STATE_PATH || ".orchestrator-state.json");
+    try {
+      const state = await readOrchestratorStateFile(orchestratorStatePath);
+      const next = {
+        ...(state && typeof state === "object" ? state : {}),
+        poll_count: Number.isInteger(state?.poll_count) && state.poll_count >= 0 ? state.poll_count : 0,
+        items: state?.items && typeof state.items === "object" ? state.items : {},
+        sprint_plan: sprintPlan,
+        ownership_index: ownershipIndex,
+      };
+      await writeOrchestratorStateFile(orchestratorStatePath, next);
+    } catch (error) {
+      reply.code(502);
+      return { error: error instanceof Error ? error.message : String(error) };
+    }
+
     return {
       role: "ORCHESTRATOR",
       sprint,
       created,
+      sprint_plan: sprintPlan,
+      ownership_index: ownershipIndex,
       status: "APPLIED",
     };
   };

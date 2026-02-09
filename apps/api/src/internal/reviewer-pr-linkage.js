@@ -39,9 +39,11 @@ function parseExecutorRunMarker(body) {
     return null;
   }
 
-  const markerMatch = body.match(/<!-- EXECUTOR_RUN_V1\s*\n([\s\S]*?)\n-->/);
+  // Allow optional whitespace after `<!--` so the marker can be rendered visibly inside
+  // fenced code blocks without changing the canonical content.
+  const markerMatch = body.match(/<!--\s*EXECUTOR_RUN_V1\s*\r?\n([\s\S]*?)\r?\n\s*-->/);
   if (!markerMatch) {
-    if (body.includes("<!-- EXECUTOR_RUN_V1")) {
+    if (/<!--\s*EXECUTOR_RUN_V1/.test(body)) {
       throw createLinkageError("malformed_marker", "malformed EXECUTOR_RUN_V1 marker block", { ambiguous: true });
     }
     return null;
@@ -118,27 +120,40 @@ export async function resolveLinkedPullRequestForIssue({ githubClient, issueNumb
   for (const pr of pulls) {
     let body = typeof pr?.body === "string" ? pr.body : "";
     let prUrl = pr?.html_url ?? "";
+    const prNumber = pr?.number;
 
-    if (body.trim().length === 0) {
+    async function hydrateIfPossible(reason) {
       if (typeof githubClient.getPullRequest !== "function") {
         throw createLinkageError("ambiguous_linked_pr", "PR body unavailable and getPullRequest is not supported", {
           ambiguous: true,
-          pr_number: pr?.number,
+          reason,
+          pr_number: prNumber,
           pr_url: prUrl,
         });
       }
-      const hydrated = await githubClient.getPullRequest({ prNumber: pr?.number });
+      const hydrated = await githubClient.getPullRequest({ prNumber });
       body = typeof hydrated?.body === "string" ? hydrated.body : "";
       prUrl = typeof hydrated?.html_url === "string" && hydrated.html_url.length > 0 ? hydrated.html_url : prUrl;
     }
 
-    const refsThisIssue = hasRefsIssue(body, issueNumber);
-    const marker = parseExecutorRunMarker(body);
+    if (body.trim().length === 0) {
+      await hydrateIfPossible("empty_body");
+    }
+
+    let refsThisIssue = hasRefsIssue(body, issueNumber);
+    let marker = parseExecutorRunMarker(body);
+    // Defensive: PR list endpoints can return incomplete bodies. If we see Refs #N but
+    // can't parse the marker block, re-fetch the full PR body before failing closed.
+    if (refsThisIssue && !marker && typeof githubClient.getPullRequest === "function" && body.trim().length > 0) {
+      await hydrateIfPossible("marker_missing_from_list_body");
+      refsThisIssue = hasRefsIssue(body, issueNumber);
+      marker = parseExecutorRunMarker(body);
+    }
 
     if (hasForbiddenAutoClose(body, issueNumber)) {
       throw createLinkageError("forbidden_autoclose", "forbidden auto-close keyword detected for linked issue", {
         ambiguous: true,
-        pr_number: pr?.number,
+        pr_number: prNumber,
         pr_url: prUrl,
       });
     }
@@ -146,7 +161,7 @@ export async function resolveLinkedPullRequestForIssue({ githubClient, issueNumb
     if (!refsThisIssue && marker?.issue === issueNumber) {
       throw createLinkageError("marker_without_refs", "marker references issue without Refs #N", {
         ambiguous: true,
-        pr_number: pr?.number,
+        pr_number: prNumber,
         pr_url: prUrl,
       });
     }
@@ -158,7 +173,7 @@ export async function resolveLinkedPullRequestForIssue({ githubClient, issueNumb
     if (!marker) {
       throw createLinkageError("unmarked_refs", "unmarked_refs", {
         ambiguous: true,
-        pr_number: pr?.number,
+        pr_number: prNumber,
         pr_url: prUrl,
       });
     }
@@ -166,14 +181,14 @@ export async function resolveLinkedPullRequestForIssue({ githubClient, issueNumb
     if (marker.issue !== issueNumber) {
       throw createLinkageError("marker_issue_mismatch", "marker issue mismatch for Refs #N", {
         ambiguous: true,
-        pr_number: pr?.number,
+        pr_number: prNumber,
         pr_url: prUrl,
       });
     }
     if (marker.project_item_id !== expectedProjectItemId) {
       throw createLinkageError("project_item_id_mismatch", "marker project_item_id does not match project item for issue", {
         ambiguous: true,
-        pr_number: pr?.number,
+        pr_number: prNumber,
         pr_url: prUrl,
         issue_number: issueNumber,
         expected_project_item_id: expectedProjectItemId,
@@ -182,7 +197,7 @@ export async function resolveLinkedPullRequestForIssue({ githubClient, issueNumb
     }
 
     linked.push({
-      pr_number: pr.number,
+      pr_number: prNumber,
       pr_url: prUrl,
       issue_number: issueNumber,
       project_item_id: marker.project_item_id,
