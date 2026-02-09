@@ -218,7 +218,7 @@ test("GET /internal/preflight returns FAIL when project schema verification fail
         {
           name: "Size",
           type: "single_select",
-          options: ["S", "L", "M"],
+          options: ["S", "L"],
         },
       ],
     }),
@@ -236,6 +236,57 @@ test("GET /internal/preflight returns FAIL when project schema verification fail
   assert.equal(result.project_schema.status, "FAIL");
   assert.equal(result.status, "FAIL");
   assert.equal(result.errors.some((error) => error.source === "project_schema"), true);
+});
+
+test("GET /internal/preflight returns PASS when Status options match as a set with different order", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "agent-preflight-status-order-pass-"));
+  await writeBundleFiles(repoRoot);
+
+  const app = buildApp();
+  await registerInternalPreflightRoute(app, {
+    repoRoot,
+    projectSchemaReader: async () => ({
+      project_name: "Codex Task Board",
+      fields: [
+        {
+          name: "Status",
+          type: "single_select",
+          options: ["Done", "Blocked", "Needs Human Approval", "In Review", "In Progress", "Ready", "Backlog"],
+        },
+        {
+          name: "Size",
+          type: "single_select",
+          options: ["M", "L", "S"],
+        },
+        {
+          name: "Area",
+          type: "single_select",
+          options: ["docs", "infra", "providers", "web", "api", "db"],
+        },
+        {
+          name: "Priority",
+          type: "single_select",
+          options: ["P2", "P1", "P0"],
+        },
+        {
+          name: "Sprint",
+          type: "single_select",
+          options: ["M4", "M3", "M2", "M1"],
+        },
+      ],
+    }),
+    templateMetadataReader: async () => ({
+      path: ".github/ISSUE_TEMPLATE/milestone-task.yml",
+      size_bytes: 1,
+      sha256: "x",
+    }),
+  });
+
+  const routeReply = buildReply();
+  const result = await app.handler({ query: { role: "orchestrator" } }, routeReply);
+  assert.equal(routeReply.statusCode, 200);
+  assert.equal(result.project_schema.status, "PASS");
+  assert.equal(result.status, "PASS");
 });
 
 test("GET /internal/preflight uses TARGET_* env override instead of policy/github-project.json identity", async () => {

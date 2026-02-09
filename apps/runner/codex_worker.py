@@ -22,9 +22,11 @@ class WorkerResult:
     run_id: str
     role: str
     status: str  # succeeded|failed
+    outcome: Optional[str]
     summary: str
     urls: Dict[str, str]
     errors: list[Dict[str, Any]]
+    marker_verified: Optional[bool] = None
 
 
 _MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -147,9 +149,11 @@ def _extract_worker_result(*, content: str, expected_run_id: str, expected_role:
     run_id = parsed.get("run_id")
     role = parsed.get("role")
     status = parsed.get("status")
+    outcome = parsed.get("outcome")
     summary = parsed.get("summary")
     urls = parsed.get("urls")
     errors = parsed.get("errors")
+    marker_verified = parsed.get("marker_verified")
 
     if run_id != expected_run_id or role != expected_role:
         raise CodexWorkerError(
@@ -159,20 +163,36 @@ def _extract_worker_result(*, content: str, expected_run_id: str, expected_role:
         )
     if status not in ("succeeded", "failed"):
         raise CodexWorkerError("worker result status must be succeeded|failed", code="worker_invalid_output", details={"status": status})
+    normalized_outcome: Optional[str] = None
+    if outcome is not None:
+        if not isinstance(outcome, str):
+            raise CodexWorkerError("worker result outcome must be a string when provided", code="worker_invalid_output")
+        normalized_outcome = outcome.strip().upper()
+    if expected_role == "REVIEWER":
+        if normalized_outcome not in ("PASS", "FAIL", "INCOMPLETE"):
+            raise CodexWorkerError(
+                "reviewer worker must emit outcome PASS|FAIL|INCOMPLETE",
+                code="worker_invalid_output",
+                details={"outcome": outcome},
+            )
     if not isinstance(summary, str):
         raise CodexWorkerError("worker result summary must be a string", code="worker_invalid_output")
     if not isinstance(urls, dict):
         urls = {}
     if not isinstance(errors, list):
         errors = []
+    if marker_verified is not None and not isinstance(marker_verified, bool):
+        raise CodexWorkerError("worker result marker_verified must be a boolean when provided", code="worker_invalid_output")
 
     return WorkerResult(
         run_id=run_id,
         role=role,
         status=status,
+        outcome=normalized_outcome,
         summary=summary,
         urls={str(k): str(v) for k, v in urls.items()},
         errors=[e if isinstance(e, dict) else {"error": str(e)} for e in errors],
+        marker_verified=marker_verified,
     )
 
 
@@ -246,8 +266,22 @@ def _build_worker_prompt(*, role_bundle: Dict[str, Any], intent: Dict[str, Any],
             "Reviewer-specific constraints:\n"
             "- Leave feedback as GitHub ISSUE comments only.\n"
             "- Do NOT call github.pull_request_review_write and do NOT submit approvals.\n"
+            "- Do NOT change project status directly; runner handles status transition on PASS.\n"
             "- For findings, use checklist IDs (R1, R2, ...) and include explicit done conditions.\n"
+            "- If outcome is FAIL, leave actionable checklist feedback on the issue.\n"
+            "- If outcome is INCOMPLETE, leave a diagnostic issue comment with blocker details.\n"
             "- End feedback with: Reviewer: addressed (requesting evidence per item ID).\n"
+            "- If lint/typecheck scripts are missing in package.json, treat them as N/A and do not fail for absence alone.\n"
+            "- Provide verification evidence from available tests/scripts/logs.\n"
+        )
+    elif role == "EXECUTOR":
+        role_specific_rules = (
+            "Executor-specific constraints:\n"
+            "- For any created/updated PR, enforce canonical linkage in PR body:\n"
+            "  1) Refs #<issue_number>\n"
+            "  2) EXECUTOR_RUN_V1 marker block with issue, project_item_id, run_id.\n"
+            "- After opening or updating PR, re-fetch PR body and patch it if marker/linkage is missing.\n"
+            "- This check must be idempotent.\n"
         )
 
     return (
@@ -270,9 +304,11 @@ def _build_worker_prompt(*, role_bundle: Dict[str, Any], intent: Dict[str, Any],
         f'  \"run_id\": \"{run_id}\",\n'
         f'  \"role\": \"{role}\",\n'
         '  \"status\": \"succeeded\"|\"failed\",\n'
+        '  \"outcome\": null|\"PASS\"|\"FAIL\"|\"INCOMPLETE\",\n'
         '  \"summary\": \"...\",\n'
         '  \"urls\": {\"key\":\"value\"},\n'
-        '  \"errors\": [{\"code\":\"...\",\"message\":\"...\"}]\n'
+        '  \"errors\": [{\"code\":\"...\",\"message\":\"...\"}],\n'
+        '  \"marker_verified\": true|false|null\n'
         "}\n"
     )
 

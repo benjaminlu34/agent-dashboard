@@ -64,9 +64,9 @@ export function buildInternalReviewerResolveLinkedPrHandler({
       reply.code(400);
       return { error: "role must be a valid filename token (letters, digits, underscore)" };
     }
-    if (normalizedRole !== "REVIEWER") {
+    if (normalizedRole !== "REVIEWER" && normalizedRole !== "EXECUTOR") {
       reply.code(400);
-      return { error: "body.role must be REVIEWER" };
+      return { error: "body.role must be REVIEWER or EXECUTOR" };
     }
     if (!isPositiveInteger(issueNumber)) {
       reply.code(400);

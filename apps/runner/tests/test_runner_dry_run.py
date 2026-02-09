@@ -26,6 +26,9 @@ class RunnerDryRunTests(unittest.TestCase):
             codex_mcp_args="mcp-server",
             codex_tools_call_timeout_s=600.0,
             orchestrator_state_path="./.orchestrator-state.json",
+            review_stall_polls=50,
+            blocked_retry_minutes=15,
+            watchdog_timeout_s=900,
         )
 
         intent = parse_intent(

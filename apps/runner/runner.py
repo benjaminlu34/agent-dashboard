@@ -25,6 +25,52 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _normalize_iso(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _minutes_since(start_iso: Any, *, now_iso: str) -> int:
+    start_normalized = _normalize_iso(start_iso)
+    now_normalized = _normalize_iso(now_iso)
+    if not start_normalized or not now_normalized:
+        return 0
+    start_dt = datetime.fromisoformat(start_normalized.replace("Z", "+00:00"))
+    now_dt = datetime.fromisoformat(now_normalized.replace("Z", "+00:00"))
+    delta = now_dt - start_dt
+    if delta.total_seconds() <= 0:
+        return 0
+    return int(delta.total_seconds() // 60)
+
+
+def _seconds_since(start_iso: Any, *, now_iso: str) -> int:
+    start_normalized = _normalize_iso(start_iso)
+    now_normalized = _normalize_iso(now_iso)
+    if not start_normalized or not now_normalized:
+        return 0
+    start_dt = datetime.fromisoformat(start_normalized.replace("Z", "+00:00"))
+    now_dt = datetime.fromisoformat(now_normalized.replace("Z", "+00:00"))
+    delta = now_dt - start_dt
+    if delta.total_seconds() <= 0:
+        return 0
+    return int(delta.total_seconds())
+
+
+def _is_after_iso(left_iso: Any, right_iso: Any) -> bool:
+    left_normalized = _normalize_iso(left_iso)
+    right_normalized = _normalize_iso(right_iso)
+    if not left_normalized or not right_normalized:
+        return False
+    left_dt = datetime.fromisoformat(left_normalized.replace("Z", "+00:00"))
+    right_dt = datetime.fromisoformat(right_normalized.replace("Z", "+00:00"))
+    return left_dt > right_dt
+
+
 def classify_failure(error: Exception) -> str:
     # Returns one of: HARD_STOP, ITEM_STOP, TRANSIENT
     if isinstance(error, IntentError):
@@ -63,6 +109,19 @@ def exit_code_for_classification(classification: str) -> int:
     return 2
 
 
+def is_retryable_failure(*, failure_classification: str, error_code: str) -> bool:
+    normalized_class = str(failure_classification or "").strip().upper()
+    normalized_code = str(error_code or "").strip()
+    if normalized_class == "TRANSIENT":
+        return True
+    return normalized_code in {
+        "mcp_timeout",
+        "backend_unreachable",
+        "mcp_stdio_unavailable",
+        "mcp_error_response",
+    }
+
+
 def _atomic_write_json(path: str, obj: Dict[str, Any]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -84,6 +143,10 @@ def _load_json_file(path: str) -> Optional[Dict[str, Any]]:
 
 def _priority_rank(priority: str) -> int:
     return {"P0": 0, "P1": 1, "P2": 2}.get(priority, 99)
+
+
+def isNonEmptyString(value: Any) -> bool:
+    return isinstance(value, str) and value.strip() != ""
 
 
 def _maybe_autopromote_ready(
@@ -261,6 +324,9 @@ class Runner:
         codex_mcp_args: str,
         codex_tools_call_timeout_s: float,
         orchestrator_state_path: str,
+        review_stall_polls: int,
+        blocked_retry_minutes: int,
+        watchdog_timeout_s: int,
     ):
         self._backend = backend
         self._ledger = ledger
@@ -269,12 +335,486 @@ class Runner:
         self._codex_mcp_args = codex_mcp_args
         self._codex_tools_call_timeout_s = codex_tools_call_timeout_s
         self._orchestrator_state_path = orchestrator_state_path
+        self._review_stall_polls = review_stall_polls
+        self._blocked_retry_minutes = blocked_retry_minutes
+        self._watchdog_timeout_s = watchdog_timeout_s
 
         self._executor_queue: "queue.Queue[RunIntent]" = queue.Queue()
         self._reviewer_queue: "queue.Queue[RunIntent]" = queue.Queue()
 
         self._hard_stop_event = threading.Event()
         self._hard_stop_reason: Optional[str] = None
+
+    def _read_orchestrator_state(self) -> Dict[str, Any]:
+        try:
+            state = _load_json_file(self._orchestrator_state_path)
+        except Exception:
+            return {"poll_count": 0, "items": {}}
+        if not isinstance(state, dict):
+            return {"poll_count": 0, "items": {}}
+        items = state.get("items")
+        if not isinstance(items, dict):
+            items = {}
+        return {
+            "poll_count": state.get("poll_count") if isinstance(state.get("poll_count"), int) else 0,
+            "items": items,
+        }
+
+    def _resolve_project_state_item(self, project_item_id: str) -> Optional[Dict[str, Any]]:
+        state = self._read_orchestrator_state()
+        items = state.get("items")
+        if not isinstance(items, dict):
+            return None
+        entry = items.get(project_item_id)
+        if not isinstance(entry, dict):
+            return None
+        return entry
+
+    def _resolve_project_item_id_for_issue(self, issue_number: int) -> Optional[str]:
+        state = self._read_orchestrator_state()
+        items = state.get("items")
+        if not isinstance(items, dict):
+            return None
+        matches = []
+        for project_item_id, entry in items.items():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("last_seen_issue_number") == issue_number:
+                matches.append(project_item_id)
+        if len(matches) != 1:
+            return None
+        return matches[0]
+
+    def _update_orchestrator_state_item(self, project_item_id: str, updates: Dict[str, Any]) -> None:
+        state = self._read_orchestrator_state()
+        items = state.get("items")
+        if not isinstance(items, dict):
+            return
+        existing = items.get(project_item_id)
+        if not isinstance(existing, dict):
+            return
+        merged = {**existing, **updates}
+        items[project_item_id] = merged
+        state["items"] = items
+        _atomic_write_json(self._orchestrator_state_path, state)
+
+    def _record_reviewer_outcome_state(self, *, issue_number: int, outcome: str, recorded_at: str) -> None:
+        project_item_id = self._resolve_project_item_id_for_issue(issue_number)
+        if not project_item_id:
+            return
+        state_item = self._resolve_project_state_item(project_item_id) or {}
+        review_cycle_count = state_item.get("review_cycle_count")
+        next_cycle_count = review_cycle_count if isinstance(review_cycle_count, int) and review_cycle_count >= 0 else 0
+        if outcome in ("FAIL", "INCOMPLETE"):
+            next_cycle_count += 1
+        self._update_orchestrator_state_item(
+            project_item_id,
+            {
+                "last_reviewer_outcome": outcome,
+                "last_reviewer_feedback_at": recorded_at,
+                "review_cycle_count": next_cycle_count,
+            },
+        )
+
+    def _record_executor_response_state(self, *, run_id: str, recorded_at: str) -> None:
+        context = self._resolve_run_context(run_id)
+        if not context:
+            return
+        _issue_number, project_item_id, status = context
+        if status != "In Review":
+            return
+        self._update_orchestrator_state_item(
+            project_item_id,
+            {
+                "last_executor_response_at": recorded_at,
+            },
+        )
+
+    def _resolve_reviewer_pr_linkage(self, *, issue_number: int) -> Dict[str, Any]:
+        payload = self._backend.post_json(
+            "/internal/reviewer/resolve-linked-pr",
+            body={
+                "role": "REVIEWER",
+                "issue_number": issue_number,
+            },
+        )
+        return payload
+
+    def _transition_reviewer_pass_to_needs_human_approval(
+        self,
+        *,
+        run_id: str,
+        issue_number: int,
+        project_item_id: str,
+        pr_url: str,
+        reason: str,
+    ) -> Dict[str, Any]:
+        body = {
+            "role": "ORCHESTRATOR",
+            "project_item_id": project_item_id,
+            "field": "Status",
+            "value": "Needs Human Approval",
+            "issue_number": issue_number,
+            "pr_url": pr_url,
+            "checks_performed": [
+                "Canonical PR linkage resolved via backend",
+                "Reviewer run completed with deterministic outcome",
+            ],
+            "checks_passed": [
+                "No unresolved blocking findings remain",
+                "Item is ready for human merge decision",
+            ],
+            "human_steps": [
+                reason,
+                "Review linked PR, merge if acceptable, and move item to Done after validation.",
+            ],
+            "run_id": run_id,
+        }
+        return self._backend.post_json("/internal/project-item/update-field", body=body)
+
+    def _retry_blocked_item_to_ready(
+        self,
+        *,
+        issue_number: int,
+        project_item_id: str,
+        run_id: str,
+        blocked_minutes: int,
+        failure_classification: str,
+        error_code: str,
+    ) -> Dict[str, Any]:
+        body = {
+            "role": "ORCHESTRATOR",
+            "project_item_id": project_item_id,
+            "field": "Status",
+            "value": "Ready",
+            "issue_number": issue_number,
+            "retry_reason": "automatic_retry_after_cooldown",
+            "failure_classification": failure_classification,
+            "failure_error_code": error_code,
+            "blocked_minutes": blocked_minutes,
+            "run_id": run_id,
+            "suggested_next_steps": [
+                "Re-run executor for this item.",
+                "If failure repeats, inspect logs and keep item Blocked for human triage.",
+            ],
+        }
+        return self._backend.post_json("/internal/project-item/update-field", body=body)
+
+    def _transition_review_cycle_exceeded_to_blocked(
+        self,
+        *,
+        issue_number: int,
+        project_item_id: str,
+        run_id: str,
+        review_cycle_count: int,
+    ) -> Dict[str, Any]:
+        body = {
+            "role": "ORCHESTRATOR",
+            "project_item_id": project_item_id,
+            "field": "Status",
+            "value": "Blocked",
+            "issue_number": issue_number,
+            "failure_classification": "ITEM_STOP",
+            "failure_message": "Exceeded review iterations; needs human intervention.",
+            "suggested_next_steps": [
+                "Human triage required to unblock review loop.",
+                "Decide whether to merge, split scope, or adjust acceptance criteria.",
+            ],
+            "run_id": run_id,
+            "review_cycle_count": review_cycle_count,
+        }
+        return self._backend.post_json("/internal/project-item/update-field", body=body)
+
+    def _handle_review_stall(self, *, summary: Dict[str, Any]) -> None:
+        needs_attention = summary.get("needs_attention")
+        if not isinstance(needs_attention, dict):
+            return
+        churn_entries = needs_attention.get("in_review_churn")
+        if not isinstance(churn_entries, list):
+            return
+
+        for entry in churn_entries:
+            if not isinstance(entry, dict):
+                continue
+            issue_number = entry.get("issue_number")
+            project_item_id = entry.get("project_item_id")
+            in_review_polls = entry.get("in_review_polls")
+            if not isinstance(issue_number, int) or issue_number <= 0:
+                continue
+            if not isinstance(project_item_id, str) or not project_item_id.strip():
+                continue
+            if not isinstance(in_review_polls, int):
+                continue
+            if in_review_polls <= self._review_stall_polls:
+                continue
+
+            _log_stderr(
+                {
+                    "type": "REVIEW_STALL_DETECTED",
+                    "issue_number": issue_number,
+                    "project_item_id": project_item_id,
+                    "in_review_polls": in_review_polls,
+                    "threshold": self._review_stall_polls,
+                }
+            )
+
+            state_item = self._resolve_project_state_item(project_item_id)
+            if isinstance(state_item, dict):
+                reviewer_feedback_at = state_item.get("last_reviewer_feedback_at")
+                executor_response_at = state_item.get("last_executor_response_at")
+                if _is_after_iso(executor_response_at, reviewer_feedback_at):
+                    continue
+            reviewer_dispatches = 0
+            if isinstance(state_item, dict):
+                dispatches_value = state_item.get("reviewer_dispatches_for_current_status")
+                if isinstance(dispatches_value, int):
+                    reviewer_dispatches = dispatches_value
+
+            # Escalate only after the bounded second reviewer attempt has already happened.
+            if reviewer_dispatches < 2:
+                continue
+
+            try:
+                linkage = self._resolve_reviewer_pr_linkage(issue_number=issue_number)
+                pr_url = linkage.get("pr_url")
+                if not isinstance(pr_url, str) or not pr_url.strip():
+                    raise HttpError("review linkage missing pr_url", code="backend_invalid_payload", payload=linkage)
+                linkage_project_item_id = linkage.get("project_item_id")
+                if linkage_project_item_id != project_item_id:
+                    raise HttpError(
+                        "review linkage project_item_id mismatch",
+                        code="backend_invalid_payload",
+                        payload={
+                            "expected_project_item_id": project_item_id,
+                            "actual_project_item_id": linkage_project_item_id,
+                        },
+                    )
+
+                payload = self._transition_reviewer_pass_to_needs_human_approval(
+                    run_id=str(entry.get("last_run_id") or ""),
+                    issue_number=issue_number,
+                    project_item_id=project_item_id,
+                    pr_url=pr_url.strip(),
+                    reason=(
+                        "Escalated by orchestrator after repeated In Review stall; "
+                        "manual decision required."
+                    ),
+                )
+                _log_stderr(
+                    {
+                        "type": "REVIEW_STALL_ESCALATED",
+                        "issue_number": issue_number,
+                        "project_item_id": project_item_id,
+                        "in_review_polls": in_review_polls,
+                        "backend_payload": payload,
+                    }
+                )
+            except Exception as exc:
+                _log_stderr(
+                    {
+                        "type": "REVIEW_STALL_ESCALATED",
+                        "issue_number": issue_number,
+                        "project_item_id": project_item_id,
+                        "in_review_polls": in_review_polls,
+                        "error": str(exc),
+                        "status": "failed",
+                    }
+                )
+
+    def _handle_blocked_retries(self, *, summary: Dict[str, Any]) -> None:
+        processed_items = summary.get("processed_items")
+        if not isinstance(processed_items, list):
+            return
+
+        now_iso = _utc_now_iso()
+        for item in processed_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("status") != "Blocked":
+                continue
+            issue_number = item.get("issue_number")
+            project_item_id = item.get("project_item_id")
+            if not isinstance(issue_number, int) or issue_number <= 0:
+                continue
+            if not isinstance(project_item_id, str) or not project_item_id.strip():
+                continue
+
+            state_item = self._resolve_project_state_item(project_item_id)
+            if not isinstance(state_item, dict):
+                continue
+            blocked_minutes = _minutes_since(state_item.get("status_since_at"), now_iso=now_iso)
+            if blocked_minutes < self._blocked_retry_minutes:
+                continue
+
+            run_id = str(state_item.get("last_run_id") or "")
+            if not run_id or not self._ledger:
+                continue
+            ledger_entry = self._ledger.get(run_id)
+            if not isinstance(ledger_entry, dict):
+                continue
+            result = ledger_entry.get("result")
+            if not isinstance(result, dict):
+                continue
+            failure_classification = str(result.get("failure_classification") or "")
+            error_code = str(result.get("error_code") or "")
+            if not is_retryable_failure(
+                failure_classification=failure_classification,
+                error_code=error_code,
+            ):
+                continue
+
+            try:
+                payload = self._retry_blocked_item_to_ready(
+                    issue_number=issue_number,
+                    project_item_id=project_item_id,
+                    run_id=run_id,
+                    blocked_minutes=blocked_minutes,
+                    failure_classification=failure_classification,
+                    error_code=error_code,
+                )
+                _log_stderr(
+                    {
+                        "type": "BLOCKED_RETRY",
+                        "issue_number": issue_number,
+                        "project_item_id": project_item_id,
+                        "blocked_minutes": blocked_minutes,
+                        "failure_classification": failure_classification,
+                        "error_code": error_code,
+                        "backend_payload": payload,
+                    }
+                )
+            except Exception as exc:
+                _log_stderr(
+                    {
+                        "type": "BLOCKED_RETRY",
+                        "issue_number": issue_number,
+                        "project_item_id": project_item_id,
+                        "blocked_minutes": blocked_minutes,
+                        "failure_classification": failure_classification,
+                        "error_code": error_code,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
+
+    def _handle_in_review_cycle_caps(self, *, summary: Dict[str, Any]) -> None:
+        processed_items = summary.get("processed_items")
+        if not isinstance(processed_items, list):
+            return
+
+        for item in processed_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("status") != "In Review":
+                continue
+            issue_number = item.get("issue_number")
+            project_item_id = item.get("project_item_id")
+            if not isinstance(issue_number, int) or issue_number <= 0:
+                continue
+            if not isinstance(project_item_id, str) or not project_item_id.strip():
+                continue
+            state_item = self._resolve_project_state_item(project_item_id)
+            if not isinstance(state_item, dict):
+                continue
+            review_cycle_count = state_item.get("review_cycle_count")
+            if not isinstance(review_cycle_count, int) or review_cycle_count < 5:
+                continue
+            run_id = str(state_item.get("last_run_id") or "")
+            try:
+                payload = self._transition_review_cycle_exceeded_to_blocked(
+                    issue_number=issue_number,
+                    project_item_id=project_item_id,
+                    run_id=run_id,
+                    review_cycle_count=review_cycle_count,
+                )
+                _log_stderr(
+                    {
+                        "type": "REVIEW_CYCLE_CAP_BLOCKED",
+                        "issue_number": issue_number,
+                        "project_item_id": project_item_id,
+                        "review_cycle_count": review_cycle_count,
+                        "backend_payload": payload,
+                    }
+                )
+            except Exception as exc:
+                _log_stderr(
+                    {
+                        "type": "REVIEW_CYCLE_CAP_BLOCKED",
+                        "issue_number": issue_number,
+                        "project_item_id": project_item_id,
+                        "review_cycle_count": review_cycle_count,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
+
+    def _handle_running_watchdog(self, *, summary: Dict[str, Any]) -> None:
+        if not self._ledger:
+            return
+        processed_items = summary.get("processed_items")
+        if not isinstance(processed_items, list):
+            return
+        now_iso = _utc_now_iso()
+
+        for item in processed_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("status") != "In Progress":
+                continue
+            issue_number = item.get("issue_number")
+            project_item_id = item.get("project_item_id")
+            if not isinstance(issue_number, int) or issue_number <= 0:
+                continue
+            if not isinstance(project_item_id, str) or not project_item_id.strip():
+                continue
+            state_item = self._resolve_project_state_item(project_item_id)
+            if not isinstance(state_item, dict):
+                continue
+            run_id = str(state_item.get("last_run_id") or "")
+            if not run_id:
+                continue
+            ledger_entry = self._ledger.get(run_id)
+            if not isinstance(ledger_entry, dict) or ledger_entry.get("status") != "running":
+                continue
+            started_at = ledger_entry.get("running_at") or ledger_entry.get("received_at")
+            elapsed_seconds = _seconds_since(started_at, now_iso=now_iso)
+            if elapsed_seconds <= self._watchdog_timeout_s:
+                continue
+
+            message = f"Worker exceeded watchdog timeout ({self._watchdog_timeout_s}s)."
+            self._ledger.mark_result(
+                run_id,
+                status="failed",
+                result={
+                    "status": "failed",
+                    "summary": message,
+                    "urls": {},
+                    "errors": [{"code": "watchdog_timeout", "message": message}],
+                    "failure_classification": "HARD_STOP",
+                    "error_code": "watchdog_timeout",
+                },
+            )
+            _log_stderr(
+                {
+                    "type": "WORKER_WATCHDOG_TIMEOUT",
+                    "run_id": run_id,
+                    "issue_number": issue_number,
+                    "project_item_id": project_item_id,
+                    "elapsed_s": elapsed_seconds,
+                    "timeout_s": self._watchdog_timeout_s,
+                }
+            )
+            self._transition_executor_failure_to_blocked(
+                run_id=run_id,
+                failure_classification="HARD_STOP",
+                failure_message=message,
+            )
+
+    def handle_dispatch_summary(self, *, summary: Dict[str, Any]) -> None:
+        self._handle_review_stall(summary=summary)
+        self._handle_blocked_retries(summary=summary)
+        self._handle_in_review_cycle_caps(summary=summary)
+        self._handle_running_watchdog(summary=summary)
 
     def hard_stop(self, reason: str) -> None:
         self._hard_stop_reason = reason
@@ -501,6 +1041,7 @@ class Runner:
         except Exception as exc:
             heartbeat_stop.set()
             failure_classification = classify_failure(exc)
+            error_code = exc.code if isinstance(exc, (CodexWorkerError, HttpError, IntentError)) else "unknown_error"
             _log_stderr(
                 {
                     "type": "WORKER_FAILED",
@@ -508,9 +1049,27 @@ class Runner:
                     "run_id": intent.run_id,
                     "elapsed_s": int(time.time() - started_at),
                     "classification": failure_classification,
+                    "error_code": error_code,
                     "error": str(exc),
                 }
             )
+            if intent.role == "REVIEWER":
+                _log_stderr(
+                    {
+                        "type": "REVIEW_OUTCOME",
+                        "role": "REVIEWER",
+                        "run_id": intent.run_id,
+                        "outcome": "INCOMPLETE",
+                        "source": "worker_exception",
+                    }
+                )
+                issue_number = intent.body.get("issue_number")
+                if isinstance(issue_number, int) and issue_number > 0:
+                    self._record_reviewer_outcome_state(
+                        issue_number=issue_number,
+                        outcome="INCOMPLETE",
+                        recorded_at=_utc_now_iso(),
+                    )
             if intent.role == "EXECUTOR":
                 self._transition_executor_failure_to_blocked(
                     run_id=intent.run_id,
@@ -521,42 +1080,179 @@ class Runner:
                 self._ledger.mark_result(
                     intent.run_id,
                     status="failed",
-                    result={"status": "failed", "summary": str(exc), "urls": {}, "errors": [{"error": str(exc)}]},
+                    result={
+                        "status": "failed",
+                        "summary": str(exc),
+                        "urls": {},
+                        "errors": [{"error": str(exc), "code": error_code}],
+                        "failure_classification": failure_classification,
+                        "error_code": error_code,
+                        "reviewer_outcome": "INCOMPLETE" if intent.role == "REVIEWER" else None,
+                        "last_reviewer_feedback_at": _utc_now_iso() if intent.role == "REVIEWER" else None,
+                        "last_executor_response_at": None,
+                    },
                 )
             raise
 
         heartbeat_stop.set()
-        _log_stderr(
-            {
-                "type": "WORKER_FINISHED",
-                "role": intent.role,
-                "run_id": intent.run_id,
-                "elapsed_s": int(time.time() - started_at),
-                "status": result.status,
-                "summary": result.summary[:500],
-                "urls": result.urls,
-                "errors_count": len(result.errors),
-            }
-        )
-        if self._ledger:
-            self._ledger.mark_result(
-                intent.run_id,
-                status="succeeded" if result.status == "succeeded" else "failed",
-                result={
-                    "run_id": result.run_id,
-                    "role": result.role,
+        reviewer_outcome = result.outcome if intent.role == "REVIEWER" else None
+        completed_at = _utc_now_iso()
+        review_cycle_count_for_result: Optional[int] = None
+        try:
+            if intent.role == "REVIEWER":
+                if reviewer_outcome not in ("PASS", "FAIL", "INCOMPLETE"):
+                    raise CodexWorkerError(
+                        "reviewer outcome is required",
+                        code="worker_invalid_output",
+                        details={"outcome": reviewer_outcome},
+                    )
+                _log_stderr(
+                    {
+                        "type": "REVIEW_OUTCOME",
+                        "role": "REVIEWER",
+                        "run_id": intent.run_id,
+                        "outcome": reviewer_outcome,
+                        "status": result.status,
+                    }
+                )
+                issue_number = intent.body.get("issue_number")
+                if isinstance(issue_number, int) and issue_number > 0:
+                    self._record_reviewer_outcome_state(
+                        issue_number=issue_number,
+                        outcome=reviewer_outcome,
+                        recorded_at=completed_at,
+                    )
+                    project_item_id = self._resolve_project_item_id_for_issue(issue_number)
+                    if project_item_id:
+                        state_item = self._resolve_project_state_item(project_item_id)
+                        if isinstance(state_item, dict) and isinstance(state_item.get("review_cycle_count"), int):
+                            review_cycle_count_for_result = state_item.get("review_cycle_count")
+                if reviewer_outcome == "PASS":
+                    if not isinstance(issue_number, int) or issue_number <= 0:
+                        raise HttpError(
+                            "reviewer pass requires issue_number in intent body",
+                            code="backend_invalid_payload",
+                            payload=intent.body,
+                        )
+                    linkage = self._resolve_reviewer_pr_linkage(issue_number=issue_number)
+                    pr_url = linkage.get("pr_url")
+                    project_item_id = linkage.get("project_item_id")
+                    if not isinstance(pr_url, str) or not pr_url.strip():
+                        raise HttpError("review linkage missing pr_url", code="backend_invalid_payload", payload=linkage)
+                    if not isinstance(project_item_id, str) or not project_item_id.strip():
+                        raise HttpError("review linkage missing project_item_id", code="backend_invalid_payload", payload=linkage)
+                    self._transition_reviewer_pass_to_needs_human_approval(
+                        run_id=intent.run_id,
+                        issue_number=issue_number,
+                        project_item_id=project_item_id.strip(),
+                        pr_url=pr_url.strip(),
+                        reason="Reviewer PASS outcome reached; awaiting human approval.",
+                    )
+            if intent.role == "EXECUTOR" and result.status == "succeeded":
+                if isinstance(result.urls, dict) and isNonEmptyString(result.urls.get("pr_url")):
+                    if result.marker_verified is not True:
+                        raise CodexWorkerError(
+                            "executor must verify canonical PR marker/linkage for PR runs",
+                            code="worker_invalid_output",
+                            details={"run_id": intent.run_id},
+                        )
+                self._record_executor_response_state(
+                    run_id=intent.run_id,
+                    recorded_at=completed_at,
+                )
+            _log_stderr(
+                {
+                    "type": "WORKER_FINISHED",
+                    "role": intent.role,
+                    "run_id": intent.run_id,
+                    "elapsed_s": int(time.time() - started_at),
                     "status": result.status,
-                    "summary": result.summary,
+                    "summary": result.summary[:500],
                     "urls": result.urls,
-                    "errors": result.errors,
-                },
+                    "errors_count": len(result.errors),
+                }
             )
-        if intent.role == "EXECUTOR" and result.status != "succeeded":
-            self._transition_executor_failure_to_blocked(
-                run_id=intent.run_id,
-                failure_classification="ITEM_STOP",
-                failure_message=result.summary,
+            if self._ledger:
+                first_error = result.errors[0] if isinstance(result.errors, list) and len(result.errors) > 0 else {}
+                error_code = first_error.get("code") if isinstance(first_error, dict) else ""
+                self._ledger.mark_result(
+                    intent.run_id,
+                    status="succeeded" if result.status == "succeeded" else "failed",
+                    result={
+                        "run_id": result.run_id,
+                        "role": result.role,
+                        "status": result.status,
+                        "summary": result.summary,
+                        "urls": result.urls,
+                        "errors": result.errors,
+                        "reviewer_outcome": reviewer_outcome,
+                        "last_reviewer_feedback_at": completed_at if intent.role == "REVIEWER" else None,
+                        "last_executor_response_at": completed_at if intent.role == "EXECUTOR" else None,
+                        "review_cycle_count": review_cycle_count_for_result if intent.role == "REVIEWER" else None,
+                        "failure_classification": "ITEM_STOP" if result.status != "succeeded" else "",
+                        "error_code": str(error_code or ""),
+                    },
+                )
+            if intent.role == "EXECUTOR" and result.status != "succeeded":
+                self._transition_executor_failure_to_blocked(
+                    run_id=intent.run_id,
+                    failure_classification="ITEM_STOP",
+                    failure_message=result.summary,
+                )
+        except Exception as exc:
+            failure_classification = classify_failure(exc)
+            error_code = exc.code if isinstance(exc, (CodexWorkerError, HttpError, IntentError)) else "unknown_error"
+            if intent.role == "REVIEWER":
+                _log_stderr(
+                    {
+                        "type": "REVIEW_OUTCOME",
+                        "role": "REVIEWER",
+                        "run_id": intent.run_id,
+                        "outcome": "INCOMPLETE",
+                        "source": "post_processing_exception",
+                    }
+                )
+                issue_number = intent.body.get("issue_number")
+                if isinstance(issue_number, int) and issue_number > 0:
+                    self._record_reviewer_outcome_state(
+                        issue_number=issue_number,
+                        outcome="INCOMPLETE",
+                        recorded_at=_utc_now_iso(),
+                    )
+            _log_stderr(
+                {
+                    "type": "WORKER_FAILED",
+                    "role": intent.role,
+                    "run_id": intent.run_id,
+                    "elapsed_s": int(time.time() - started_at),
+                    "classification": failure_classification,
+                    "error_code": error_code,
+                    "error": str(exc),
+                }
             )
+            if self._ledger:
+                self._ledger.mark_result(
+                    intent.run_id,
+                    status="failed",
+                    result={
+                        "status": "failed",
+                        "summary": str(exc),
+                        "urls": {},
+                        "errors": [{"error": str(exc), "code": error_code}],
+                        "failure_classification": failure_classification,
+                        "error_code": error_code,
+                        "reviewer_outcome": "INCOMPLETE" if intent.role == "REVIEWER" else None,
+                        "last_reviewer_feedback_at": _utc_now_iso() if intent.role == "REVIEWER" else None,
+                        "last_executor_response_at": None,
+                    },
+                )
+            if intent.role == "EXECUTOR":
+                self._transition_executor_failure_to_blocked(
+                    run_id=intent.run_id,
+                    failure_classification=failure_classification,
+                    failure_message=str(exc),
+                )
+            raise
 
 
 def _log_stderr(obj: Dict[str, Any]) -> None:
@@ -929,6 +1625,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         codex_mcp_args=config.codex_mcp_args,
         codex_tools_call_timeout_s=config.codex_tools_call_timeout_s,
         orchestrator_state_path=config.orchestrator_state_path,
+        review_stall_polls=config.review_stall_polls,
+        blocked_retry_minutes=config.blocked_retry_minutes,
+        watchdog_timeout_s=config.watchdog_timeout_s,
     )
 
     # Spawn worker threads.
@@ -953,11 +1652,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Allow bounded reviewer retries without manual state-file resets.
     orchestrator_env["ORCHESTRATOR_MAX_REVIEWER_DISPATCHES_PER_STATUS"] = os.environ.get(
         "ORCHESTRATOR_MAX_REVIEWER_DISPATCHES_PER_STATUS",
-        "3",
+        "2",
     )
     orchestrator_env["ORCHESTRATOR_REVIEWER_RETRY_POLLS"] = os.environ.get(
         "ORCHESTRATOR_REVIEWER_RETRY_POLLS",
-        "10",
+        str(config.review_stall_polls),
     )
     if config.once:
         if "--loop" in config.orchestrator_cmd:
@@ -990,6 +1689,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             "orchestrator_cmd": orchestrator_cmd,
             "ready_buffer": config.runner_ready_buffer,
             "autopromote": config.autopromote,
+            "review_stall_polls": config.review_stall_polls,
+            "blocked_retry_minutes": config.blocked_retry_minutes,
+            "watchdog_timeout_s": config.watchdog_timeout_s,
             "reviewer_retry": {
                 "max_dispatches_per_status": orchestrator_env["ORCHESTRATOR_MAX_REVIEWER_DISPATCHES_PER_STATUS"],
                 "retry_polls": orchestrator_env["ORCHESTRATOR_REVIEWER_RETRY_POLLS"],
@@ -1037,6 +1739,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                             dry_run=config.dry_run,
                             ready_target=config.runner_ready_buffer,
                         )
+                        if not config.dry_run:
+                            runner.handle_dispatch_summary(summary=payload)
                     continue
 
                 try:

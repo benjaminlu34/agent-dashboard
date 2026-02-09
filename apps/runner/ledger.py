@@ -72,6 +72,7 @@ class RunLedger:
             if not existing:
                 raise LedgerError("cannot mark running: run_id not in ledger")
             existing["status"] = "running"
+            existing["running_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             existing["result"] = existing.get("result")
             self._atomic_write()
 
@@ -93,4 +94,3 @@ class RunLedger:
             json.dump(self._data, handle, indent=2, sort_keys=True)
             handle.write("\n")
         os.replace(temp_path, self._path)
-

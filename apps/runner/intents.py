@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 ALLOWED_ROLES = {"EXECUTOR", "REVIEWER"}
 INTENT_TYPE = "RUN_INTENT"
 ALLOWED_ENDPOINTS_BY_ROLE = {
-    "EXECUTOR": {"/internal/executor/claim-ready-item"},
+    "EXECUTOR": {"/internal/executor/claim-ready-item", "/internal/reviewer/resolve-linked-pr"},
     "REVIEWER": {"/internal/reviewer/resolve-linked-pr"},
 }
 

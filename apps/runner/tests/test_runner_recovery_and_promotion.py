@@ -73,6 +73,9 @@ class RunnerPromotionAndRecoveryTests(unittest.TestCase):
                 codex_mcp_args="mcp-server",
                 codex_tools_call_timeout_s=600.0,
                 orchestrator_state_path=state_path,
+                review_stall_polls=50,
+                blocked_retry_minutes=15,
+                watchdog_timeout_s=900,
             )
             runner._transition_executor_failure_to_blocked(
                 run_id="run-44",
@@ -89,4 +92,3 @@ class RunnerPromotionAndRecoveryTests(unittest.TestCase):
         self.assertEqual(body["value"], "Blocked")
         self.assertEqual(body["issue_number"], 44)
         self.assertEqual(body["failure_classification"], "ITEM_STOP")
-

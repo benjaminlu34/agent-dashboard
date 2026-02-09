@@ -1,13 +1,12 @@
 # Reviewer v1 Runbook (Single Issue)
 
-This runbook defines a minimal Reviewer v1 workflow. Reviewer is read/write for review artifacts and the `In Review` -> `Needs Human Approval` project handoff only.
+This runbook defines a minimal Reviewer v1 workflow. Reviewer is comment-only for review artifacts; runner performs status handoff on reviewer `PASS`.
 
 ## Inputs
 
 - Backend endpoints:
   - `GET /internal/preflight?role=REVIEWER`
   - `POST /internal/reviewer/resolve-linked-pr`
-  - `POST /internal/project-item/update-field`
 - MCP tools:
   - `github.issue_read`
   - `github.pull_request_read`
@@ -16,11 +15,11 @@ This runbook defines a minimal Reviewer v1 workflow. Reviewer is read/write for 
 ## Invariants
 
 - Reviewer must not modify code.
-- Reviewer may only change GitHub Project Status for `In Review` -> `Needs Human Approval`.
+- Reviewer does not change project status directly.
 - Reviewer must not merge PRs or close issues.
 - One PR per issue enforced with deterministic linkage.
 - Fail closed on ambiguity.
-- PASS review must hand off by changing project status to `Needs Human Approval`.
+- PASS review must emit reviewer outcome `PASS`; runner applies status handoff.
 
 ## Procedure
 
@@ -66,21 +65,12 @@ This runbook defines a minimal Reviewer v1 workflow. Reviewer is read/write for 
      - Do not submit any PR approval.
      - Continue to handoff step.
 
-7. Emit merge-ready human signal and handoff (PASS path only).
+7. Emit merge-ready human signal (PASS path only).
    - Add PR comment via `github.add_issue_comment` on PR number:
      - Include `@<HUMAN> merge-ready`.
      - Include reviewed head SHA and short verification checklist.
-   - Call backend `POST /internal/project-item/update-field` with:
-     - `role=REVIEWER`
-     - `project_item_id=<project_item_id>`
-     - `field=Status`
-     - `value=Needs Human Approval`
-     - `issue_number=<issue_number>`
-     - `pr_url=<pr_url>`
-     - `checks_performed=<list of checks executed>`
-     - `checks_passed=<list of checks that passed>`
-     - `human_steps=<list, e.g. approve/merge PR and verify deployment>`
-   - This call records the human handoff comment on the issue.
+  - Return worker outcome `PASS` in structured runner result.
+  - Runner transitions `In Review` -> `Needs Human Approval` and records handoff comment.
    - Do not merge and do not close issue.
 
 8. End.

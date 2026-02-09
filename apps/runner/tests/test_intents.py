@@ -56,3 +56,19 @@ class IntentParsingTests(unittest.TestCase):
                 }
             )
         self.assertEqual(ctx.exception.code, "intent_endpoint_not_allowed")
+
+    def test_accepts_executor_in_review_resolve_endpoint(self) -> None:
+        intent = parse_intent(
+            {
+                "type": "RUN_INTENT",
+                "role": "EXECUTOR",
+                "run_id": "33333333-3333-4333-8333-333333333333",
+                "endpoint": "/internal/reviewer/resolve-linked-pr",
+                "body": {
+                    "role": "EXECUTOR",
+                    "run_id": "33333333-3333-4333-8333-333333333333",
+                    "issue_number": 3,
+                },
+            }
+        )
+        self.assertEqual(intent.endpoint, "/internal/reviewer/resolve-linked-pr")

@@ -9,14 +9,28 @@ function normalizeOptions(options) {
   if (!Array.isArray(options)) {
     return [];
   }
-  return options.filter((option) => typeof option === "string");
+  const normalized = options
+    .filter((option) => typeof option === "string")
+    .map((option) => option.trim())
+    .filter((option) => option.length > 0);
+  return Array.from(new Set(normalized));
 }
 
-function equalStringArrays(left, right) {
+function equalStringSets(left, right) {
   if (left.length !== right.length) {
     return false;
   }
-  return left.every((value, index) => value === right[index]);
+  const leftSet = new Set(left);
+  const rightSet = new Set(right);
+  if (leftSet.size !== rightSet.size) {
+    return false;
+  }
+  for (const value of leftSet) {
+    if (!rightSet.has(value)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function compareProjectSchema(requiredSchema, liveSchema) {
@@ -70,7 +84,7 @@ export function compareProjectSchema(requiredSchema, liveSchema) {
       const normalizedExpectedOptions = expectedOptions ?? [];
       const normalizedActualOptions = actualOptions ?? [];
 
-      if (!equalStringArrays(normalizedExpectedOptions, normalizedActualOptions)) {
+      if (!equalStringSets(normalizedExpectedOptions, normalizedActualOptions)) {
         mismatches.push({
           field: fieldName,
           kind: "options_mismatch",

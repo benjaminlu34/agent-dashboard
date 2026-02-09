@@ -1,11 +1,6 @@
 import { randomUUID } from "node:crypto";
 
 const INTENT_TYPE = "RUN_INTENT";
-const DISPATCH_ROLE_BY_STATUS = {
-  Ready: "EXECUTOR",
-  "In Review": "REVIEWER",
-};
-
 function assertPositiveInteger(value, name) {
   if (!Number.isInteger(value) || value <= 0) {
     throw new Error(`${name} must be a positive integer`);
@@ -71,8 +66,17 @@ function minutesBetween(startIso, endIso) {
   return Math.floor(diffMs / 60000);
 }
 
-function buildDispatchBody({ role, runId, sprint, issueNumber }) {
-  if (role === "EXECUTOR") {
+function isAfterIso(leftIso, rightIso) {
+  const left = toIsoTimestamp(leftIso);
+  const right = toIsoTimestamp(rightIso);
+  if (!left || !right) {
+    return false;
+  }
+  return new Date(left).getTime() > new Date(right).getTime();
+}
+
+function buildDispatchBody({ role, runId, sprint, issueNumber, endpoint }) {
+  if (role === "EXECUTOR" && endpoint === "/internal/executor/claim-ready-item") {
     return {
       role,
       run_id: runId,
@@ -110,6 +114,18 @@ function updateSeenState({
     : Number.isInteger(previous.reviewer_dispatches_for_current_status)
       ? previous.reviewer_dispatches_for_current_status
       : 0;
+  const reviewCycleCount = statusChanged
+    ? 0
+    : Number.isInteger(previous.review_cycle_count) && previous.review_cycle_count >= 0
+      ? previous.review_cycle_count
+      : 0;
+  const lastReviewerOutcome = statusChanged
+    ? ""
+    : hasNonEmptyString(previous.last_reviewer_outcome)
+      ? previous.last_reviewer_outcome.trim().toUpperCase()
+      : "";
+  const lastReviewerFeedbackAt = statusChanged ? "" : toIsoTimestamp(previous.last_reviewer_feedback_at);
+  const lastExecutorResponseAt = statusChanged ? "" : toIsoTimestamp(previous.last_executor_response_at);
 
   stateByItemId[item.project_item_id] = {
     last_seen_status: status,
@@ -129,6 +145,10 @@ function updateSeenState({
         : 0,
     last_run_id: hasNonEmptyString(previous.last_run_id) ? previous.last_run_id : "",
     reviewer_dispatches_for_current_status: reviewerDispatchesForCurrentStatus,
+    review_cycle_count: reviewCycleCount,
+    last_reviewer_outcome: lastReviewerOutcome,
+    last_reviewer_feedback_at: lastReviewerFeedbackAt,
+    last_executor_response_at: lastExecutorResponseAt,
   };
 
   return stateByItemId[item.project_item_id];
@@ -158,6 +178,7 @@ export function buildRunPlan({
   reviewChurnPolls = 3,
   maxReviewerDispatchesPerStatus = 1,
   reviewerRetryPolls = 0,
+  maxReviewCycles = 5,
 } = {}) {
   if (!Array.isArray(projectItems)) {
     throw new Error("projectItems must be an array");
@@ -173,6 +194,7 @@ export function buildRunPlan({
   assertPositiveInteger(stallMinutes, "stallMinutes");
   assertPositiveInteger(reviewChurnPolls, "reviewChurnPolls");
   assertPositiveInteger(maxReviewerDispatchesPerStatus, "maxReviewerDispatchesPerStatus");
+  assertPositiveInteger(maxReviewCycles, "maxReviewCycles");
   if (!Number.isInteger(reviewerRetryPolls) || reviewerRetryPolls < 0) {
     throw new Error("reviewerRetryPolls must be a non-negative integer");
   }
@@ -307,6 +329,7 @@ export function buildRunPlan({
       runId,
       sprint: normalizedSprint,
       issueNumber: item.issue_number,
+      endpoint,
     });
 
     intents.push({
@@ -331,11 +354,44 @@ export function buildRunPlan({
   }
 
   for (const item of scopedItems) {
-    const role = DISPATCH_ROLE_BY_STATUS[item.status];
-    if (role === "EXECUTOR") {
+    if (item.status === "Ready") {
       maybeDispatch(item, "EXECUTOR", "/internal/executor/claim-ready-item", maxExecutors);
-    } else if (role === "REVIEWER") {
-      maybeDispatch(item, "REVIEWER", "/internal/reviewer/resolve-linked-pr", maxReviewers);
+      continue;
+    }
+
+    if (item.status === "In Review") {
+      const stateItem = nextState.items[item.project_item_id];
+      const lastOutcome = hasNonEmptyString(stateItem.last_reviewer_outcome)
+        ? stateItem.last_reviewer_outcome.trim().toUpperCase()
+        : "";
+      const reviewCycleCount = Number.isInteger(stateItem.review_cycle_count) ? stateItem.review_cycle_count : 0;
+
+      if (lastOutcome === "PASS") {
+        continue;
+      }
+      if (reviewCycleCount >= maxReviewCycles) {
+        continue;
+      }
+
+      const hasReviewerFeedback = hasNonEmptyString(stateItem.last_reviewer_feedback_at);
+      const hasExecutorResponse = hasNonEmptyString(stateItem.last_executor_response_at);
+      const executorRespondedAfterFeedback =
+        hasReviewerFeedback && hasExecutorResponse
+          ? isAfterIso(stateItem.last_executor_response_at, stateItem.last_reviewer_feedback_at)
+          : false;
+
+      if (!hasNonEmptyString(lastOutcome)) {
+        maybeDispatch(item, "REVIEWER", "/internal/reviewer/resolve-linked-pr", maxReviewers);
+        continue;
+      }
+
+      if (lastOutcome === "FAIL" || lastOutcome === "INCOMPLETE") {
+        if (!executorRespondedAfterFeedback) {
+          maybeDispatch(item, "EXECUTOR", "/internal/reviewer/resolve-linked-pr", maxExecutors);
+        } else {
+          maybeDispatch(item, "REVIEWER", "/internal/reviewer/resolve-linked-pr", maxReviewers);
+        }
+      }
     }
   }
 

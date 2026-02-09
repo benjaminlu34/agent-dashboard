@@ -16,15 +16,15 @@ test("Executor can transition Ready -> In Progress", async () => {
   });
 });
 
-test("In Review -> Needs Human Approval is Reviewer-only", async () => {
-  const reviewerResult = await isStatusTransitionAllowed("Reviewer", "In Review", "Needs Human Approval");
-  assert.deepEqual(reviewerResult, {
+test("In Review -> Needs Human Approval is Orchestrator-only", async () => {
+  const orchestratorResult = await isStatusTransitionAllowed("Orchestrator", "In Review", "Needs Human Approval");
+  assert.deepEqual(orchestratorResult, {
     allowed: true,
     automation_allowed: true,
   });
 
-  const executorResult = await isStatusTransitionAllowed("Executor", "In Review", "Needs Human Approval");
-  assert.deepEqual(executorResult, {
+  const reviewerResult = await isStatusTransitionAllowed("Reviewer", "In Review", "Needs Human Approval");
+  assert.deepEqual(reviewerResult, {
     allowed: false,
     automation_allowed: true,
   });

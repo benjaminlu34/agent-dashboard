@@ -59,7 +59,8 @@ async function writeBundleFiles(repoRoot) {
           { from: "Backlog", to: "Ready", allowed_roles: ["Orchestrator"] },
           { from: "Ready", to: "In Progress", allowed_roles: ["Executor"] },
           { from: "In Progress", to: "Blocked", allowed_roles: ["Orchestrator"] },
-          { from: "In Review", to: "Needs Human Approval", allowed_roles: ["Reviewer"] },
+          { from: "Blocked", to: "Ready", allowed_roles: ["Orchestrator"] },
+          { from: "In Review", to: "Needs Human Approval", allowed_roles: ["Orchestrator"] },
         ],
       },
       null,
@@ -242,7 +243,7 @@ test("POST /internal/project-item/update-field returns 409 when preflight fails"
   await app.close();
 });
 
-test("POST /internal/project-item/update-field requires handoff metadata and writes issue comment for reviewer pass", async () => {
+test("POST /internal/project-item/update-field requires handoff metadata and writes issue comment for orchestrator human-approval handoff", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "project-item-update-reviewer-handoff-"));
   await writeBundleFiles(repoRoot);
   await writeFile(join(repoRoot, "agents/REVIEWER.md"), "reviewer overlay\n", "utf8");
@@ -270,7 +271,7 @@ test("POST /internal/project-item/update-field requires handoff metadata and wri
     method: "POST",
     url: "/internal/project-item/update-field",
     payload: {
-      role: "REVIEWER",
+      role: "ORCHESTRATOR",
       project_item_id: "PVTI_test_123",
       field: "Status",
       value: "Needs Human Approval",
@@ -282,7 +283,7 @@ test("POST /internal/project-item/update-field requires handoff metadata and wri
     method: "POST",
     url: "/internal/project-item/update-field",
     payload: {
-      role: "REVIEWER",
+      role: "ORCHESTRATOR",
       project_item_id: "PVTI_test_123",
       field: "Status",
       value: "Needs Human Approval",
@@ -366,5 +367,69 @@ test("POST /internal/project-item/update-field requires failure metadata and wri
   assert.equal(commentCalls[0].issueNumber, 321);
   assert.match(commentCalls[0].body, /Executor failure handoff: Blocked/);
   assert.match(commentCalls[0].body, /Failure classification: ITEM_STOP/);
+  await app.close();
+});
+
+test("POST /internal/project-item/update-field requires retry metadata and writes issue comment for Blocked to Ready retry", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "project-item-update-blocked-retry-"));
+  await writeBundleFiles(repoRoot);
+
+  const commentCalls = [];
+  const app = await buildTestApp({
+    repoRoot,
+    preflightHandler: buildPreflightPass(),
+    githubClientFactory: async () => ({
+      async getProjectItemFieldValue() {
+        return "Blocked";
+      },
+      async updateProjectItemField() {},
+      async createIssueComment(payload) {
+        commentCalls.push(payload);
+        return {
+          id: 1002,
+          html_url: "https://github.com/benjaminlu34/agent-dashboard/issues/222#issuecomment-1002",
+        };
+      },
+    }),
+  });
+
+  const missingMetadata = await app.inject({
+    method: "POST",
+    url: "/internal/project-item/update-field",
+    payload: {
+      role: "ORCHESTRATOR",
+      project_item_id: "PVTI_test_222",
+      field: "Status",
+      value: "Ready",
+    },
+  });
+  assert.equal(missingMetadata.statusCode, 400);
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/internal/project-item/update-field",
+    payload: {
+      role: "ORCHESTRATOR",
+      project_item_id: "PVTI_test_222",
+      field: "Status",
+      value: "Ready",
+      issue_number: 222,
+      retry_reason: "automatic_retry_after_cooldown",
+      failure_classification: "TRANSIENT",
+      failure_error_code: "backend_unreachable",
+      blocked_minutes: 16,
+      suggested_next_steps: ["Re-run executor", "Keep Blocked if repeated"],
+      run_id: "33333333-3333-4333-8333-333333333333",
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  const payload = response.json();
+  assert.equal(payload.updated.Status, "Ready");
+  assert.equal(payload.retry_comment.id, 1002);
+  assert.equal(commentCalls.length, 1);
+  assert.equal(commentCalls[0].issueNumber, 222);
+  assert.match(commentCalls[0].body, /Orchestrator retry handoff: Blocked -> Ready/);
+  assert.match(commentCalls[0].body, /Retry reason: automatic_retry_after_cooldown/);
   await app.close();
 });

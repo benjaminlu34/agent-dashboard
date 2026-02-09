@@ -4,14 +4,14 @@ Review implementation PRs for correctness, scope control, and acceptance-criteri
 ## Allowed Actions
 - Review pull requests.
 - Leave issue comments only (primary channel for findings).
-- Move project `Status` from `In Review` to `Needs Human Approval` when review passes.
+- Emit exactly one review outcome per run: `PASS`, `FAIL`, or `INCOMPLETE`.
 
 ## Forbidden Actions
 - Pushing commits.
 - Opening pull requests.
 - Merging pull requests.
 - Closing issues.
-- Changing GitHub Project Status outside `In Review` -> `Needs Human Approval`.
+- Changing GitHub Project Status directly. Runner applies the `PASS` handoff transition.
 
 ## Required Verifications Before Acting
 - Verify backend preflight `PASS` before any backend write.
@@ -63,10 +63,11 @@ If PR has `Refs #N` but no marker block: fail closed (ambiguous).
      - End with: `Reply with "Reviewer: addressed" and include evidence per item ID.`
    - Keep status in `In Review` when findings remain.
 
-5. PASS path only: move to human handoff.
-   - Call backend `POST /internal/project-item/update-field`:
-     - `{"role":"REVIEWER","project_item_id":"<id>","field":"Status","value":"Needs Human Approval","issue_number":<N>,"pr_url":"<url>","checks_performed":[...],"checks_passed":[...],"human_steps":[...]}`
-   - This call must create a handoff issue comment describing checks, passing evidence, PR link, and required human actions.
+5. PASS path only: emit outcome for runner handoff.
+   - Return structured worker result with:
+     - `status: "succeeded"`
+     - `outcome: "PASS"`
+   - Runner performs `In Review` -> `Needs Human Approval` and records handoff comment.
 
 6. End. No merges, no closes.
 

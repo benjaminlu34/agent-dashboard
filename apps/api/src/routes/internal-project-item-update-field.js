@@ -18,6 +18,7 @@ const NEEDS_HUMAN_APPROVAL_STATUS = "Needs Human Approval";
 const IN_REVIEW_STATUS = "In Review";
 const IN_PROGRESS_STATUS = "In Progress";
 const BLOCKED_STATUS = "Blocked";
+const READY_STATUS = "Ready";
 
 function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
@@ -111,6 +112,38 @@ function buildExecutionFailureBlockedComment({
   return lines.join("\n");
 }
 
+function buildBlockedRetryComment({
+  issueNumber,
+  retryReason,
+  failureClassification,
+  failureErrorCode,
+  blockedMinutes,
+  suggestedNextSteps,
+  projectItemId,
+  runId = "",
+}) {
+  const lines = [
+    "Orchestrator retry handoff: Blocked -> Ready",
+    "",
+    `Linked issue: #${issueNumber}`,
+    `Retry reason: ${retryReason}`,
+    `Previous failure classification: ${failureClassification}`,
+    `Previous error code: ${failureErrorCode}`,
+    `Blocked duration minutes: ${blockedMinutes}`,
+    "",
+    "Suggested next steps:",
+    ...suggestedNextSteps.map((entry) => `- ${entry}`),
+    "",
+    "<!-- BLOCKED_RETRY_READY_V1",
+    `project_item_id: ${projectItemId}`,
+  ];
+  if (isNonEmptyString(runId)) {
+    lines.push(`run_id: ${runId}`);
+  }
+  lines.push("-->");
+  return lines.join("\n");
+}
+
 function parseNeedsHumanApprovalMetadata(body) {
   const issueNumber = body?.issue_number;
   const prUrl = body?.pr_url;
@@ -169,6 +202,45 @@ function parseExecutionFailureBlockedMetadata(body) {
     issueNumber,
     failureClassification: failureClassification.trim(),
     failureMessage: failureMessage.trim(),
+    suggestedNextSteps,
+    runId,
+  };
+}
+
+function parseBlockedRetryMetadata(body) {
+  const issueNumber = body?.issue_number;
+  const retryReason = body?.retry_reason;
+  const failureClassification = body?.failure_classification;
+  const failureErrorCode = body?.failure_error_code;
+  const blockedMinutes = body?.blocked_minutes;
+  const suggestedNextSteps = normalizeStringArray(body?.suggested_next_steps);
+  const runId = isNonEmptyString(body?.run_id) ? body.run_id.trim() : "";
+
+  if (!isPositiveInteger(issueNumber)) {
+    return { error: "body.issue_number must be a positive integer for Blocked -> Ready transition" };
+  }
+  if (!isNonEmptyString(retryReason)) {
+    return { error: "body.retry_reason is required for Blocked -> Ready transition" };
+  }
+  if (!isNonEmptyString(failureClassification)) {
+    return { error: "body.failure_classification is required for Blocked -> Ready transition" };
+  }
+  if (!isNonEmptyString(failureErrorCode)) {
+    return { error: "body.failure_error_code is required for Blocked -> Ready transition" };
+  }
+  if (!Number.isInteger(blockedMinutes) || blockedMinutes < 0) {
+    return { error: "body.blocked_minutes must be a non-negative integer for Blocked -> Ready transition" };
+  }
+  if (suggestedNextSteps.length === 0) {
+    return { error: "body.suggested_next_steps must be a non-empty array of strings for Blocked -> Ready transition" };
+  }
+
+  return {
+    issueNumber,
+    retryReason: retryReason.trim(),
+    failureClassification: failureClassification.trim(),
+    failureErrorCode: failureErrorCode.trim(),
+    blockedMinutes,
     suggestedNextSteps,
     runId,
   };
@@ -367,7 +439,7 @@ export function buildInternalProjectItemUpdateFieldHandler({
 
     const requiresHumanApprovalHandoff =
       field === "Status" &&
-      normalizedRole === "REVIEWER" &&
+      normalizedRole === "ORCHESTRATOR" &&
       value === NEEDS_HUMAN_APPROVAL_STATUS &&
       currentStatus === IN_REVIEW_STATUS;
     const requiresExecutionFailureHandoff =
@@ -375,8 +447,14 @@ export function buildInternalProjectItemUpdateFieldHandler({
       normalizedRole === "ORCHESTRATOR" &&
       value === BLOCKED_STATUS &&
       currentStatus === IN_PROGRESS_STATUS;
+    const requiresBlockedRetryHandoff =
+      field === "Status" &&
+      normalizedRole === "ORCHESTRATOR" &&
+      value === READY_STATUS &&
+      currentStatus === BLOCKED_STATUS;
     let handoffMetadata = null;
     let failureMetadata = null;
+    let blockedRetryMetadata = null;
     if (requiresHumanApprovalHandoff) {
       handoffMetadata = parseNeedsHumanApprovalMetadata(request?.body);
       if (handoffMetadata.error) {
@@ -389,6 +467,13 @@ export function buildInternalProjectItemUpdateFieldHandler({
       if (failureMetadata.error) {
         reply.code(400);
         return { error: failureMetadata.error };
+      }
+    }
+    if (requiresBlockedRetryHandoff) {
+      blockedRetryMetadata = parseBlockedRetryMetadata(request?.body);
+      if (blockedRetryMetadata.error) {
+        reply.code(400);
+        return { error: blockedRetryMetadata.error };
       }
     }
 
@@ -444,6 +529,28 @@ export function buildInternalProjectItemUpdateFieldHandler({
         return { error: error instanceof Error ? error.message : String(error) };
       }
     }
+    let blockedRetryComment = null;
+    if (blockedRetryMetadata) {
+      const commentBody = buildBlockedRetryComment({
+        issueNumber: blockedRetryMetadata.issueNumber,
+        retryReason: blockedRetryMetadata.retryReason,
+        failureClassification: blockedRetryMetadata.failureClassification,
+        failureErrorCode: blockedRetryMetadata.failureErrorCode,
+        blockedMinutes: blockedRetryMetadata.blockedMinutes,
+        suggestedNextSteps: blockedRetryMetadata.suggestedNextSteps,
+        projectItemId,
+        runId: blockedRetryMetadata.runId,
+      });
+      try {
+        blockedRetryComment = await githubClient.createIssueComment({
+          issueNumber: blockedRetryMetadata.issueNumber,
+          body: commentBody,
+        });
+      } catch (error) {
+        reply.code(502);
+        return { error: error instanceof Error ? error.message : String(error) };
+      }
+    }
 
     const payload = {
       role: normalizedRole,
@@ -464,6 +571,14 @@ export function buildInternalProjectItemUpdateFieldHandler({
             failure_comment: {
               id: failureComment.id,
               html_url: failureComment.html_url,
+            },
+          }
+        : {}),
+      ...(blockedRetryComment
+        ? {
+            retry_comment: {
+              id: blockedRetryComment.id,
+              html_url: blockedRetryComment.html_url,
             },
           }
         : {}),

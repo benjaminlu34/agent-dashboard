@@ -18,6 +18,9 @@ Optional:
 - `RUNNER_MAX_EXECUTORS` (default `1`)
 - `RUNNER_MAX_REVIEWERS` (default `1`)
 - `RUNNER_READY_BUFFER` (default `2`) - minimum number of `Ready` items runner tries to maintain via promotion
+- `REVIEW_STALL_POLLS` (default `50`) - after this many `In Review` polls, allow one retry reviewer dispatch; if still stalled, escalate
+- `BLOCKED_RETRY_MINUTES` (default `15`) - cooldown before auto-retrying retryable `Blocked` items back to `Ready`
+- `RUNNER_WATCHDOG_TIMEOUT_S` (default `900`) - timeout for stale `running` executor runs before forced `In Progress -> Blocked`
 - `RUNNER_DRY_RUN` (default `false`)
 - `RUNNER_LEDGER_PATH` (default `./.runner-ledger.json`)
 - `RUNNER_SPRINT_PLAN_PATH` (default `./.runner-sprint-plan.json`)
@@ -79,3 +82,12 @@ python3 -m apps.runner.tests
 
 Non-dry-run execution spawns `codex mcp-server` per intent and calls the MCP `codex` tool once per intent.
 See `docs/runner-contract.md`.
+
+## Operational events
+
+Runner emits structured stderr events for resiliency workflows:
+- `REVIEW_OUTCOME` (`PASS` | `FAIL` | `INCOMPLETE`)
+- `REVIEW_STALL_DETECTED`
+- `REVIEW_STALL_ESCALATED`
+- `BLOCKED_RETRY`
+- `WORKER_WATCHDOG_TIMEOUT`

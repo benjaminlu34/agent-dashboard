@@ -54,7 +54,7 @@ test("compareProjectSchema returns FAIL when a required field is missing", () =>
   ]);
 });
 
-test("compareProjectSchema returns FAIL when single-select option order differs", () => {
+test("compareProjectSchema returns PASS when single-select option order differs", () => {
   const liveSchema = {
     project_name: "Codex Task Board",
     fields: [
@@ -64,21 +64,23 @@ test("compareProjectSchema returns FAIL when single-select option order differs"
   };
 
   const result = compareProjectSchema(REQUIRED_SCHEMA, liveSchema);
+  assert.deepEqual(result, { status: "PASS", mismatches: [] });
+});
+
+test("compareProjectSchema returns FAIL when single-select options differ by set", () => {
+  const liveSchema = {
+    project_name: "Codex Task Board",
+    fields: [
+      { name: "Status", type: "single_select", options: ["Backlog", "Ready"] },
+      { name: "Size", type: "single_select", options: ["S", "M", "L"] },
+    ],
+  };
+
+  const result = compareProjectSchema(REQUIRED_SCHEMA, liveSchema);
   assert.equal(result.status, "FAIL");
-  assert.deepEqual(result.mismatches, [
-    {
-      field: "Status",
-      kind: "options_mismatch",
-      expected: {
-        type: "single_select",
-        options: ["Backlog", "Ready", "In Progress"],
-      },
-      actual: {
-        type: "single_select",
-        options: ["Ready", "Backlog", "In Progress"],
-      },
-    },
-  ]);
+  assert.equal(result.mismatches.length, 1);
+  assert.equal(result.mismatches[0].field, "Status");
+  assert.equal(result.mismatches[0].kind, "options_mismatch");
 });
 
 test("compareProjectSchema returns FAIL when type differs", () => {
