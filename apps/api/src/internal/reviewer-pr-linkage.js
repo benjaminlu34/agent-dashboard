@@ -41,7 +41,7 @@ function parseExecutorRunMarker(body) {
 
   // Allow optional whitespace after `<!--` so the marker can be rendered visibly inside
   // fenced code blocks without changing the canonical content.
-  const markerMatch = body.match(/<!--\s*EXECUTOR_RUN_V1\s*\r?\n([\s\S]*?)\r?\n\s*-->/);
+  const markerMatch = body.match(/<!--\s*EXECUTOR_RUN_V1\s*(?:\r?\n)?([\s\S]*?)\s*-->/);
   if (!markerMatch) {
     if (/<!--\s*EXECUTOR_RUN_V1/.test(body)) {
       throw createLinkageError("malformed_marker", "malformed EXECUTOR_RUN_V1 marker block", { ambiguous: true });
@@ -121,6 +121,8 @@ export async function resolveLinkedPullRequestForIssue({ githubClient, issueNumb
     let body = typeof pr?.body === "string" ? pr.body : "";
     let prUrl = pr?.html_url ?? "";
     const prNumber = pr?.number;
+    let headRef = typeof pr?.head_ref === "string" ? pr.head_ref : "";
+    let headSha = typeof pr?.head_sha === "string" ? pr.head_sha : "";
 
     async function hydrateIfPossible(reason) {
       if (typeof githubClient.getPullRequest !== "function") {
@@ -134,6 +136,8 @@ export async function resolveLinkedPullRequestForIssue({ githubClient, issueNumb
       const hydrated = await githubClient.getPullRequest({ prNumber });
       body = typeof hydrated?.body === "string" ? hydrated.body : "";
       prUrl = typeof hydrated?.html_url === "string" && hydrated.html_url.length > 0 ? hydrated.html_url : prUrl;
+      headRef = typeof hydrated?.head_ref === "string" ? hydrated.head_ref : headRef;
+      headSha = typeof hydrated?.head_sha === "string" ? hydrated.head_sha : headSha;
     }
 
     if (body.trim().length === 0) {
@@ -202,6 +206,8 @@ export async function resolveLinkedPullRequestForIssue({ githubClient, issueNumb
       issue_number: issueNumber,
       project_item_id: marker.project_item_id,
       run_id: marker.run_id,
+      head_ref: headRef,
+      head_sha: headSha,
     });
   }
 

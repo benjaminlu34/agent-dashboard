@@ -70,6 +70,8 @@ test("POST /internal/reviewer/resolve-linked-pr returns exactly one linked PR", 
           {
             number: 77,
             html_url: "https://github.com/benjaminlu34/agent-dashboard/pull/77",
+            head_ref: "executor/issue-44",
+            head_sha: "deadbeef",
             body: buildMarkerBody({
               issueNumber: 44,
               projectItemId: "PVTI_44",
@@ -97,6 +99,8 @@ test("POST /internal/reviewer/resolve-linked-pr returns exactly one linked PR", 
     issue_number: 44,
     project_item_id: "PVTI_44",
     run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    head_ref: "executor/issue-44",
+    head_sha: "deadbeef",
   });
   await app.close();
 });
@@ -190,6 +194,51 @@ test("POST /internal/reviewer/resolve-linked-pr accepts marker header without wh
 
   assert.equal(response.statusCode, 200);
   assert.equal(response.json().pr_number, 93);
+  assert.equal(response.json().issue_number, 44);
+  assert.equal(response.json().project_item_id, "PVTI_44");
+  await app.close();
+});
+
+test("POST /internal/reviewer/resolve-linked-pr accepts marker closing delimiter on same line", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "reviewer-resolve-inline-marker-close-"));
+  await writeBundleFiles(repoRoot);
+
+  const app = await buildTestApp({
+    repoRoot,
+    preflightHandler: buildPreflightPass(),
+    githubClientFactory: async () => ({
+      async listProjectItems() {
+        return [{ project_item_id: "PVTI_44", issue_number: 44 }];
+      },
+      async listPullRequests() {
+        return [
+          {
+            number: 94,
+            html_url: "https://github.com/benjaminlu34/agent-dashboard/pull/94",
+            body: [
+              "Refs #44",
+              "<!-- EXECUTOR_RUN_V1",
+              "issue: 44",
+              "project_item_id: PVTI_44",
+              "run_id: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa -->",
+            ].join("\n"),
+          },
+        ];
+      },
+    }),
+  });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/internal/reviewer/resolve-linked-pr",
+    payload: {
+      role: "REVIEWER",
+      issue_number: 44,
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().pr_number, 94);
   assert.equal(response.json().issue_number, 44);
   assert.equal(response.json().project_item_id, "PVTI_44");
   await app.close();

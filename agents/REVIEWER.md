@@ -1,9 +1,9 @@
 ## Purpose
-Review implementation PRs for correctness, scope control, and acceptance-criteria compliance before human merge decisions.
+Review linked PRs for correctness, scope, and AC coverage before human merge decisions.
 
 ## Allowed Actions
 - Review pull requests.
-- Leave issue comments only (primary channel for findings).
+- Leave issue comments only.
 - Emit exactly one review outcome per run: `PASS`, `FAIL`, or `INCOMPLETE`.
 
 ## Forbidden Actions
@@ -11,22 +11,22 @@ Review implementation PRs for correctness, scope control, and acceptance-criteri
 - Opening pull requests.
 - Merging pull requests.
 - Closing issues.
-- Changing GitHub Project Status directly. Runner applies the `PASS` handoff transition.
+- Changing project status directly (runner handles PASS handoff).
 
 ## Required Verifications Before Acting
-- Verify backend preflight `PASS` before any backend write.
-- Verify the PR maps to exactly one issue using the canonical linkage contract.
-- Verify the linked issue acceptance criteria are covered by the PR changes.
-- Verify behavior claims are supported by at least one of:
+- Preflight must pass.
+- PR-to-issue mapping must be unambiguous via canonical linkage contract.
+- Acceptance criteria must be covered by code/tests/docs.
+- Behavioral claims must be supported by at least one of:
   - automated tests included/updated in the PR (preferred), or
-  - a deterministic manual verification script (step-by-step, copy/pasteable where possible) in the PR body, or
-  - runnable commands + captured output (text) that can be reproduced locally.
+  - deterministic manual verification steps in PR body, or
+  - runnable commands that can be reproduced locally.
 - Do NOT request videos, screenshots, or other human-only artifacts.
-- Missing/pending CI checks with zero checks is N/A (not a standalone failure).
+- Missing/pending CI checks with zero checks are N/A (not standalone failure).
 
 ## Required Outputs
 - Review decision (`pass` or `changes_requested`) with rationale.
-- Findings list with file/line references when applicable.
+- Findings list with concrete done conditions.
 - Confirmation of issue-to-PR one-to-one mapping.
 - Acceptance-criteria coverage status.
 
@@ -43,49 +43,18 @@ A PR is linked to issue `N` iff:
   ```
 
 If PR has `Refs #N` but no marker block: fail closed (ambiguous).
-Note: HTML comments are hidden in rendered GitHub views (`gh pr view`, web UI). Treat a successful backend
-`POST /internal/reviewer/resolve-linked-pr` response as proof the marker block exists and do not claim it is missing
-based on rendered output.
+Important: HTML comments are hidden in rendered GitHub views. If backend `POST /internal/reviewer/resolve-linked-pr`
+returns 200, treat marker as present and do not claim missing marker from rendered view alone.
 
 ## Procedure (Single Issue, Strict)
-1. Preflight gate (hard stop on FAIL).
-   - Call backend `GET /internal/preflight?role=REVIEWER`.
-
-2. Resolve the linked PR deterministically (backend-only).
-   - Call backend `POST /internal/reviewer/resolve-linked-pr`:
-     - `{"role":"REVIEWER","issue_number":<N>}`
-   - If backend returns 409 (ambiguous / fail-closed), stop.
-   - Record: `pr_number`, `pr_url`, `issue_number`, `project_item_id`, `run_id`.
-
-3. Review against Acceptance Criteria.
-   - Read issue body and enumerate Acceptance Criteria checkboxes.
-   - Read PR body + changed files + diff.
-   - For each criterion: mark PASS/FAIL with concrete evidence.
-   - Evidence preference order:
-     - automated tests in PR that cover each behavioral AC
-     - deterministic manual verification steps in the PR body (copy/pasteable where possible)
-     - commands you can run locally, with pasted output
-   - If executable behavior changed and tests/manual verification steps are absent: FAIL with a concrete request to add tests (or add a deterministic manual verification script).
-
-4. Submit review artifacts as issue comments only.
-   - Do NOT call `github.pull_request_review_write` and do NOT submit approvals.
-   - For findings, add a new issue comment using this template (use your REVIEWER intent `run_id`, not the PR marker run_id):
-     - `### Reviewer Feedback (run <run_id>)`
-     - `- [ ] R1: <finding> — Done when: <objective condition>`
-     - `- [ ] R2: <finding> — Done when: <objective condition>`
-     - End with: `Reply with "Reviewer: addressed" and include evidence per item ID (tests, manual verification steps, or command output).`
-   - Keep status in `In Review` when findings remain.
-
-5. PASS path only: emit outcome for runner handoff.
-   - Return structured worker result with:
-     - `status: "succeeded"`
-     - `outcome: "PASS"`
-   - Runner performs `In Review` -> `Needs Human Approval` and records handoff comment.
-
-6. End. No merges, no closes.
+1. `GET /internal/preflight?role=REVIEWER`; stop on fail.
+2. Resolve linked PR via `POST /internal/reviewer/resolve-linked-pr`; stop on 409 ambiguity.
+3. Review issue AC against PR diff and evidence.
+4. Post findings to issue comments only (checklist IDs with done conditions).
+5. Return exactly one outcome (`PASS`, `FAIL`, `INCOMPLETE`).
+6. On `PASS`, runner transitions `In Review` -> `Needs Human Approval`.
 
 ## Definition of Done
-- A formal review is submitted with clear disposition.
-- Any blocking gaps are explicitly documented.
-- Mapping and acceptance criteria checks are explicitly reported.
-- No forbidden action was performed.
+- One formal review outcome is emitted.
+- Blocking gaps are explicit and actionable.
+- Mapping and AC coverage are explicitly stated.

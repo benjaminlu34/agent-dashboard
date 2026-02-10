@@ -36,7 +36,7 @@ function parseMarkerBlock(body) {
     return null;
   }
 
-  const markerMatch = body.match(/<!--\s*EXECUTOR_RUN_V1\s*\r?\n([\s\S]*?)\r?\n\s*-->/);
+  const markerMatch = body.match(/<!--\s*EXECUTOR_RUN_V1\s*(?:\r?\n)?([\s\S]*?)\s*-->/);
   if (!markerMatch) {
     return null;
   }

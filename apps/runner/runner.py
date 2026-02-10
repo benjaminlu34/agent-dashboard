@@ -499,6 +499,71 @@ class Runner:
         self._hard_stop_event = threading.Event()
         self._hard_stop_reason: Optional[str] = None
 
+        # Prevent concurrent EXECUTOR/REVIEWER work on the same issue. Orchestrator can emit
+        # reviewer intents while an executor run is still finishing its PR updates; this
+        # gate forces per-issue serialization to avoid racey reviews.
+        self._in_flight_lock = threading.Lock()
+        self._in_flight_cond = threading.Condition(self._in_flight_lock)
+        self._in_flight_by_issue: Dict[int, Dict[str, str]] = {}
+
+    def _resolve_issue_number_for_intent(self, intent: RunIntent) -> int:
+        issue_number = intent.body.get("issue_number")
+        if isinstance(issue_number, int) and issue_number > 0:
+            return issue_number
+        if intent.role != "EXECUTOR":
+            return 0
+
+        # Claim-ready-item intents do not include issue_number. Resolve via orchestrator state.
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not self.should_stop():
+            context = self._resolve_run_context(intent.run_id)
+            if context:
+                return int(context[0])
+            time.sleep(0.05)
+        return 0
+
+    def _reserve_issue_slot(self, *, issue_number: int, run_id: str, role: str) -> None:
+        if issue_number <= 0:
+            return
+        if not run_id:
+            return
+
+        waited_s = 0.0
+        with self._in_flight_cond:
+            while not self.should_stop():
+                current = self._in_flight_by_issue.get(issue_number)
+                if not isinstance(current, dict):
+                    current = None
+                if not current:
+                    self._in_flight_by_issue[issue_number] = {"run_id": run_id, "role": role}
+                    return
+                if current.get("run_id") == run_id:
+                    return
+
+                if waited_s >= 5.0 and int(waited_s) % 5 == 0:
+                    _log_stderr(
+                        {
+                            "type": "WORKER_WAITING",
+                            "issue_number": issue_number,
+                            "run_id": run_id,
+                            "role": role,
+                            "blocked_by_role": current.get("role"),
+                            "blocked_by_run_id": current.get("run_id"),
+                            "waited_s": int(waited_s),
+                        }
+                    )
+                self._in_flight_cond.wait(timeout=0.5)
+                waited_s += 0.5
+
+    def _release_issue_slot(self, *, issue_number: int, run_id: str) -> None:
+        if issue_number <= 0 or not run_id:
+            return
+        with self._in_flight_cond:
+            current = self._in_flight_by_issue.get(issue_number)
+            if isinstance(current, dict) and current.get("run_id") == run_id:
+                del self._in_flight_by_issue[issue_number]
+                self._in_flight_cond.notify_all()
+
     def _read_orchestrator_state(self) -> Dict[str, Any]:
         try:
             state = _load_json_file(self._orchestrator_state_path)
@@ -528,15 +593,22 @@ class Runner:
         items = state.get("items")
         if not isinstance(items, dict):
             return None
-        matches = []
+        matches: list[tuple[str, str, str]] = []
         for project_item_id, entry in items.items():
             if not isinstance(entry, dict):
                 continue
-            if entry.get("last_seen_issue_number") == issue_number:
-                matches.append(project_item_id)
-        if len(matches) != 1:
+            if entry.get("last_seen_issue_number") != issue_number:
+                continue
+            # State files can retain stale entries across repeated local runs. Prefer the
+            # most recently seen project item for this issue number.
+            last_seen_at = _normalize_iso(entry.get("last_seen_at"))
+            status_since_at = _normalize_iso(entry.get("status_since_at"))
+            matches.append((last_seen_at, status_since_at, project_item_id))
+        if not matches:
             return None
-        return matches[0]
+        # ISO timestamps sort lexicographically when normalized; break ties deterministically.
+        matches.sort()
+        return matches[-1][2]
 
     def _update_orchestrator_state_item(self, project_item_id: str, updates: Dict[str, Any]) -> None:
         state = self._read_orchestrator_state()
@@ -1130,6 +1202,7 @@ class Runner:
             )
             return
 
+        issue_number = self._resolve_issue_number_for_intent(intent)
         started_at = time.time()
         heartbeat_stop = threading.Event()
 
@@ -1168,6 +1241,8 @@ class Runner:
                 )
             self._ledger.mark_running(intent.run_id)
 
+        self._reserve_issue_slot(issue_number=issue_number, run_id=intent.run_id, role=intent.role)
+
         try:
             _log_stderr(
                 {
@@ -1175,6 +1250,7 @@ class Runner:
                     "role": intent.role,
                     "run_id": intent.run_id,
                     "endpoint": intent.endpoint,
+                    "issue_number": issue_number if issue_number > 0 else None,
                     "executor_queue_depth": self._executor_queue.qsize(),
                     "reviewer_queue_depth": self._reviewer_queue.qsize(),
                 }
@@ -1246,6 +1322,9 @@ class Runner:
                     },
                 )
             raise
+        finally:
+            heartbeat_stop.set()
+            self._release_issue_slot(issue_number=issue_number, run_id=intent.run_id)
 
         heartbeat_stop.set()
         reviewer_outcome = result.outcome if intent.role == "REVIEWER" else None

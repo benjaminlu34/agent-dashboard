@@ -533,10 +533,10 @@ export async function createGitHubPlanApplyClient({
       return items;
     },
 
-    async listPullRequests({ state = "all" } = {}) {
-      const allowedState = state === "open" || state === "closed" || state === "all" ? state : "all";
-      const all = [];
-      let page = 1;
+	    async listPullRequests({ state = "all" } = {}) {
+	      const allowedState = state === "open" || state === "closed" || state === "all" ? state : "all";
+	      const all = [];
+	      let page = 1;
 
       while (true) {
         const payload = await requestJson(
@@ -551,17 +551,19 @@ export async function createGitHubPlanApplyClient({
           break;
         }
 
-        for (const pr of payload) {
-          if (!Number.isInteger(pr?.number)) {
-            continue;
-          }
-          all.push({
-            number: pr.number,
-            html_url: pr?.html_url ?? "",
-            body: typeof pr?.body === "string" ? pr.body : "",
-            state: typeof pr?.state === "string" ? pr.state : "",
-          });
-        }
+	        for (const pr of payload) {
+	          if (!Number.isInteger(pr?.number)) {
+	            continue;
+	          }
+	          all.push({
+	            number: pr.number,
+	            html_url: pr?.html_url ?? "",
+	            body: typeof pr?.body === "string" ? pr.body : "",
+	            head_ref: typeof pr?.head?.ref === "string" ? pr.head.ref : "",
+	            head_sha: typeof pr?.head?.sha === "string" ? pr.head.sha : "",
+	            state: typeof pr?.state === "string" ? pr.state : "",
+	          });
+	        }
 
         if (payload.length < 100) {
           break;
@@ -574,10 +576,10 @@ export async function createGitHubPlanApplyClient({
       return all;
     },
 
-    async getPullRequest({ prNumber }) {
-      if (!Number.isInteger(prNumber) || prNumber <= 0) {
-        throw new GitHubPlanApplyError("prNumber must be a positive integer");
-      }
+	    async getPullRequest({ prNumber }) {
+	      if (!Number.isInteger(prNumber) || prNumber <= 0) {
+	        throw new GitHubPlanApplyError("prNumber must be a positive integer");
+	      }
 
       const payload = await requestJson(`${restEndpoint}/repos/${ownerLogin}/${repositoryName}/pulls/${prNumber}`, {
         method: "GET",
@@ -588,13 +590,15 @@ export async function createGitHubPlanApplyClient({
         throw new GitHubPlanApplyError("unexpected pull request response");
       }
 
-      return {
-        number: payload.number,
-        html_url: typeof payload?.html_url === "string" ? payload.html_url : "",
-        body: typeof payload?.body === "string" ? payload.body : "",
-        state: typeof payload?.state === "string" ? payload.state : "",
-      };
-    },
+	      return {
+	        number: payload.number,
+	        html_url: typeof payload?.html_url === "string" ? payload.html_url : "",
+	        body: typeof payload?.body === "string" ? payload.body : "",
+	        head_ref: typeof payload?.head?.ref === "string" ? payload.head.ref : "",
+	        head_sha: typeof payload?.head?.sha === "string" ? payload.head.sha : "",
+	        state: typeof payload?.state === "string" ? payload.state : "",
+	      };
+	    },
 
     async listIssueComments({ issueNumber }) {
       if (!Number.isInteger(issueNumber) || issueNumber <= 0) {

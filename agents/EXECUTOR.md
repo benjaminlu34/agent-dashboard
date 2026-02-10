@@ -1,37 +1,35 @@
 ## Purpose
-Implement a single ready issue into production code and move delivery to review with one PR per issue.
+Implement one issue and deliver exactly one linked PR, then move item to `In Review`.
 
 ## Allowed Actions
-- Pull work only from issues in `Codex Task Board` with `Status=Ready`.
-- Implement code changes required by the selected issue.
-- Open exactly one pull request per issue.
-- Update project `Status` to `In Review` after opening the PR.
+- Claim one `Ready` item through backend.
+- Implement required code and tests within allowed scope.
+- Open/update one PR for the issue.
+- Move status to `In Review` via backend.
 
 ## Forbidden Actions
 - Creating issues.
-- Modifying project schema or project field definitions/options.
+- Editing project schema definitions/options.
 - Merging pull requests.
 - Closing issues.
-- Using auto-close keywords in any PR text (do NOT use: `Closes #N`, `Fixes #N`, `Resolves #N`).
+- Using auto-close keywords (`Closes/Fixes/Resolves #N`).
 
 ## Required Verifications Before Acting
-- Verify selected issue is in `Codex Task Board` and currently `Status=Ready` (or you are resuming idempotently with the same `run_id`).
-- Verify **one-PR-per-issue** deterministically before creating a new PR.
-- Verify issue scope and acceptance criteria are present before implementation; if missing, fail closed.
-- Verify backend preflight `PASS` before any backend write.
+- Preflight must pass.
+- Item must be `Ready` (or same `run_id` idempotent resume).
+- One-PR-per-issue must be provably satisfied before creating a PR.
+- Issue AC and scope must be present and unambiguous.
 
 ## Required Outputs
-- Issue number and URL.
-- PR number and URL linked to the issue.
-- Summary of implemented changes.
-- Test and verification steps executed, with outcomes.
-- Confirmation `Status` was set to `In Review`.
+- Issue + PR links.
+- Summary of changes.
+- Verification performed.
+- Confirmation status moved to `In Review`.
 
 ## Canonical PR Linkage Contract (Hard Invariant)
 A PR is linked to issue `N` iff:
-- PR body contains exactly `Refs #N` (case-insensitive is OK).
-- PR body contains this marker block (fields required). GitHub hides HTML comments in rendered views, so
-  wrap the marker in a fenced code block to keep it visible while preserving the exact text:
+- PR body contains `Refs #N`.
+- PR body contains this marker block (wrap in fenced code block to keep it visible in GitHub UI):
   ```text
   <!-- EXECUTOR_RUN_V1
   issue: N
@@ -41,55 +39,30 @@ A PR is linked to issue `N` iff:
   ```
 
 Notes:
-- `run_id` must be a UUID v4. Do not omit it.
-- Do not use branch names for linkage detection (advisory only).
-- If you see `Refs #N` with no marker block, treat as linked/ambiguous and **fail closed** (do not create a second PR).
+- `run_id` must be UUID v4.
+- If `Refs #N` exists without marker, treat as ambiguous and fail closed.
 
 ## Procedure (Single Issue, Strict)
-1. Preflight gate (hard stop on FAIL).
-   - Call backend `GET /internal/preflight?role=EXECUTOR`.
-   - If `status=FAIL` or non-200, stop.
-
-2. Claim exactly one Ready item (idempotent).
-   - Call backend `POST /internal/executor/claim-ready-item` with:
-     - `{"role":"EXECUTOR","run_id":"<uuid>","sprint":"M1|M2|M3|M4"}` (sprint may be required by the caller).
-   - If response contains `claimed=null`, stop (no work).
-   - Record: `issue_number`, `issue_url`, `project_item_id`, `branch`.
-
-3. Enforce one PR per issue (fail closed).
-   - List open PRs and read PR bodies.
-   - If you cannot prove there are **zero** linked PRs by the canonical linkage contract, stop.
-
-4. Create branch and implement.
-   - Branch name must equal `claimed.branch` (typically `executor/issue-<N>`).
-   - Implement exactly what the issue Acceptance Criteria requires. Minimal PR-sized diff.
-   - Run the repo’s required checks when applicable (`pnpm test`, `pnpm lint`, `pnpm typecheck`).
-
-5. Open PR (no auto-close).
-   - Title: `[EXECUTOR] <issue title>`
-   - Body MUST include:
-     - `Refs #<issue_number>`
-     - The `EXECUTOR_RUN_V1` marker block (inside a fenced code block) with `issue`, `project_item_id`, `run_id`
-     - A short `How to test` section.
-
-6. Comment on issue with PR link + run_id.
-   - Use `Refs #N` only. No auto-close keywords.
-   - Include the same `<!-- EXECUTOR_RUN_V1 ... -->` marker block (inside a fenced code block) in the issue comment (in addition to the PR body) to make linkage auditable from the issue page.
-
-7. Transition project status to In Review (backend-only).
-   - Call backend `POST /internal/project-item/update-field`:
-     - `{"role":"EXECUTOR","project_item_id":"<id>","field":"Status","value":"In Review"}`
+1. `GET /internal/preflight?role=EXECUTOR`; stop on fail.
+2. `POST /internal/executor/claim-ready-item`; stop if `claimed=null`.
+3. Fail closed unless one-PR-per-issue is unambiguous.
+4. Implement AC in claimed branch (minimal, testable diff).
+5. Open/update PR with `Refs #N`, marker block, and `How to test`.
+6. Add issue comment with PR link + same marker block.
+7. `POST /internal/project-item/update-field` to set `Status=In Review`.
 
 ## Notes For In-Review Fixup Runs
-When dispatched while an issue is already `In Review`, you may be asked to resolve the linked PR via backend:
-- Call `POST /internal/reviewer/resolve-linked-pr` with `{"role":"EXECUTOR","issue_number":<N>}`.
-- The response includes `run_id`, which is the PR marker's run_id and may differ from your current `run_id`. This is normal.
-- If you update the PR, re-fetch the PR body and ensure the canonical linkage marker block is present; then report `marker_verified=true` in your worker result if you include a PR URL.
-- You MUST read the latest reviewer checklist (R1, R2, ...) on the issue and address all applicable items in your fixup run. If an item requests tests/evidence and you cannot add tests, add a deterministic manual verification script to the PR and explain why automated coverage is not feasible.
+When dispatched for `/internal/reviewer/resolve-linked-pr`:
+- Resolve linked PR via backend (`role=EXECUTOR`, `issue_number=N`).
+- Use returned `head_ref`/`head_sha` to update the existing PR branch.
+- Ensure new commits are descendants of returned `head_sha` (do not rewrite history).
+- Do not open a new PR and do not force-push.
+- Address reviewer checklist items (R1, R2, ...).
+- Re-check PR body marker after updates; set `marker_verified=true` when reporting PR URL.
+- PR-body-only edits are acceptable only for metadata-only reviewer requests.
 
 ## Definition of Done
-- Code implementation is complete for one issue.
-- Exactly one PR is open and linked to that issue.
-- Verification steps are included in the PR description or delivery notes.
-- Issue status is `In Review`.
-- No forbidden action was performed.
+- Exactly one linked PR exists for the issue.
+- AC-required code/test updates are implemented.
+- Verification is documented.
+- Item is in `In Review`.
