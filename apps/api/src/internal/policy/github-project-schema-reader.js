@@ -30,17 +30,30 @@ async function runGraphqlQuery({ endpoint, githubToken, query, variables }) {
     headers: {
       authorization: `Bearer ${githubToken}`,
       "content-type": "application/json",
+      accept: "application/json",
     },
     body: JSON.stringify({ query, variables }),
   });
 
-  if (!response.ok) {
-    throw new ProjectSchemaReadError(`failed to read GitHub Projects schema: HTTP ${response.status}`);
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new ProjectSchemaReadError(
+      `failed to read GitHub Projects schema: non-JSON response (HTTP ${response.status})`,
+    );
   }
 
-  const payload = await response.json();
+  if (!response.ok) {
+    const message = typeof payload?.message === "string" && payload.message.trim().length > 0
+      ? payload.message.trim()
+      : `HTTP ${response.status}`;
+    throw new ProjectSchemaReadError(`failed to read GitHub Projects schema: ${message}`);
+  }
+
   if (Array.isArray(payload?.errors) && payload.errors.length > 0) {
-    throw new ProjectSchemaReadError("failed to read GitHub Projects schema: GraphQL error");
+    const message = typeof payload.errors[0]?.message === "string" ? payload.errors[0].message : "GraphQL error";
+    throw new ProjectSchemaReadError(`failed to read GitHub Projects schema: ${message}`);
   }
 
   return payload.data;

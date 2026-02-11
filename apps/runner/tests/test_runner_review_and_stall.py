@@ -2,6 +2,8 @@ import contextlib
 import io
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -73,6 +75,124 @@ def _build_runner(
 
 
 class RunnerReviewAndStallTests(unittest.TestCase):
+    def test_executor_and_reviewer_same_issue_are_serialized_by_in_flight_gate(self) -> None:
+        backend = _BackendStub()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = f"{tmp_dir}/orchestrator-state.json"
+            Path(state_path).write_text(
+                json.dumps(
+                    {
+                        "poll_count": 1,
+                        "items": {
+                            "PVTI_2": {
+                                "last_seen_issue_number": 2,
+                                "last_seen_status": "In Progress",
+                                "last_dispatched_role": "EXECUTOR",
+                                "last_run_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runner = _build_runner(backend=backend, state_path=state_path, ledger=None)
+            exec_intent = parse_intent(
+                {
+                    "type": "RUN_INTENT",
+                    "role": "EXECUTOR",
+                    "run_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "endpoint": "/internal/executor/claim-ready-item",
+                    "body": {
+                        "role": "EXECUTOR",
+                        "run_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                        "sprint": "M1",
+                    },
+                }
+            )
+            reviewer_intent = parse_intent(
+                {
+                    "type": "RUN_INTENT",
+                    "role": "REVIEWER",
+                    "run_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    "endpoint": "/internal/reviewer/resolve-linked-pr",
+                    "body": {
+                        "role": "REVIEWER",
+                        "run_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                        "issue_number": 2,
+                    },
+                }
+            )
+
+            executor_started = threading.Event()
+            allow_executor_finish = threading.Event()
+            executor_finished = threading.Event()
+            reviewer_worker_started = threading.Event()
+            ordering: dict[str, float] = {}
+            ordering_lock = threading.Lock()
+            failures = []
+
+            def fake_worker_call(*, intent, **_kwargs):
+                role = intent.get("role")
+                if role == "EXECUTOR":
+                    executor_started.set()
+                    allow_executor_finish.wait(timeout=3.0)
+                    return WorkerResult(
+                        run_id=exec_intent.run_id,
+                        role="EXECUTOR",
+                        status="succeeded",
+                        outcome=None,
+                        summary="executor done",
+                        urls={},
+                        errors=[],
+                    )
+
+                reviewer_worker_started.set()
+                with ordering_lock:
+                    ordering["reviewer_started"] = time.monotonic()
+                return WorkerResult(
+                    run_id=reviewer_intent.run_id,
+                    role="REVIEWER",
+                    status="succeeded",
+                    outcome="FAIL",
+                    summary="reviewer done",
+                    urls={},
+                    errors=[],
+                )
+
+            def run_intent(intent_obj):
+                try:
+                    runner._handle_intent(intent_obj)  # pylint: disable=protected-access
+                    if intent_obj.run_id == exec_intent.run_id:
+                        with ordering_lock:
+                            ordering["executor_finished"] = time.monotonic()
+                        executor_finished.set()
+                except Exception as exc:  # pragma: no cover - test assertion handles this list
+                    failures.append(exc)
+
+            with patch("apps.runner.runner.run_intent_with_codex_mcp", side_effect=fake_worker_call):
+                executor_thread = threading.Thread(target=run_intent, args=(exec_intent,), daemon=True)
+                reviewer_thread = threading.Thread(target=run_intent, args=(reviewer_intent,), daemon=True)
+
+                executor_thread.start()
+                self.assertTrue(executor_started.wait(timeout=1.0))
+                reviewer_thread.start()
+
+                # Reviewer must wait until executor releases the issue slot.
+                time.sleep(0.2)
+                self.assertFalse(reviewer_worker_started.is_set())
+
+                allow_executor_finish.set()
+                self.assertTrue(executor_finished.wait(timeout=2.0))
+                executor_thread.join(timeout=2.0)
+                reviewer_thread.join(timeout=2.0)
+
+            self.assertEqual(failures, [])
+            self.assertTrue(reviewer_worker_started.is_set())
+            self.assertGreaterEqual(
+                ordering.get("reviewer_started", 0.0),
+                ordering.get("executor_finished", 0.0),
+            )
+
     def test_missing_reviewer_outcome_fails_closed(self) -> None:
         backend = _BackendStub()
         with tempfile.TemporaryDirectory() as tmp_dir:

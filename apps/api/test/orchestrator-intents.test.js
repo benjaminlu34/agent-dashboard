@@ -410,6 +410,72 @@ test("computeSprintPlanMetadata uses prefix overlap and chains conflicting owner
   assert.equal(ownershipIndex["apps/runner"], 4);
 });
 
+test("computeSprintPlanMetadata infers granular ownership when only top-level bucket matches", () => {
+  const first = computeSprintPlanMetadata({
+    issues: [
+      {
+        issue_number: 2,
+        title: "[TASK] Data catalogs",
+        priority: "P0",
+        files_likely_touched: ["Assets/Scripts/Data/*.cs"],
+      },
+      {
+        issue_number: 3,
+        title: "[TASK] Event channels",
+        priority: "P0",
+        files_likely_touched: ["Assets/Scripts/Events/*.cs"],
+      },
+      {
+        issue_number: 4,
+        title: "[TASK] Scene setup",
+        priority: "P0",
+        files_likely_touched: ["Assets/Scenes/VerticalSlice.unity"],
+      },
+    ],
+    buckets: ["Assets", "docs"],
+    sharedCorePaths: new Set(),
+  });
+
+  const second = computeSprintPlanMetadata({
+    issues: [
+      {
+        issue_number: 2,
+        title: "[TASK] Data catalogs",
+        priority: "P0",
+        files_likely_touched: ["Assets/Scripts/Data/*.cs"],
+      },
+      {
+        issue_number: 3,
+        title: "[TASK] Event channels",
+        priority: "P0",
+        files_likely_touched: ["Assets/Scripts/Events/*.cs"],
+      },
+      {
+        issue_number: 4,
+        title: "[TASK] Scene setup",
+        priority: "P0",
+        files_likely_touched: ["Assets/Scenes/VerticalSlice.unity"],
+      },
+    ],
+    buckets: ["Assets", "docs"],
+    sharedCorePaths: new Set(),
+  });
+
+  assert.deepEqual(second, first);
+  assert.deepEqual(first.sprintPlan["2"].owns_paths, ["Assets/Scripts/Data"]);
+  assert.deepEqual(first.sprintPlan["3"].owns_paths, ["Assets/Scripts/Events"]);
+  assert.deepEqual(first.sprintPlan["4"].owns_paths, ["Assets/Scenes"]);
+  assert.equal(first.sprintPlan["2"].isolation_mode, "ISOLATED");
+  assert.equal(first.sprintPlan["3"].isolation_mode, "ISOLATED");
+  assert.equal(first.sprintPlan["4"].isolation_mode, "ISOLATED");
+  assert.deepEqual(first.sprintPlan["2"].conflicts_with, []);
+  assert.deepEqual(first.sprintPlan["3"].conflicts_with, []);
+  assert.deepEqual(first.sprintPlan["4"].conflicts_with, []);
+  assert.equal(first.ownershipIndex["Assets/Scripts/Data"], 2);
+  assert.equal(first.ownershipIndex["Assets/Scripts/Events"], 3);
+  assert.equal(first.ownershipIndex["Assets/Scenes"], 4);
+});
+
 test("computeSprintPlanMetadata does not assign ownership to sprint goal issues", () => {
   const { sprintPlan } = computeSprintPlanMetadata({
     issues: [

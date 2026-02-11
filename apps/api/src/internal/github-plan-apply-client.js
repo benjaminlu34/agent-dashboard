@@ -134,6 +134,9 @@ async function requestJson(url, { method = "GET", token, body } = {}) {
   try {
     payload = await response.json();
   } catch {
+    if (response.ok) {
+      throw new GitHubPlanApplyError(`GitHub REST API returned non-JSON response (HTTP ${response.status})`);
+    }
     payload = null;
   }
 
@@ -155,7 +158,12 @@ async function requestGraphql({ token, endpoint, query, variables }) {
     body: JSON.stringify({ query, variables }),
   });
 
-  const payload = await response.json();
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new GitHubPlanApplyError(`GitHub GraphQL API returned non-JSON response (HTTP ${response.status})`);
+  }
   if (!response.ok) {
     throw new GitHubPlanApplyError(`GitHub GraphQL request failed: HTTP ${response.status}`);
   }

@@ -19,6 +19,15 @@ const DEFAULT_REVIEWER_RETRY_POLLS = 20;
 const DEFAULT_MAX_REVIEWER_DISPATCHES_PER_STATUS = 2;
 const DEFAULT_STATE_PATH = ".orchestrator-state.json";
 
+function emptyOrchestratorState() {
+  return {
+    poll_count: 0,
+    items: {},
+    sprint_plan: {},
+    ownership_index: {},
+  };
+}
+
 function hasNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
@@ -237,7 +246,17 @@ async function readProjectItems({ githubClient, env }) {
   const itemsFixturePath = env.ORCHESTRATOR_ITEMS_FILE;
   if (hasNonEmptyString(itemsFixturePath)) {
     const fixtureContent = await readFile(resolve(process.cwd(), itemsFixturePath), "utf8");
-    const fixture = JSON.parse(fixtureContent);
+    let fixture = null;
+    try {
+      fixture = JSON.parse(fixtureContent);
+    } catch (error) {
+      throw withErrorCode(
+        new Error(
+          `ORCHESTRATOR_ITEMS_FILE must contain valid JSON array: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+        "validation_failed",
+      );
+    }
     if (!Array.isArray(fixture)) {
       throw withErrorCode(new Error("ORCHESTRATOR_ITEMS_FILE must contain a JSON array"), "validation_failed");
     }
@@ -252,11 +271,23 @@ async function readProjectItems({ githubClient, env }) {
 }
 
 async function readStateFile(statePath) {
+  function stateParseError(code, message) {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+  }
+
   try {
     const raw = await readFile(statePath, "utf8");
-    const parsed = JSON.parse(raw);
+    let parsed = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw stateParseError("state_invalid_json", "state file contains invalid JSON");
+    }
+
     if (!parsed || typeof parsed !== "object") {
-      throw new Error("state file must be a JSON object");
+      throw stateParseError("state_invalid_object", "state file must be a JSON object");
     }
 
     return {
@@ -267,12 +298,29 @@ async function readStateFile(statePath) {
     };
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-      return {
-        poll_count: 0,
-        items: {},
-        sprint_plan: {},
-        ownership_index: {},
-      };
+      return emptyOrchestratorState();
+    }
+
+    const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+    if (code === "state_invalid_json" || code === "state_invalid_object") {
+      const backupPath = `${statePath}.corrupt-${Date.now()}`;
+      let backupCreated = false;
+      try {
+        await rename(statePath, backupPath);
+        backupCreated = true;
+      } catch {
+        backupCreated = false;
+      }
+
+      process.stderr.write(
+        `${JSON.stringify({
+          type: "ORCHESTRATOR_STATE_RESET_INVALID_JSON",
+          path: statePath,
+          backup_path: backupCreated ? backupPath : "",
+          error: error instanceof Error ? error.message : String(error),
+        })}\n`,
+      );
+      return emptyOrchestratorState();
     }
 
     throw withErrorCode(

@@ -92,19 +92,70 @@ function normalizeBuckets(buckets) {
   return normalized;
 }
 
+function inferBucketFromPath(pathValue) {
+  const normalized = normalizePath(pathValue);
+  if (!normalized) {
+    return "";
+  }
+
+  const wildcardRe = /[*?\[\]{}]/;
+  const segments = normalized.split("/").filter((segment) => segment.length > 0);
+  if (segments.length === 0) {
+    return "";
+  }
+
+  while (segments.length > 0 && wildcardRe.test(segments[segments.length - 1])) {
+    segments.pop();
+  }
+  if (segments.length === 0) {
+    return "";
+  }
+
+  const lastSegment = segments[segments.length - 1];
+  if (lastSegment.includes(".") && !wildcardRe.test(lastSegment)) {
+    segments.pop();
+  }
+  if (segments.length === 0) {
+    return "";
+  }
+
+  const depth = Math.min(segments.length, 3);
+  return segments.slice(0, depth).join("/");
+}
+
 function bucketForPath(pathValue, buckets) {
   const normalized = normalizePath(pathValue);
   if (!normalized) {
     return "";
   }
 
+  let matchedBucket = "";
   for (const bucket of buckets) {
     if (normalized === bucket) {
-      return bucket;
+      matchedBucket = bucket;
+      break;
     }
     if (normalized.startsWith(`${bucket}/`)) {
-      return bucket;
+      matchedBucket = bucket;
+      break;
     }
+  }
+
+  // If only a top-level bucket matches (for example "Assets"), infer a more
+  // specific stable subtree from the touched path to preserve safe parallelism.
+  if (matchedBucket) {
+    if (!matchedBucket.includes("/") && normalized.includes("/")) {
+      const inferred = inferBucketFromPath(normalized);
+      if (inferred && inferred !== matchedBucket) {
+        return inferred;
+      }
+    }
+    return matchedBucket;
+  }
+
+  const inferred = inferBucketFromPath(normalized);
+  if (inferred) {
+    return inferred;
   }
 
   const [firstSegment] = normalized.split("/", 1);

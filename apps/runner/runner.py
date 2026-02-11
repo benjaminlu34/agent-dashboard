@@ -1242,6 +1242,14 @@ class Runner:
             self._ledger.mark_running(intent.run_id)
 
         self._reserve_issue_slot(issue_number=issue_number, run_id=intent.run_id, role=intent.role)
+        slot_released = False
+
+        def release_issue_slot_once() -> None:
+            nonlocal slot_released
+            if slot_released:
+                return
+            self._release_issue_slot(issue_number=issue_number, run_id=intent.run_id)
+            slot_released = True
 
         try:
             _log_stderr(
@@ -1321,10 +1329,10 @@ class Runner:
                         "last_executor_response_at": None,
                     },
                 )
+            release_issue_slot_once()
             raise
         finally:
             heartbeat_stop.set()
-            self._release_issue_slot(issue_number=issue_number, run_id=intent.run_id)
 
         heartbeat_stop.set()
         reviewer_outcome = result.outcome if intent.role == "REVIEWER" else None
@@ -1485,6 +1493,8 @@ class Runner:
                     failure_message=str(exc),
                 )
             raise
+        finally:
+            release_issue_slot_once()
 
 
 def _log_stderr(obj: Dict[str, Any]) -> None:
