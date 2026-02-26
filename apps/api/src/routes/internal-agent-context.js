@@ -59,9 +59,6 @@ async function readIgnorePathsConfig({ repoRoot }) {
   try {
     rawConfig = await readFile(configPath, "utf8");
   } catch (error) {
-    if (error?.code === "ENOENT") {
-      return [];
-    }
     return [];
   }
 

@@ -263,25 +263,20 @@ export async function fetchRepositoryMapFromGithub({
     return [];
   }
 
-  const candidateRefs = [];
-  const normalizedRef = hasNonEmptyString(ref) ? ref.trim() : "HEAD";
-  candidateRefs.push(normalizedRef);
+   const normalizedRef = hasNonEmptyString(ref) ? ref.trim() : "HEAD";
+  const treeResult = await requestGithubJson({
+    url: buildTreeUrl({
+      ownerLogin,
+      repoName,
+      ref: normalizedRef,
+      apiBaseUrl,
+    }),
+    githubToken,
+    fetchImpl,
+  });
 
-  for (const candidateRef of candidateRefs) {
-    const treeResult = await requestGithubJson({
-      url: buildTreeUrl({
-        ownerLogin,
-        repoName,
-        ref: candidateRef,
-        apiBaseUrl,
-      }),
-      githubToken,
-      fetchImpl,
-    });
-
-    if (treeResult.ok && Array.isArray(treeResult.payload?.tree)) {
-      return filterRepositoryMapPaths(treeResult.payload.tree, ignorePaths);
-    }
+  if (treeResult.ok && Array.isArray(treeResult.payload?.tree)) {
+    return filterRepositoryMapPaths(treeResult.payload.tree, ignorePaths);
   }
 
   if (normalizedRef.toUpperCase() !== "HEAD") {
