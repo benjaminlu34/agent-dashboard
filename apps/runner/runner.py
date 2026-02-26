@@ -2297,11 +2297,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     sprint_override = args.sprint.strip() if isinstance(args.sprint, str) else None
+    repo_root = str(Path(__file__).resolve().parents[2])
     try:
         config = load_config(
             dry_run_flag=args.dry_run,
             once_flag=args.once,
             orchestrator_sprint_override=sprint_override,
+            cwd=repo_root,
         )
     except ValueError as exc:
         _log_stderr({"type": "CONFIG_ERROR", "error": str(exc)})

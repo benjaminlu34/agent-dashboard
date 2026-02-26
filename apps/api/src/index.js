@@ -13,6 +13,7 @@ import { registerInternalReviewerResolveLinkedPrRoute } from "./routes/internal-
 import { registerInternalStatusRoute } from "./routes/internal-status.js";
 import { registerInternalMetadataRoute } from "./routes/internal-metadata.js";
 import { registerInternalConfigRoute } from "./routes/internal-config.js";
+import { registerInternalKickoffRoute } from "./routes/internal-kickoff.js";
 
 const MODULE_DIRNAME = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../");
@@ -37,6 +38,7 @@ export async function buildApp({ repoRoot = DEFAULT_REPO_ROOT, logger = true } =
     },
   });
   await registerInternalConfigRoute(app, routeOptions);
+  await registerInternalKickoffRoute(app, routeOptions);
 
   await app.register(fastifyStatic, {
     root: resolve(repoRoot, "apps/web/public"),

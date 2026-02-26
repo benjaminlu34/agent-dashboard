@@ -186,6 +186,48 @@
 
         <div id="error-banner" class="mt-5 hidden rounded-xl border border-zinc-700 bg-zinc-900 px-4 py-3 text-sm font-medium text-zinc-200 shadow-md shadow-white/5"></div>
 
+        <section class="mt-7 rounded-2xl border border-zinc-800 bg-zinc-900 p-5 shadow-lg shadow-white/10 sm:p-6">
+          <div class="flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <h2 class="text-xl font-semibold tracking-tight text-white">Initialize Sprint</h2>
+              <p class="mt-1 text-sm text-zinc-400">Capture the high-level sprint goal and persist it to local kickoff state.</p>
+            </div>
+          </div>
+
+          <form id="kickoff-form" class="mt-5">
+            <label for="kickoff-goal" class="mb-2 block text-xs font-semibold uppercase tracking-[0.16em] text-zinc-400">
+              Sprint Goal
+            </label>
+            <textarea
+              id="kickoff-goal"
+              name="goal"
+              rows="7"
+              placeholder="Describe the primary sprint objective and intended outcomes."
+              class="w-full rounded-xl border border-zinc-700 bg-black px-4 py-3 text-sm text-zinc-100 outline-none transition focus:border-zinc-500"
+            ></textarea>
+            <div class="mt-4 flex flex-wrap items-center justify-between gap-3">
+              <p
+                id="kickoff-message"
+                class="hidden rounded-lg border px-3 py-2 text-sm"
+                role="status"
+                aria-live="polite"
+              ></p>
+              <button
+                id="kickoff-submit-button"
+                type="submit"
+                class="inline-flex items-center gap-2 rounded-lg border border-zinc-200 bg-white px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-zinc-950 transition hover:bg-zinc-200 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <span
+                  id="kickoff-button-spinner"
+                  class="hidden h-3 w-3 animate-spin rounded-full border-2 border-zinc-900 border-r-transparent"
+                  aria-hidden="true"
+                ></span>
+                <span id="kickoff-button-label">Write Goal &amp; Kickoff</span>
+              </button>
+            </div>
+          </form>
+        </section>
+
         <main class="mt-7 grid gap-6 xl:grid-cols-5">
           <section class="xl:col-span-3 rounded-2xl border border-zinc-800 bg-zinc-900 p-5 shadow-lg shadow-white/10 sm:p-6">
             <div class="flex flex-wrap items-center justify-between gap-4">
@@ -246,6 +288,12 @@
       const settingsGithubTokenEl = document.getElementById("settings-github-token");
       const settingsMaxExecutorsEl = document.getElementById("settings-max-executors");
       const settingsMaxReviewersEl = document.getElementById("settings-max-reviewers");
+      const kickoffFormEl = document.getElementById("kickoff-form");
+      const kickoffGoalEl = document.getElementById("kickoff-goal");
+      const kickoffMessageEl = document.getElementById("kickoff-message");
+      const kickoffSubmitButtonEl = document.getElementById("kickoff-submit-button");
+      const kickoffButtonSpinnerEl = document.getElementById("kickoff-button-spinner");
+      const kickoffButtonLabelEl = document.getElementById("kickoff-button-label");
 
       const canvas = document.getElementById("bg-canvas");
       const ctx = canvas.getContext("2d");
@@ -578,6 +626,89 @@
         settingsSaveButtonEl.textContent = isLoading ? "Saving..." : "Save Settings";
       }
 
+      function showKickoffMessage(message, type = "success") {
+        kickoffMessageEl.textContent = message;
+        kickoffMessageEl.classList.remove(
+          "hidden",
+          "border-zinc-700",
+          "border-zinc-500",
+          "text-zinc-200",
+          "text-white",
+        );
+
+        kickoffMessageEl.classList.add("bg-zinc-900");
+        if (type === "error") {
+          kickoffMessageEl.classList.add("border-zinc-700", "text-zinc-200");
+          return;
+        }
+        kickoffMessageEl.classList.add("border-zinc-500", "text-white");
+      }
+
+      function clearKickoffMessage() {
+        kickoffMessageEl.textContent = "";
+        kickoffMessageEl.classList.add("hidden");
+      }
+
+      function setKickoffLoading(isLoading) {
+        const nextLoading = Boolean(isLoading);
+        kickoffSubmitButtonEl.disabled = nextLoading;
+        kickoffGoalEl.disabled = nextLoading;
+        kickoffButtonSpinnerEl.classList.toggle("hidden", !nextLoading);
+        kickoffButtonLabelEl.textContent = nextLoading ? "Writing..." : "Write Goal & Kickoff";
+      }
+
+      async function submitKickoff(event) {
+        event.preventDefault();
+        clearKickoffMessage();
+
+        const goal = kickoffGoalEl.value;
+        if (goal.trim().length === 0) {
+          showKickoffMessage("Goal is required.", "error");
+          kickoffGoalEl.focus();
+          return;
+        }
+
+        setKickoffLoading(true);
+
+        try {
+          const response = await fetch("/internal/kickoff", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ goal }),
+          });
+
+          const rawResponseBody = await response.text();
+          let payload = {};
+          if (rawResponseBody.trim().length > 0) {
+            try {
+              payload = asObject(JSON.parse(rawResponseBody));
+            } catch {
+              payload = {};
+            }
+          }
+
+          if (!response.ok) {
+            const fallbackMessage =
+              (typeof payload.error === "string" && payload.error.trim().length > 0
+                ? payload.error.trim()
+                : rawResponseBody.trim()) || `HTTP ${response.status}`;
+            throw new Error(fallbackMessage);
+          }
+
+          const successMessage =
+            typeof payload.message === "string" && payload.message.trim().length > 0
+              ? payload.message.trim()
+              : "Goal received.";
+          showKickoffMessage(successMessage);
+        } catch (error) {
+          showKickoffMessage(`Failed to write goal: ${error?.message ?? "Unknown error"}`, "error");
+        } finally {
+          setKickoffLoading(false);
+        }
+      }
+
       function clearSettingsFieldValidation() {
         for (const field of Object.values(settingsFieldByName)) {
           field.classList.remove("border-zinc-300", "ring-1", "ring-zinc-300/60");
@@ -853,6 +984,7 @@
       settingsCancelButtonEl.addEventListener("click", () => setSettingsOpen(false));
       settingsBackdropEl.addEventListener("click", () => setSettingsOpen(false));
       settingsFormEl.addEventListener("submit", submitConfig);
+      kickoffFormEl.addEventListener("submit", submitKickoff);
       window.addEventListener("keydown", (event) => {
         if (event.key === "Escape" && isSettingsOpen) {
           setSettingsOpen(false);
