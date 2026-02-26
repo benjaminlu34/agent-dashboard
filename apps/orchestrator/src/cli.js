@@ -44,9 +44,6 @@ function buildScopedStatePath(owner, repo) {
   }
   const ownerToken = sanitizeStatePathToken(owner);
   const repoToken = sanitizeStatePathToken(repo);
-  if (!ownerToken || !repoToken) {
-    return DEFAULT_STATE_PATH;
-  }
   return `./.orchestrator-state.${ownerToken}.${repoToken}.json`;
 }
 
@@ -65,7 +62,11 @@ async function resolveDefaultStatePath({ cwd = process.cwd() } = {}) {
   let parsed;
   try {
     parsed = YAML.parse(rawConfig) ?? {};
-  } catch {
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    process.stderr.write(
+      `Warning: Failed to parse ${AGENT_SWARM_CONFIG_PATH}: ${detail}. Falling back to default state path.\n`,
+    );
     return DEFAULT_STATE_PATH;
   }
 

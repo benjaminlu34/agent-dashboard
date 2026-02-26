@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
+import sys
 from typing import Optional
 
 try:
@@ -111,7 +112,11 @@ def _read_target_repo_identity_from_agent_swarm(cwd: Path) -> Optional[tuple[str
 
     try:
         parsed = yaml.safe_load(raw) or {}
-    except Exception:
+    except yaml.YAMLError as exc:
+        sys.stderr.write(
+            f"Warning: Failed to parse {DEFAULT_AGENT_SWARM_CONFIG_PATH}: {exc}. "
+            "Falling back to default state paths.\n"
+        )
         return None
 
     if not isinstance(parsed, dict):
@@ -129,9 +134,6 @@ def _read_target_repo_identity_from_agent_swarm(cwd: Path) -> Optional[tuple[str
 
     owner_token = _sanitize_state_path_token(owner)
     repo_token = _sanitize_state_path_token(repo)
-    if not owner_token or not repo_token:
-        return None
-
     return owner_token, repo_token
 
 
