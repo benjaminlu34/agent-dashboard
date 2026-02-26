@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import fastifyStatic from "@fastify/static";
 
 import { registerInternalPreflightRoute } from "./routes/internal-preflight.js";
 import { registerInternalRunRoute } from "./routes/internal-run.js";
@@ -9,6 +10,7 @@ import { registerInternalProjectItemUpdateFieldRoute } from "./routes/internal-p
 import { registerInternalAgentContextRoute } from "./routes/internal-agent-context.js";
 import { registerInternalExecutorClaimReadyItemRoute } from "./routes/internal-executor-claim-ready-item.js";
 import { registerInternalReviewerResolveLinkedPrRoute } from "./routes/internal-reviewer-resolve-linked-pr.js";
+import { registerInternalStatusRoute } from "./routes/internal-status.js";
 
 const MODULE_DIRNAME = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../");
@@ -16,7 +18,7 @@ const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../");
 export async function buildApp({ repoRoot = DEFAULT_REPO_ROOT, logger = true } = {}) {
   const app = Fastify({ logger });
 
-  const routeOptions = { repoRoot };
+  const routeOptions = { repoRoot, env: process.env };
   await registerInternalPreflightRoute(app, routeOptions);
   await registerInternalRunRoute(app, routeOptions);
   await registerInternalPlanApplyRoute(app, routeOptions);
@@ -24,6 +26,12 @@ export async function buildApp({ repoRoot = DEFAULT_REPO_ROOT, logger = true } =
   await registerInternalAgentContextRoute(app, routeOptions);
   await registerInternalExecutorClaimReadyItemRoute(app, routeOptions);
   await registerInternalReviewerResolveLinkedPrRoute(app, routeOptions);
+  await registerInternalStatusRoute(app, routeOptions);
+
+  await app.register(fastifyStatic, {
+    root: resolve(repoRoot, "apps/web/public"),
+    prefix: "/",
+  });
 
   return app;
 }
