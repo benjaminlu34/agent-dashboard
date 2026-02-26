@@ -94,6 +94,48 @@ async function defaultStartKickoffLoopProcess({ repoRoot, sprint }) {
   });
 }
 
+async function defaultStartRunnerLoopProcess({ repoRoot, sprint }) {
+  const args = ["-m", "apps.runner", "--sprint", sprint, "--loop"];
+  return new Promise((resolveStarted, rejectStart) => {
+    const child = spawn("python3", args, {
+      cwd: repoRoot,
+      detached: true,
+      stdio: "ignore",
+      env: { ...process.env },
+    });
+
+    const failStartup = (message) => {
+      cleanupStartup();
+      rejectStart(new Error(message));
+    };
+
+    const handleStartupError = (error) => {
+      const detail = typeof error?.message === "string" && error.message.trim().length > 0 ? error.message.trim() : "unknown error";
+      failStartup(`unable to start runner loop process: ${detail}`);
+    };
+
+    const handleStartupExit = (code, signal) => {
+      const reason = signal ? `signal ${signal}` : `exit code ${String(code ?? "unknown")}`;
+      failStartup(`runner loop process exited before startup check (${reason})`);
+    };
+
+    const startupTimer = setTimeout(() => {
+      cleanupStartup();
+      child.unref();
+      resolveStarted(child);
+    }, RUNNER_STARTUP_GRACE_MS);
+
+    function cleanupStartup() {
+      clearTimeout(startupTimer);
+      child.off("error", handleStartupError);
+      child.off("exit", handleStartupExit);
+    }
+
+    child.once("error", handleStartupError);
+    child.once("exit", handleStartupExit);
+  });
+}
+
 function buildKickoffLoopManager({ repoRoot = DEFAULT_REPO_ROOT, startKickoffLoopProcess = defaultStartKickoffLoopProcess } = {}) {
   return {
     getActive() {
@@ -254,7 +296,71 @@ export function buildInternalKickoffStartLoopHandler({
   };
 }
 
+export function buildInternalRunnerStartLoopHandler({
+  repoRoot = DEFAULT_REPO_ROOT,
+  preflightCheck,
+  runnerLoopManager,
+} = {}) {
+  const resolvedPreflightCheck =
+    preflightCheck ??
+    (async ({ role }) =>
+      runPreflightCheck({
+        role,
+        repoRoot,
+      }));
+  const resolvedRunnerLoopManager =
+    runnerLoopManager ??
+    buildKickoffLoopManager({
+      repoRoot,
+      startKickoffLoopProcess: defaultStartRunnerLoopProcess,
+    });
+
+  return async function internalRunnerStartLoopHandler(request, reply) {
+    const sprint = normalizeSprint(request?.body?.sprint);
+    if (!sprint) {
+      reply.code(400);
+      return { error: "body.sprint must be one of M1, M2, M3, or M4" };
+    }
+
+    const preflightFailure = await validateKickoffPreflight({ preflightCheck: resolvedPreflightCheck });
+    if (preflightFailure) {
+      reply.code(preflightFailure.statusCode);
+      return preflightFailure.payload;
+    }
+
+    const active = resolvedRunnerLoopManager.getActive();
+    if (active) {
+      reply.code(409);
+      return {
+        status: "ALREADY_RUNNING",
+        error: "Runner loop is already running for this repo",
+        pid: active.pid,
+        sprint: active.sprint,
+        started_at: active.startedAt,
+      };
+    }
+
+    try {
+      const started = await resolvedRunnerLoopManager.start({ sprint });
+      reply.code(202);
+      return {
+        status: "STARTED",
+        message: "Runner loop started.",
+        pid: started.pid,
+        sprint: started.sprint,
+        started_at: started.startedAt,
+      };
+    } catch (error) {
+      reply.code(500);
+      return {
+        error: `Failed to start runner loop: ${error?.message ?? "Unknown error"}`,
+      };
+    }
+  };
+}
+
 export async function registerInternalKickoffRoute(fastify, options = {}) {
   fastify.post("/internal/kickoff", buildInternalKickoffHandler(options));
   fastify.post("/internal/kickoff/start-loop", buildInternalKickoffStartLoopHandler(options));
+  fastify.post("/internal/runner/start-loop", buildInternalRunnerStartLoopHandler(options));
 }

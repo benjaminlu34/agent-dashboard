@@ -211,6 +211,8 @@ Optional:
 - `GET /internal/agent-context?role=<ROLE>`
 - `POST /internal/executor/claim-ready-item`
 - `POST /internal/reviewer/resolve-linked-pr`
+- `POST /internal/kickoff/start-loop`
+- `POST /internal/runner/start-loop`
 
 ## Commands
 
@@ -222,6 +224,7 @@ Optional:
 - Run orchestrator once: `pnpm orchestrator`
 - Run runner once: `pnpm runner`
 - Run runner dry-run: `pnpm runner:dry`
+- Start runner loop without kickoff: `python3 -m apps.runner --sprint M1 --loop`
 
 ## Notes on Identity Resolution
 
