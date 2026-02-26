@@ -30,18 +30,18 @@ class BackendClient:
     base_url: str
     timeout_s: float = 15.0
 
-    def get_json(self, path: str, *, params: Optional[dict[str, str]] = None) -> Dict[str, Any]:
+    def get_json(self, path: str, *, params: Optional[dict[str, str]] = None, timeout_s: Optional[float] = None) -> Dict[str, Any]:
         url = _build_url(self.base_url, path, params)
-        payload, status_code = _request_json("GET", url, timeout_s=self.timeout_s)
+        payload, status_code = _request_json("GET", url, timeout_s=self.timeout_s if timeout_s is None else timeout_s)
         if status_code >= 400:
             raise HttpError(f"backend returned HTTP {status_code}", code="backend_http_error", status_code=status_code, payload=payload)
         if not isinstance(payload, dict):
             raise HttpError("backend JSON payload must be an object", code="backend_invalid_payload", status_code=status_code, payload=payload)
         return payload
 
-    def post_json(self, path: str, *, body: Dict[str, Any]) -> Dict[str, Any]:
+    def post_json(self, path: str, *, body: Dict[str, Any], timeout_s: Optional[float] = None) -> Dict[str, Any]:
         url = _build_url(self.base_url, path, None)
-        payload, status_code = _request_json("POST", url, timeout_s=self.timeout_s, body=body)
+        payload, status_code = _request_json("POST", url, timeout_s=self.timeout_s if timeout_s is None else timeout_s, body=body)
         if status_code >= 400:
             raise HttpError(f"backend returned HTTP {status_code}", code="backend_http_error", status_code=status_code, payload=payload)
         if not isinstance(payload, dict):

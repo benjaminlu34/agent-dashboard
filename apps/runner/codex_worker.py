@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from pathlib import Path
 import re
 import shlex
 import subprocess
 import threading
 import time
 import selectors
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 
 class CodexWorkerError(Exception):
@@ -35,62 +34,49 @@ _MCP_PROTOCOL_VERSION = "2024-11-05"
 
 
 class _TranscriptWriter:
-    def __init__(self, *, repo_root: Optional[str], run_id: str):
+    def __init__(
+        self,
+        *,
+        repo_root: Optional[str],
+        run_id: str,
+        transcript_event_sink: Optional[Callable[[str, str], None]] = None,
+    ):
         self._lock = threading.Lock()
-        self._handle: Optional[Any] = None
-        if not isinstance(repo_root, str) or not repo_root.strip():
-            return
-        if not isinstance(run_id, str) or not run_id.strip():
-            return
-        log_path = Path(repo_root).resolve() / f".run-transcript.{run_id.strip()}.log"
-        try:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            self._handle = log_path.open("w", encoding="utf8", buffering=1)
-        except OSError:
-            self._handle = None
+        self._sink = transcript_event_sink if callable(transcript_event_sink) else None
 
-    def _write(self, text: str) -> None:
-        if not isinstance(text, str) or text == "":
+    def _write(self, section: str, content: str) -> None:
+        if not isinstance(content, str) or content == "":
             return
-        handle = self._handle
-        if handle is None:
+        sink = self._sink
+        if sink is None:
             return
         with self._lock:
             try:
-                handle.write(text)
-                handle.flush()
+                sink(section, content)
             except Exception:
                 # Transcript logging must never crash worker execution.
                 pass
 
     def append_message_to_agent(self, prompt_text: str) -> None:
         content = str(prompt_text or "").strip()
-        self._write(f"\n========== MESSAGE TO AGENT ==========\n{content}\n")
+        self._write("MESSAGE TO AGENT", content)
 
     def append_agent_thinking(self, llm_text_content: str) -> None:
         content = str(llm_text_content or "").strip()
-        self._write(f"\n========== AGENT THINKING ==========\n{content}\n")
+        self._write("AGENT THINKING", content)
 
     def append_system_observation(self, content: str) -> None:
         normalized_content = str(content or "").strip()
         if not normalized_content:
             return
-        self._write("\n========== SYSTEM OBSERVATION ==========\n" f"{normalized_content}\n")
+        self._write("SYSTEM OBSERVATION", normalized_content)
 
     def append_tool_executed(self, tool_name: str) -> None:
         normalized_tool_name = str(tool_name or "").strip() or "unknown"
         self.append_system_observation(f"Tool '{normalized_tool_name}' executed.")
 
     def close(self) -> None:
-        handle = self._handle
-        self._handle = None
-        if handle is None:
-            return
-        with self._lock:
-            try:
-                handle.close()
-            except Exception:
-                pass
+        return None
 
 
 class _JsonRpcClient:
@@ -613,6 +599,7 @@ def run_intent_with_codex_mcp(
     intent: Dict[str, Any],
     tools_call_timeout_s: float = 600.0,
     repo_root: Optional[str] = None,
+    transcript_event_sink: Optional[Callable[[str, str], None]] = None,
 ) -> WorkerResult:
     """Execute one intent by spawning `codex mcp-server` and calling the `codex` tool via MCP (stdio).
 
@@ -626,11 +613,11 @@ def run_intent_with_codex_mcp(
     if not expected_run_id:
         raise CodexWorkerError("intent run_id is required", code="worker_invalid_intent")
 
-    resolved_repo_root = repo_root
-    if not isinstance(resolved_repo_root, str) or not resolved_repo_root.strip():
-        resolved_repo_root = str(Path(__file__).resolve().parents[2])
-
-    transcript_writer = _TranscriptWriter(repo_root=resolved_repo_root, run_id=expected_run_id)
+    transcript_writer = _TranscriptWriter(
+        repo_root=repo_root,
+        run_id=expected_run_id,
+        transcript_event_sink=transcript_event_sink,
+    )
     proc = _spawn_codex_mcp_server(codex_bin=codex_bin, codex_mcp_args=codex_mcp_args)
     client = _JsonRpcClient(proc)
     stderr_monitor = _CodexStderrMonitor(proc=proc, transcript_writer=transcript_writer)
@@ -760,6 +747,7 @@ def generate_json_with_codex_mcp(
     tools_call_timeout_s: float = 600.0,
     run_id: Optional[str] = None,
     repo_root: Optional[str] = None,
+    transcript_event_sink: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[str, Any]:
     """Spawn `codex mcp-server` and ask Codex to output a single JSON object (no prose)."""
     if not isinstance(prompt, str) or not prompt.strip():
@@ -767,7 +755,11 @@ def generate_json_with_codex_mcp(
     if not isinstance(developer_instructions, str) or not developer_instructions.strip():
         raise CodexWorkerError("developer_instructions is required", code="codex_invalid_prompt")
 
-    transcript_writer = _TranscriptWriter(repo_root=repo_root, run_id=str(run_id or "").strip())
+    transcript_writer = _TranscriptWriter(
+        repo_root=repo_root,
+        run_id=str(run_id or "").strip(),
+        transcript_event_sink=transcript_event_sink,
+    )
     proc = _spawn_codex_mcp_server(codex_bin=codex_bin, codex_mcp_args=codex_mcp_args)
     client = _JsonRpcClient(proc)
     stderr_monitor = _CodexStderrMonitor(proc=proc, transcript_writer=transcript_writer)

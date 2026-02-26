@@ -247,7 +247,7 @@ class RunnerCliModeTests(unittest.TestCase):
             transcript_run_ids = []
 
             class _TranscriptStub:
-                def __init__(self, *, repo_root: str, run_id: str) -> None:
+                def __init__(self, *, repo_root: str, run_id: str, **_kwargs: object) -> None:
                     _ = repo_root
                     transcript_run_ids.append(run_id)
 

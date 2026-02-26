@@ -346,10 +346,7 @@
 
     <script>
       const POLL_INTERVAL_MS = 15000;
-      const TERMINAL_WAIT_TIMEOUT_RUNNING_MS = 25000;
-      const TERMINAL_WAIT_TIMEOUT_IDLE_MS = 12000;
-      const TERMINAL_HIDDEN_POLL_INTERVAL_MS = 10000;
-      const TERMINAL_RETRY_DELAY_MS = 1500;
+      const TERMINAL_STREAM_RECONNECT_MS = 1500;
       const TERMINAL_RECENT_WINDOW_MS = 20 * 60 * 1000;
       const orchestratorItemsEl = document.getElementById("orchestrator-items");
       const orchestratorSummaryEl = document.getElementById("orchestrator-summary");
@@ -404,12 +401,12 @@
       let activeTerminalRunId = "";
       let terminalRunIds = [];
       const terminalLogCache = new Map();
-      const terminalLogEtagByRun = new Map();
+      const terminalLogSeqByRun = new Map();
       const terminalRunMetaById = new Map();
-      let terminalPollSequence = 0;
-      let terminalPollInFlight = false;
-      let terminalPollTimerId = 0;
-      let terminalPollAbortController = null;
+      let terminalStreamSource = null;
+      let terminalStreamRunId = "";
+      let terminalStreamReconnectTimerId = 0;
+      let terminalStreamSessionId = 0;
       const settingsFieldByName = {
         targetOwner: settingsTargetOwnerEl,
         targetRepo: settingsTargetRepoEl,
@@ -782,10 +779,12 @@
         }
         activeTerminalRunId = normalizedRunId;
         renderTerminalTabs();
-        restartTerminalPollNow();
+        restartTerminalStreamNow();
       }
 
       function syncTerminalRuns(runnerEntries) {
+        const previousRunKey = terminalRunIds.join("|");
+        const previousActiveRunId = activeTerminalRunId;
         terminalRunIds = collectTerminalRunIds(runnerEntries);
         terminalRunMetaById.clear();
         for (const entry of runnerEntries) {
@@ -800,9 +799,9 @@
         if (terminalRunIds.length === 0) {
           activeTerminalRunId = "";
           terminalLogCache.clear();
-          terminalLogEtagByRun.clear();
-          abortTerminalPollRequest();
-          clearTerminalPollTimer();
+          terminalLogSeqByRun.clear();
+          closeTerminalStream();
+          clearTerminalStreamReconnectTimer();
           renderTerminalTabs();
           return;
         }
@@ -812,9 +811,9 @@
             terminalLogCache.delete(runId);
           }
         }
-        for (const runId of Array.from(terminalLogEtagByRun.keys())) {
+        for (const runId of Array.from(terminalLogSeqByRun.keys())) {
           if (!terminalRunIds.includes(runId) && runId !== activeTerminalRunId) {
-            terminalLogEtagByRun.delete(runId);
+            terminalLogSeqByRun.delete(runId);
           }
         }
 
@@ -823,123 +822,136 @@
         }
 
         renderTerminalTabs();
-        restartTerminalPollNow();
-      }
-
-      function activeTerminalLongPollTimeoutMs() {
-        const activeMeta = terminalRunMetaById.get(activeTerminalRunId);
-        const activeStatus = String(activeMeta?.status ?? "").toUpperCase();
-        if (activeStatus === "RUNNING") {
-          return TERMINAL_WAIT_TIMEOUT_RUNNING_MS;
-        }
-        return TERMINAL_WAIT_TIMEOUT_IDLE_MS;
-      }
-
-      function clearTerminalPollTimer() {
-        if (terminalPollTimerId) {
-          window.clearTimeout(terminalPollTimerId);
-          terminalPollTimerId = 0;
+        const nextRunKey = terminalRunIds.join("|");
+        const runSetChanged = previousRunKey !== nextRunKey;
+        const activeChanged = previousActiveRunId !== activeTerminalRunId;
+        const streamMismatched = terminalStreamRunId !== activeTerminalRunId;
+        if (runSetChanged || activeChanged || streamMismatched || !terminalStreamSource) {
+          restartTerminalStreamNow();
         }
       }
 
-      function abortTerminalPollRequest() {
-        if (!terminalPollAbortController) {
-          return;
+      function clearTerminalStreamReconnectTimer() {
+        if (terminalStreamReconnectTimerId) {
+          window.clearTimeout(terminalStreamReconnectTimerId);
+          terminalStreamReconnectTimerId = 0;
         }
-        try {
-          terminalPollAbortController.abort();
-        } catch {
-          // no-op
-        }
-        terminalPollAbortController = null;
       }
 
-      function restartTerminalPollNow() {
-        abortTerminalPollRequest();
-        clearTerminalPollTimer();
-        scheduleTerminalPoll(0);
+      function closeTerminalStream() {
+        if (terminalStreamSource) {
+          terminalStreamSource.close();
+          terminalStreamSource = null;
+        }
+        terminalStreamRunId = "";
       }
 
-      function scheduleTerminalPoll(delayMs = 0) {
-        clearTerminalPollTimer();
-        terminalPollTimerId = window.setTimeout(() => {
-          void pollActiveTerminalLogs();
-        }, Math.max(150, Number(delayMs) || 0));
-      }
-
-      async function pollActiveTerminalLogs() {
-        if (!activeTerminalRunId) {
-          return;
+      async function loadTerminalSnapshot(runId, sessionId) {
+        const response = await fetch(`/internal/logs/${encodeURIComponent(runId)}`, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
         }
-        if (document.hidden) {
-          scheduleTerminalPoll(TERMINAL_HIDDEN_POLL_INTERVAL_MS);
-          return;
-        }
-        if (terminalPollInFlight) {
-          return;
-        }
-
-        const runId = activeTerminalRunId;
-        const sequence = ++terminalPollSequence;
-        let nextDelayMs = 0;
-        terminalPollInFlight = true;
-        const abortController = new AbortController();
-        terminalPollAbortController = abortController;
-        try {
-          const headers = {};
-          const cachedEtag = terminalLogEtagByRun.get(runId);
-          if (typeof cachedEtag === "string" && cachedEtag.length > 0) {
-            headers["If-None-Match"] = cachedEtag;
-          }
-          const timeoutMs = activeTerminalLongPollTimeoutMs();
-          const response = await fetch(`/internal/logs/${encodeURIComponent(runId)}?wait=1&timeoutMs=${timeoutMs}`, {
-            cache: "no-store",
-            headers,
-            signal: abortController.signal,
-          });
-          if (response.status === 304) {
-            return;
-          }
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-          }
-
-          const payload = asObject(await response.json());
-          const logs = typeof payload.logs === "string" ? payload.logs : "";
-          const nextEtag = response.headers.get("etag") || (typeof payload.etag === "string" ? payload.etag : "");
-          if (nextEtag) {
-            terminalLogEtagByRun.set(runId, nextEtag);
-          }
-          terminalLogCache.set(runId, logs);
-
-          if (sequence !== terminalPollSequence || runId !== activeTerminalRunId) {
-            return;
-          }
+        const payload = asObject(await response.json());
+        const logs = typeof payload.logs === "string" ? payload.logs : "";
+        const seq = Number.isInteger(payload.seq) && payload.seq > 0 ? payload.seq : 0;
+        terminalLogCache.set(runId, logs);
+        terminalLogSeqByRun.set(runId, seq);
+        if (sessionId === terminalStreamSessionId && runId === activeTerminalRunId) {
           renderTerminalOutput(logs);
-        } catch (error) {
-          if (error?.name === "AbortError") {
+        }
+      }
+
+      function scheduleTerminalStreamReconnect(sessionId, delayMs = TERMINAL_STREAM_RECONNECT_MS) {
+        clearTerminalStreamReconnectTimer();
+        terminalStreamReconnectTimerId = window.setTimeout(() => {
+          if (sessionId !== terminalStreamSessionId) {
             return;
           }
-          nextDelayMs = TERMINAL_RETRY_DELAY_MS;
-          if (sequence !== terminalPollSequence || runId !== activeTerminalRunId) {
+          void startTerminalStreamSession(sessionId);
+        }, Math.max(250, Number(delayMs) || 0));
+      }
+
+      function connectTerminalStream(runId, sessionId) {
+        if (document.hidden || !runId || runId !== activeTerminalRunId || sessionId !== terminalStreamSessionId) {
+          return;
+        }
+
+        const after = terminalLogSeqByRun.get(runId) ?? 0;
+        const source = new EventSource(`/internal/logs/stream/${encodeURIComponent(runId)}?after=${encodeURIComponent(after)}`);
+        terminalStreamSource = source;
+        terminalStreamRunId = runId;
+
+        source.addEventListener("transcript", (event) => {
+          if (sessionId !== terminalStreamSessionId || runId !== activeTerminalRunId) {
+            return;
+          }
+          let payload = {};
+          try {
+            payload = asObject(JSON.parse(event.data || "{}"));
+          } catch {
+            payload = {};
+          }
+          const chunk = typeof payload.chunk === "string" ? payload.chunk : "";
+          if (!chunk) {
+            return;
+          }
+          const seq = Number.isInteger(payload.seq) && payload.seq > 0 ? payload.seq : 0;
+          const currentSeq = terminalLogSeqByRun.get(runId) ?? 0;
+          if (seq > 0 && seq <= currentSeq) {
+            return;
+          }
+          const previous = terminalLogCache.get(runId) ?? "";
+          const nextLogs = `${previous}${chunk}`;
+          terminalLogCache.set(runId, nextLogs);
+          if (seq > 0) {
+            terminalLogSeqByRun.set(runId, seq);
+          }
+          renderTerminalOutput(nextLogs);
+        });
+
+        source.addEventListener("ping", () => {});
+
+        source.onerror = () => {
+          if (sessionId !== terminalStreamSessionId || source !== terminalStreamSource || runId !== activeTerminalRunId) {
+            return;
+          }
+          closeTerminalStream();
+          scheduleTerminalStreamReconnect(sessionId);
+        };
+      }
+
+      async function startTerminalStreamSession(sessionId) {
+        const runId = activeTerminalRunId;
+        if (!runId || document.hidden || sessionId !== terminalStreamSessionId) {
+          return;
+        }
+        try {
+          await loadTerminalSnapshot(runId, sessionId);
+        } catch (error) {
+          if (sessionId !== terminalStreamSessionId || runId !== activeTerminalRunId) {
             return;
           }
           if (!terminalLogCache.has(runId)) {
             terminalOutputEl.textContent = `Unable to load logs for ${runId}: ${error?.message ?? "Unknown error"}`;
           }
-        } finally {
-          if (terminalPollAbortController === abortController) {
-            terminalPollAbortController = null;
-          }
-          terminalPollInFlight = false;
-          if (runId === activeTerminalRunId) {
-            if (document.hidden) {
-              scheduleTerminalPoll(TERMINAL_HIDDEN_POLL_INTERVAL_MS);
-            } else {
-              scheduleTerminalPoll(nextDelayMs);
-            }
-          }
+          scheduleTerminalStreamReconnect(sessionId);
+          return;
         }
+        if (sessionId !== terminalStreamSessionId || runId !== activeTerminalRunId || document.hidden) {
+          return;
+        }
+        connectTerminalStream(runId, sessionId);
+      }
+
+      function restartTerminalStreamNow() {
+        terminalStreamSessionId += 1;
+        const sessionId = terminalStreamSessionId;
+        closeTerminalStream();
+        clearTerminalStreamReconnectTimer();
+        if (!activeTerminalRunId || document.hidden) {
+          return;
+        }
+        void startTerminalStreamSession(sessionId);
       }
 
       function deriveRunFailureDetail(entry) {
@@ -1652,13 +1664,13 @@
       loadConfig();
       loadStatus();
       setInterval(loadStatus, POLL_INTERVAL_MS);
-      scheduleTerminalPoll(250);
+      restartTerminalStreamNow();
       document.addEventListener("visibilitychange", () => {
         if (document.hidden) {
-          abortTerminalPollRequest();
-          scheduleTerminalPoll(TERMINAL_HIDDEN_POLL_INTERVAL_MS);
+          closeTerminalStream();
+          clearTerminalStreamReconnectTimer();
         } else {
-          restartTerminalPollNow();
+          restartTerminalStreamNow();
         }
       });
 
@@ -1666,8 +1678,8 @@
         if (animationFrameId) {
           window.cancelAnimationFrame(animationFrameId);
         }
-        abortTerminalPollRequest();
-        clearTerminalPollTimer();
+        closeTerminalStream();
+        clearTerminalStreamReconnectTimer();
       });
     </script>
   </body>

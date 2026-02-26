@@ -1671,6 +1671,15 @@ class Runner:
             # Bundle injection: fetch verbatim from backend.
             bundle = self._backend.get_agent_context(intent.role)
 
+            def _intent_transcript_sink(section: str, content: str) -> None:
+                _emit_live_transcript_event(
+                    backend=self._backend,
+                    run_id=intent.run_id,
+                    role=intent.role,
+                    section=section,
+                    content=content,
+                )
+
             # Execute via Codex MCP worker (Codex MCP server is spawned per intent).
             result = run_intent_with_codex_mcp(
                 codex_bin=self._codex_bin,
@@ -1679,6 +1688,7 @@ class Runner:
                 role_bundle=bundle,
                 intent=intent.raw,
                 tools_call_timeout_s=self._codex_tools_call_timeout_s,
+                transcript_event_sink=_intent_transcript_sink,
             )
         except Exception as exc:
             heartbeat_stop.set()
@@ -1907,33 +1917,65 @@ def _log_stderr(obj: Dict[str, Any]) -> None:
     sys.stderr.flush()
 
 
-class _RunTranscriptWriter:
-    def __init__(self, *, repo_root: str, run_id: str):
-        self._lock = threading.Lock()
-        self._handle: Optional[Any] = None
-        if not isinstance(repo_root, str) or not repo_root.strip():
-            return
-        if not isinstance(run_id, str) or not run_id.strip():
-            return
-        transcript_path = Path(repo_root).resolve() / f".run-transcript.{run_id.strip()}.log"
-        try:
-            transcript_path.parent.mkdir(parents=True, exist_ok=True)
-            self._handle = transcript_path.open("w", encoding="utf8", buffering=1)
-        except OSError:
-            self._handle = None
+def _emit_live_transcript_event(
+    *,
+    backend: Any,
+    run_id: str,
+    role: str,
+    section: str,
+    content: str,
+) -> None:
+    normalized_run_id = str(run_id or "").strip()
+    normalized_role = str(role or "").strip().upper()
+    normalized_section = str(section or "").strip().upper()
+    normalized_content = str(content or "").strip()
+    if not normalized_run_id or not normalized_role or not normalized_section or not normalized_content:
+        return
 
-    def _write(self, text: str) -> None:
-        handle = self._handle
-        if handle is None:
+    post_json = getattr(backend, "post_json", None)
+    if not callable(post_json):
+        return
+
+    body = {
+        "run_id": normalized_run_id,
+        "role": normalized_role,
+        "section": normalized_section,
+        "content": normalized_content,
+    }
+
+    try:
+        if isinstance(backend, BackendClient):
+            timeout_s = max(0.75, min(backend.timeout_s, 2.0))
+            backend.post_json("/internal/logs/events", body=body, timeout_s=timeout_s)
             return
+        post_json("/internal/logs/events", body=body)
+    except Exception:
+        # Live transcript streaming must never interrupt orchestrator/runner execution.
+        pass
+
+
+class _RunTranscriptWriter:
+    def __init__(self, *, repo_root: str, run_id: str, backend: Any = None, role: str = "ORCHESTRATOR"):
+        _ = repo_root
+        self._lock = threading.Lock()
+        self._backend = backend
+        self._run_id = str(run_id or "").strip()
+        self._role = str(role or "").strip().upper()
+
+    def _write(self, title: str, text: str) -> None:
         if not isinstance(text, str) or text == "":
             return
         with self._lock:
             try:
-                handle.write(text)
-                handle.flush()
+                _emit_live_transcript_event(
+                    backend=self._backend,
+                    run_id=self._run_id,
+                    role=self._role,
+                    section=str(title or "").strip().upper() or "SYSTEM OBSERVATION",
+                    content=text,
+                )
             except Exception:
-                # Transcript rendering must never interrupt orchestration.
+                # Transcript streaming must never interrupt orchestration.
                 pass
 
     def _append_section(self, *, title: str, content: str) -> None:
@@ -1943,7 +1985,7 @@ class _RunTranscriptWriter:
         normalized_title = str(title or "").strip()
         if not normalized_title:
             normalized_title = "SYSTEM OBSERVATION"
-        self._write(f"\n========== {normalized_title} ==========\n{normalized_content}\n")
+        self._write(normalized_title, normalized_content)
 
     def append_message_to_agent(self, content: str) -> None:
         self._append_section(title="MESSAGE TO AGENT", content=content)
@@ -1955,15 +1997,7 @@ class _RunTranscriptWriter:
         self._append_section(title="SYSTEM OBSERVATION", content=content)
 
     def close(self) -> None:
-        handle = self._handle
-        self._handle = None
-        if handle is None:
-            return
-        with self._lock:
-            try:
-                handle.close()
-            except Exception:
-                pass
+        return None
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -2507,6 +2541,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                 goal_text=goal_text,
                 ready_limit=ready_limit,
             )
+
+            def _kickoff_transcript_sink(section: str, content: str) -> None:
+                _emit_live_transcript_event(
+                    backend=backend,
+                    run_id=kickoff_run_id,
+                    role="ORCHESTRATOR",
+                    section=section,
+                    content=content,
+                )
+
             kickoff_raw = generate_json_with_codex_mcp(
                 codex_bin=config.codex_bin,
                 codex_mcp_args=config.codex_mcp_args,
@@ -2518,6 +2562,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 tools_call_timeout_s=config.codex_tools_call_timeout_s,
                 run_id=kickoff_run_id,
                 repo_root=repo_root,
+                transcript_event_sink=_kickoff_transcript_sink,
             )
             kickoff_plan = validate_kickoff_plan(kickoff_raw, sprint=sprint, ready_limit=ready_limit)
             draft = kickoff_plan_to_plan_apply_draft(kickoff_plan)
@@ -2678,7 +2723,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     orchestrator_loop_run_id = f"orchestrator-loop-{uuid4()}"
     orchestrator_poll_summaries_seen = 0
     orchestrator_dispatches_seen = 0
-    orchestrator_transcript = _RunTranscriptWriter(repo_root=repo_root, run_id=orchestrator_loop_run_id)
+    orchestrator_transcript = _RunTranscriptWriter(
+        repo_root=repo_root,
+        run_id=orchestrator_loop_run_id,
+        backend=backend,
+        role="ORCHESTRATOR",
+    )
     orchestrator_poll_interval_ms = _safe_int(orchestrator_env.get("ORCHESTRATOR_POLL_INTERVAL_MS"), 15000)
     if orchestrator_poll_interval_ms <= 0:
         orchestrator_poll_interval_ms = 15000
