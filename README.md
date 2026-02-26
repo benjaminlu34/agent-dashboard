@@ -56,7 +56,12 @@ pnpm install
 export GITHUB_TOKEN="<token>"
 ```
 
-3. Configure CLI target repo/project identity:
+3. Configure CLI target repo/project identity in repo root (`./.agent-swarm.yml`):
+- Option A (recommended): run interactive init from the repo root:
+```bash
+pnpm swarm:init
+```
+- Option B: create the file manually:
 ```bash
 cat > .agent-swarm.yml <<'YAML'
 version: "1.0"
@@ -79,39 +84,54 @@ export TARGET_TEMPLATE_PATH=".github/ISSUE_TEMPLATE/milestone-task.yml"  # optio
 export TARGET_REF="HEAD"                                                # optional
 ```
 
-5. Start internal API:
+5. Before `pnpm dev`, configure status-state input for dashboard/API status route:
+- Option A (auto-scoped defaults from `.agent-swarm.yml`):
+  - Ensure `.agent-swarm.yml` contains:
+    - `target.owner`
+    - `target.repo`
+  - The status endpoint will read:
+    - `./.orchestrator-state.<sanitized-owner>.<sanitized-repo>.json`
+    - `./.runner-ledger.<sanitized-owner>.<sanitized-repo>.json`
+- Option B (explicit state file paths via env):
+```bash
+export ORCHESTRATOR_STATE_PATH="./.orchestrator-state.json"
+export RUNNER_LEDGER_PATH="./.runner-ledger.json"
+```
+- If neither scoped files nor explicit files exist yet, `GET /internal/status` returns empty objects and dashboard sections show empty states.
+
+6. Start internal API:
 ```bash
 pnpm dev
 ```
 
-6. Run preflight manually:
+7. Run preflight manually:
 ```bash
 curl "http://localhost:4000/internal/preflight?role=ORCHESTRATOR"
 ```
 
-7. Run CLI doctor preflight checks:
+8. Run CLI doctor preflight checks:
 ```bash
 export GITHUB_TOKEN="<token>"
 pnpm doctor
 ```
 
-8. Run orchestrator once:
+9. Run orchestrator once:
 ```bash
 export ORCHESTRATOR_SPRINT="M1"
 pnpm orchestrator
 ```
 
-9. Run orchestrator loop mode:
+10. Run orchestrator loop mode:
 ```bash
 node apps/orchestrator/src/cli.js --loop
 ```
 
-10. Run runner once (executes orchestrator intents and workers):
+11. Run runner once (executes orchestrator intents and workers):
 ```bash
 pnpm runner
 ```
 
-11. Dry-run runner (no backend write endpoints, no worker execution):
+12. Dry-run runner (no backend write endpoints, no worker execution):
 ```bash
 pnpm runner:dry
 ```
@@ -196,6 +216,7 @@ Optional:
 - Run API: `pnpm dev`
 - Run tests: `pnpm test`
 - Run CLI config parser test: `pnpm test:cli`
+- Init `.agent-swarm.yml` + required template: `pnpm swarm:init`
 - Run doctor preflight checks: `pnpm doctor`
 - Run orchestrator once: `pnpm orchestrator`
 - Run runner once: `pnpm runner`

@@ -7,6 +7,7 @@
   },
   "scripts": {
     "dev": "node apps/api/src/index.js",
+    "swarm:init": "node apps/cli/src/index.js init",
     "test": "node --test apps/api/test/*.test.js",
     "test:cli": "node --test apps/cli/test/*.test.js",
     "orchestrator": "node apps/orchestrator/src/cli.js --once",
@@ -15,6 +16,7 @@
     "runner:dry": "python3 -m apps.runner --dry-run --once"
   },
   "dependencies": {
+    "@fastify/static": "^7.0.4",
     "@inquirer/prompts": "^8.3.0",
     "commander": "^12.1.0",
     "fastify": "^4.26.0",
