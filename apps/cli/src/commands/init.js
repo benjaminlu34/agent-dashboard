@@ -7,18 +7,7 @@ import YAML from "yaml";
 
 import { REQUIRED_TEMPLATE_CONTENT, REQUIRED_TEMPLATE_PATH } from "../constants/doctor.js";
 import { DEFAULT_CONFIG_FILE } from "../config.js";
-
-function green(text) {
-  return `\u001b[32m${text}\u001b[0m`;
-}
-
-function red(text) {
-  return `\u001b[31m${text}\u001b[0m`;
-}
-
-function yellow(text) {
-  return `\u001b[33m${text}\u001b[0m`;
-}
+import { green, red, yellow } from "../util/colors.js";
 
 function validateIdentifier(value, fieldName) {
   const trimmed = value.trim();
@@ -33,6 +22,10 @@ function validateIdentifier(value, fieldName) {
 
 function validateProjectV2Number(value) {
   return /^[1-9]\d*$/.test(value.trim()) ? true : "GitHub Project V2 Number must be a positive integer.";
+}
+
+async function promptTrimmedInput({ message, validate }) {
+  return (await input({ message, validate })).trim();
 }
 
 async function pathExists(path) {
@@ -60,32 +53,31 @@ function buildConfigYaml({ owner, repo, projectV2Number }) {
   });
 }
 
+async function writeFileWithSuccessMessage(path, content, label) {
+  await writeFile(path, content, "utf8");
+  process.stdout.write(`${green("✔")} Wrote ${label}\n`);
+}
+
 export function registerInitCommand(program) {
   program
     .command("init")
     .description("Bootstrap local CLI config and required GitHub issue template.")
     .action(async () => {
-      const owner = (
-        await input({
-          message: "Target GitHub Owner (User/Org)",
-          validate: (value) => validateIdentifier(value, "Target GitHub Owner"),
-        })
-      ).trim();
+      const owner = await promptTrimmedInput({
+        message: "Target GitHub Owner (User/Org)",
+        validate: (value) => validateIdentifier(value, "Target GitHub Owner"),
+      });
 
-      const repo = (
-        await input({
-          message: "Target GitHub Repository Name",
-          validate: (value) => validateIdentifier(value, "Target GitHub Repository Name"),
-        })
-      ).trim();
+      const repo = await promptTrimmedInput({
+        message: "Target GitHub Repository Name",
+        validate: (value) => validateIdentifier(value, "Target GitHub Repository Name"),
+      });
 
       const projectV2Number = Number.parseInt(
-        (
-          await input({
-            message: "GitHub Project V2 Number",
-            validate: validateProjectV2Number,
-          })
-        ).trim(),
+        await promptTrimmedInput({
+          message: "GitHub Project V2 Number",
+          validate: validateProjectV2Number,
+        }),
         10,
       );
 
@@ -95,27 +87,22 @@ export function registerInitCommand(program) {
 
       const configYaml = buildConfigYaml({ owner, repo, projectV2Number });
       const configAlreadyExists = await pathExists(configPath);
-
+      let shouldWriteConfig = true;
       if (configAlreadyExists) {
-        const shouldOverwriteConfig = await confirm({
+        shouldWriteConfig = await confirm({
           message: `${DEFAULT_CONFIG_FILE} already exists. Overwrite it?`,
           default: false,
         });
+      }
 
-        if (shouldOverwriteConfig) {
-          await writeFile(configPath, configYaml, "utf8");
-          process.stdout.write(`${green("✔")} Wrote ${DEFAULT_CONFIG_FILE}\n`);
-        } else {
-          process.stdout.write(`${yellow("!")} Kept existing ${DEFAULT_CONFIG_FILE}\n`);
-        }
+      if (shouldWriteConfig) {
+        await writeFileWithSuccessMessage(configPath, configYaml, DEFAULT_CONFIG_FILE);
       } else {
-        await writeFile(configPath, configYaml, "utf8");
-        process.stdout.write(`${green("✔")} Wrote ${DEFAULT_CONFIG_FILE}\n`);
+        process.stdout.write(`${yellow("!")} Kept existing ${DEFAULT_CONFIG_FILE}\n`);
       }
 
       await mkdir(dirname(templatePath), { recursive: true });
-      await writeFile(templatePath, REQUIRED_TEMPLATE_CONTENT, "utf8");
-      process.stdout.write(`${green("✔")} Wrote ${REQUIRED_TEMPLATE_PATH}\n`);
+      await writeFileWithSuccessMessage(templatePath, REQUIRED_TEMPLATE_CONTENT, REQUIRED_TEMPLATE_PATH);
 
       process.stdout.write(
         `${green("✔")} Init complete. Commit ${REQUIRED_TEMPLATE_PATH} and run pnpm doctor to verify your setup.\n`,

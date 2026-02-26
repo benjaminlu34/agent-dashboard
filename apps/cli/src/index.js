@@ -5,10 +5,7 @@ import { Command } from "commander";
 
 import { registerDoctorCommand } from "./commands/doctor.js";
 import { registerInitCommand } from "./commands/init.js";
-
-function red(text) {
-  return `\u001b[31m${text}\u001b[0m`;
-}
+import { red } from "./util/colors.js";
 
 const program = new Command();
 

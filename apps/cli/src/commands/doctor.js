@@ -9,14 +9,7 @@ import {
   SAFE_TEMPLATE_FIX_BRANCH,
 } from "../constants/doctor.js";
 import { loadAgentSwarmConfig } from "../config.js";
-
-function green(text) {
-  return `\u001b[32m${text}\u001b[0m`;
-}
-
-function red(text) {
-  return `\u001b[31m${text}\u001b[0m`;
-}
+import { green, red } from "../util/colors.js";
 
 function success(title, { detail, extra } = {}) {
   return {
