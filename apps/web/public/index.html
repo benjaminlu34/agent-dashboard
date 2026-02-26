@@ -737,21 +737,30 @@
       }
 
       function setKickoffLoopLoading(isLoading) {
-        const nextLoading = Boolean(isLoading);
-        kickoffStartLoopButtonEl.disabled = nextLoading;
-        kickoffStartRunnerLoopButtonEl.disabled = nextLoading;
-        kickoffSprintEl.disabled = nextLoading;
-        kickoffStartLoopSpinnerEl.classList.toggle("hidden", !nextLoading);
-        kickoffStartLoopLabelEl.textContent = nextLoading ? "Starting..." : "Start Kickoff Loop (Step 2)";
+        setLoopStartLoading({
+          isLoading,
+          spinnerEl: kickoffStartLoopSpinnerEl,
+          labelEl: kickoffStartLoopLabelEl,
+          idleLabel: "Start Kickoff Loop (Step 2)",
+        });
       }
 
       function setRunnerLoopLoading(isLoading) {
+        setLoopStartLoading({
+          isLoading,
+          spinnerEl: kickoffStartRunnerLoopSpinnerEl,
+          labelEl: kickoffStartRunnerLoopLabelEl,
+          idleLabel: "Start Runner Loop (No Kickoff)",
+        });
+      }
+
+      function setLoopStartLoading({ isLoading, spinnerEl, labelEl, idleLabel }) {
         const nextLoading = Boolean(isLoading);
         kickoffStartLoopButtonEl.disabled = nextLoading;
         kickoffStartRunnerLoopButtonEl.disabled = nextLoading;
         kickoffSprintEl.disabled = nextLoading;
-        kickoffStartRunnerLoopSpinnerEl.classList.toggle("hidden", !nextLoading);
-        kickoffStartRunnerLoopLabelEl.textContent = nextLoading ? "Starting..." : "Start Runner Loop (No Kickoff)";
+        spinnerEl.classList.toggle("hidden", !nextLoading);
+        labelEl.textContent = nextLoading ? "Starting..." : idleLabel;
       }
 
       async function submitKickoff(event) {
