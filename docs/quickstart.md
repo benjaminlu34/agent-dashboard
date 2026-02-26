@@ -57,31 +57,37 @@ This guide covers the fastest setup path using the local dashboard.
 
    If the template is missing, `pnpm doctor` prints exact remediation commands you can run.
 
-6. **Initialize sprint goal in the dashboard**
+6. **Initialize sprint and start kickoff loop in the dashboard**
 
    - In the dashboard, use the **Initialize Sprint** section.
    - Enter your high-level sprint objective in the textarea.
-   - The swarm automatically processes the high-level goal into individual tasks.
-   - Click **Write Goal & Kickoff**.
-   - Wait for success message: `Goal Received`.
+   - Click **Save Goal (Step 1)**.
+   - Set `Sprint` to `M1`, `M2`, `M3`, or `M4`.
+   - Click **Start Kickoff Loop (Step 2)**.
+   - Wait for success message: `Kickoff loop started.`
 
-   This writes the goal text to `goal.txt` in the repository root.
+   This writes `goal.txt` and starts the live kickoff loop from the GUI.
 
-   API equivalent:
+   API equivalents:
 
    ```bash
    curl -X POST http://localhost:4000/internal/kickoff \
      -H "content-type: application/json" \
      -d '{"goal":"Ship sprint kickoff flow with safe validation and visibility."}'
+
+   curl -X POST http://localhost:4000/internal/kickoff/start-loop \
+     -H "content-type: application/json" \
+     -d '{"sprint":"M1"}'
    ```
 
-   Expected success payload:
+   Expected success payloads:
 
    ```json
    { "status": "success", "message": "Goal Received." }
+   { "status": "STARTED", "message": "Kickoff loop started.", "pid": 12345, "sprint": "M1", "started_at": "..." }
    ```
 
-7. **Dry run the runner**
+7. **(Optional) Dry run the runner**
 
    ```bash
    pnpm runner:dry
@@ -89,7 +95,15 @@ This guide covers the fastest setup path using the local dashboard.
 
    This executes a safe run without modifying the target repository.
 
-8. **Monitor execution**
+8. **CLI fallback for live workflow execution**
+
+   ```bash
+   python3 -m apps.runner --kickoff --sprint M1 --goal-file ./goal.txt --loop
+   ```
+
+   Use this only if you do not start from the GUI button in step 6.
+
+9. **Monitor execution**
 
    Keep the dashboard open at `http://localhost:4000` to watch the live queue and execution states.
 
