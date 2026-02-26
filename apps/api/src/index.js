@@ -18,7 +18,7 @@ const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../");
 export async function buildApp({ repoRoot = DEFAULT_REPO_ROOT, logger = true } = {}) {
   const app = Fastify({ logger });
 
-  const routeOptions = { repoRoot, env: process.env };
+  const routeOptions = { repoRoot };
   await registerInternalPreflightRoute(app, routeOptions);
   await registerInternalRunRoute(app, routeOptions);
   await registerInternalPlanApplyRoute(app, routeOptions);
@@ -26,7 +26,13 @@ export async function buildApp({ repoRoot = DEFAULT_REPO_ROOT, logger = true } =
   await registerInternalAgentContextRoute(app, routeOptions);
   await registerInternalExecutorClaimReadyItemRoute(app, routeOptions);
   await registerInternalReviewerResolveLinkedPrRoute(app, routeOptions);
-  await registerInternalStatusRoute(app, routeOptions);
+  await registerInternalStatusRoute(app, {
+    repoRoot,
+    env: {
+      ORCHESTRATOR_STATE_PATH: process.env.ORCHESTRATOR_STATE_PATH,
+      RUNNER_LEDGER_PATH: process.env.RUNNER_LEDGER_PATH,
+    },
+  });
 
   await app.register(fastifyStatic, {
     root: resolve(repoRoot, "apps/web/public"),

@@ -345,7 +345,8 @@
 
         runnerRunsEl.innerHTML = entries
           .map((entry) => {
-            const showBlocked = entry.status?.toLowerCase() === "failed" || /block|error|stall/i.test(entry.blockedReason);
+            const normalizedStatus = String(entry.status ?? "").toLowerCase();
+            const showBlocked = normalizedStatus === "failed" || normalizedStatus === "blocked";
             return `
               <article class="relative rounded-xl border border-zinc-800 bg-black p-4 shadow-md shadow-white/5">
                 <div class="absolute left-0 top-5 h-4 w-1 rounded-r-full ${showBlocked ? "bg-zinc-500" : "bg-white/70"}"></div>
