@@ -85,6 +85,14 @@
               </button>
             </div>
             <p class="mt-2 text-sm text-zinc-400">Update local `.agent-swarm.yml` and `.env` configuration.</p>
+            <div class="mt-4 rounded-xl border border-zinc-800 bg-black/60 p-3">
+              <p class="text-xs font-semibold uppercase tracking-[0.16em] text-zinc-300">Configure via GUI</p>
+              <ul class="mt-2 space-y-1 text-xs text-zinc-400">
+                <li><span class="font-semibold text-zinc-200">Target Owner:</span> Use the organization or username slug (e.g., `openai`).</li>
+                <li><span class="font-semibold text-zinc-200">Target Repo:</span> Use the repository name slug (e.g., `whisper`).</li>
+                <li><span class="font-semibold text-zinc-200">Important:</span> Do not paste full URLs into these fields.</li>
+              </ul>
+            </div>
 
             <form id="settings-form" class="mt-5 space-y-4">
               <label class="block">
@@ -95,6 +103,7 @@
                   type="text"
                   required
                   autocomplete="off"
+                  placeholder="openai"
                   class="w-full rounded-lg border border-zinc-700 bg-black px-3 py-2 text-sm text-white outline-none transition focus:border-zinc-500"
                 />
               </label>
@@ -106,6 +115,7 @@
                   type="text"
                   required
                   autocomplete="off"
+                  placeholder="whisper"
                   class="w-full rounded-lg border border-zinc-700 bg-black px-3 py-2 text-sm text-white outline-none transition focus:border-zinc-500"
                 />
               </label>
@@ -118,6 +128,7 @@
                   required
                   min="1"
                   step="1"
+                  placeholder="7"
                   class="w-full rounded-lg border border-zinc-700 bg-black px-3 py-2 text-sm text-white outline-none transition focus:border-zinc-500"
                 />
               </label>
@@ -190,7 +201,9 @@
           <div class="flex flex-wrap items-center justify-between gap-4">
             <div>
               <h2 class="text-xl font-semibold tracking-tight text-white">Initialize Sprint</h2>
-              <p class="mt-1 text-sm text-zinc-400">Capture the high-level sprint goal and persist it to local kickoff state.</p>
+              <p class="mt-1 text-sm text-zinc-400">
+                Step 1 saves your high-level sprint goal to local kickoff state. Step 2 starts kickoff loop execution so the swarm generates tasks and begins work.
+              </p>
             </div>
           </div>
 
@@ -202,16 +215,29 @@
               id="kickoff-goal"
               name="goal"
               rows="7"
-              placeholder="Describe the primary sprint objective and intended outcomes."
+              placeholder="Example: Ship sprint kickoff validation hardening and add tests for claim lease expiration handling."
               class="w-full rounded-xl border border-zinc-700 bg-black px-4 py-3 text-sm text-zinc-100 outline-none transition focus:border-zinc-500"
             ></textarea>
-            <div class="mt-4 flex flex-wrap items-center justify-between gap-3">
-              <p
-                id="kickoff-message"
-                class="hidden rounded-lg border px-3 py-2 text-sm"
-                role="status"
-                aria-live="polite"
-              ></p>
+            <div class="mt-3 rounded-lg border border-zinc-800 bg-black px-3 py-2 text-xs text-zinc-400">
+              <p class="font-semibold uppercase tracking-[0.16em] text-zinc-300">Start Workflow</p>
+              <p class="mt-1">
+                Click <span class="font-semibold text-zinc-200">Start Kickoff Loop (Step 2)</span> to launch kickoff from the GUI. Manual fallback:
+                `python3 -m apps.runner --kickoff --sprint M1 --goal-file ./goal.txt --loop`
+              </p>
+            </div>
+            <div class="mt-4 flex flex-wrap items-end gap-3">
+              <label class="block min-w-[110px]">
+                <span class="mb-1 block text-xs font-semibold uppercase tracking-[0.16em] text-zinc-400">Sprint</span>
+                <input
+                  id="kickoff-sprint"
+                  name="sprint"
+                  type="text"
+                  value="M1"
+                  placeholder="M1"
+                  autocomplete="off"
+                  class="w-full rounded-lg border border-zinc-700 bg-black px-3 py-2 text-sm text-white outline-none transition focus:border-zinc-500"
+                />
+              </label>
               <button
                 id="kickoff-submit-button"
                 type="submit"
@@ -222,9 +248,27 @@
                   class="hidden h-3 w-3 animate-spin rounded-full border-2 border-zinc-900 border-r-transparent"
                   aria-hidden="true"
                 ></span>
-                <span id="kickoff-button-label">Write Goal &amp; Kickoff</span>
+                <span id="kickoff-button-label">Save Goal (Step 1)</span>
+              </button>
+              <button
+                id="kickoff-start-loop-button"
+                type="button"
+                class="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-black px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-zinc-200 transition hover:border-zinc-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <span
+                  id="kickoff-start-loop-spinner"
+                  class="hidden h-3 w-3 animate-spin rounded-full border-2 border-zinc-200 border-r-transparent"
+                  aria-hidden="true"
+                ></span>
+                <span id="kickoff-start-loop-label">Start Kickoff Loop (Step 2)</span>
               </button>
             </div>
+            <p
+              id="kickoff-message"
+              class="hidden mt-3 w-full rounded-lg border px-3 py-2 text-sm"
+              role="status"
+              aria-live="polite"
+            ></p>
           </form>
         </section>
 
@@ -290,10 +334,14 @@
       const settingsMaxReviewersEl = document.getElementById("settings-max-reviewers");
       const kickoffFormEl = document.getElementById("kickoff-form");
       const kickoffGoalEl = document.getElementById("kickoff-goal");
+      const kickoffSprintEl = document.getElementById("kickoff-sprint");
       const kickoffMessageEl = document.getElementById("kickoff-message");
       const kickoffSubmitButtonEl = document.getElementById("kickoff-submit-button");
       const kickoffButtonSpinnerEl = document.getElementById("kickoff-button-spinner");
       const kickoffButtonLabelEl = document.getElementById("kickoff-button-label");
+      const kickoffStartLoopButtonEl = document.getElementById("kickoff-start-loop-button");
+      const kickoffStartLoopSpinnerEl = document.getElementById("kickoff-start-loop-spinner");
+      const kickoffStartLoopLabelEl = document.getElementById("kickoff-start-loop-label");
 
       const canvas = document.getElementById("bg-canvas");
       const ctx = canvas.getContext("2d");
@@ -333,6 +381,11 @@
           return "Unknown time";
         }
         return parsed.toLocaleString();
+      }
+
+      function normalizeSprint(value) {
+        const normalized = String(value ?? "").trim().toUpperCase();
+        return /^M[1-4]$/u.test(normalized) ? normalized : null;
       }
 
       function statusBadgeClasses(status) {
@@ -653,8 +706,17 @@
         const nextLoading = Boolean(isLoading);
         kickoffSubmitButtonEl.disabled = nextLoading;
         kickoffGoalEl.disabled = nextLoading;
+        kickoffStartLoopButtonEl.disabled = nextLoading;
         kickoffButtonSpinnerEl.classList.toggle("hidden", !nextLoading);
-        kickoffButtonLabelEl.textContent = nextLoading ? "Writing..." : "Write Goal & Kickoff";
+        kickoffButtonLabelEl.textContent = nextLoading ? "Saving..." : "Save Goal (Step 1)";
+      }
+
+      function setKickoffLoopLoading(isLoading) {
+        const nextLoading = Boolean(isLoading);
+        kickoffStartLoopButtonEl.disabled = nextLoading;
+        kickoffSprintEl.disabled = nextLoading;
+        kickoffStartLoopSpinnerEl.classList.toggle("hidden", !nextLoading);
+        kickoffStartLoopLabelEl.textContent = nextLoading ? "Starting..." : "Start Kickoff Loop (Step 2)";
       }
 
       async function submitKickoff(event) {
@@ -701,11 +763,80 @@
             typeof payload.message === "string" && payload.message.trim().length > 0
               ? payload.message.trim()
               : "Goal received.";
-          showKickoffMessage(successMessage);
+          showKickoffMessage(`${successMessage} Next: click Start Kickoff Loop (Step 2).`);
         } catch (error) {
           showKickoffMessage(`Failed to write goal: ${error?.message ?? "Unknown error"}`, "error");
         } finally {
           setKickoffLoading(false);
+        }
+      }
+
+      async function startKickoffLoop() {
+        clearKickoffMessage();
+
+        const sprint = normalizeSprint(kickoffSprintEl.value);
+        if (!sprint) {
+          showKickoffMessage("Sprint must be one of M1, M2, M3, or M4.", "error");
+          kickoffSprintEl.focus();
+          return;
+        }
+
+        kickoffSprintEl.value = sprint;
+        setKickoffLoopLoading(true);
+
+        try {
+          const response = await fetch("/internal/kickoff/start-loop", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ sprint }),
+          });
+
+          const rawResponseBody = await response.text();
+          let payload = {};
+          if (rawResponseBody.trim().length > 0) {
+            try {
+              payload = asObject(JSON.parse(rawResponseBody));
+            } catch {
+              payload = {};
+            }
+          }
+
+          if (!response.ok) {
+            if (response.status === 409 && String(payload.status ?? "") === "ALREADY_RUNNING") {
+              const runningSprint =
+                typeof payload.sprint === "string" && payload.sprint.trim().length > 0 ? payload.sprint.trim() : sprint;
+              const runningPid = Number(payload.pid);
+              const runningPidText = Number.isInteger(runningPid) && runningPid > 0 ? `, PID ${runningPid}` : "";
+              showKickoffMessage(`Kickoff loop is already running (Sprint ${runningSprint}${runningPidText}).`);
+              return;
+            }
+            const fallbackMessage =
+              (typeof payload.error === "string" && payload.error.trim().length > 0
+                ? payload.error.trim()
+                : rawResponseBody.trim()) || `HTTP ${response.status}`;
+            throw new Error(fallbackMessage);
+          }
+
+          const successMessage =
+            typeof payload.message === "string" && payload.message.trim().length > 0
+              ? payload.message.trim()
+              : "Kickoff loop started.";
+          const statusParts = [];
+          if (typeof payload.sprint === "string" && payload.sprint.trim().length > 0) {
+            statusParts.push(`Sprint ${payload.sprint.trim()}`);
+          }
+          const pid = Number(payload.pid);
+          if (Number.isInteger(pid) && pid > 0) {
+            statusParts.push(`PID ${pid}`);
+          }
+          const suffix = statusParts.length > 0 ? ` (${statusParts.join(", ")})` : "";
+          showKickoffMessage(`${successMessage}${suffix}`);
+        } catch (error) {
+          showKickoffMessage(`Failed to start kickoff loop: ${error?.message ?? "Unknown error"}`, "error");
+        } finally {
+          setKickoffLoopLoading(false);
         }
       }
 
@@ -985,6 +1116,7 @@
       settingsBackdropEl.addEventListener("click", () => setSettingsOpen(false));
       settingsFormEl.addEventListener("submit", submitConfig);
       kickoffFormEl.addEventListener("submit", submitKickoff);
+      kickoffStartLoopButtonEl.addEventListener("click", startKickoffLoop);
       window.addEventListener("keydown", (event) => {
         if (event.key === "Escape" && isSettingsOpen) {
           setSettingsOpen(false);
