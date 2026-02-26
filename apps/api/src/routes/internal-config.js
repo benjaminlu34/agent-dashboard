@@ -1,0 +1,294 @@
+import { readFile, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import YAML from "yaml";
+
+const MODULE_DIRNAME = dirname(fileURLToPath(import.meta.url));
+const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../../");
+const AGENT_SWARM_CONFIG_PATH = ".agent-swarm.yml";
+const ENV_FILE_PATH = ".env";
+const DEFAULT_AGENT_SWARM_CONFIG = {
+  version: "1.0",
+  target: {
+    owner: "",
+    repo: "",
+    project_v2_number: null,
+  },
+  auth: {
+    github_token_env: "GITHUB_TOKEN",
+  },
+};
+const ENV_ASSIGNMENT_RE = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/;
+
+function isObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasNonEmptyString(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function toPositiveInteger(value) {
+  if (typeof value === "number" && Number.isInteger(value) && value > 0) {
+    return value;
+  }
+  if (typeof value === "string" && /^[1-9]\d*$/.test(value.trim())) {
+    return Number(value.trim());
+  }
+  return null;
+}
+
+function parseRequiredString(value, fieldName) {
+  if (!hasNonEmptyString(value)) {
+    return { error: `${fieldName} must be a non-empty string` };
+  }
+  return { value: value.trim() };
+}
+
+function parseRequiredPositiveInteger(value, fieldName) {
+  const parsed = toPositiveInteger(value);
+  if (!parsed) {
+    return { error: `${fieldName} must be a positive integer` };
+  }
+  return { value: parsed };
+}
+
+function parseQuotedEnvValue(rawValue) {
+  const trimmed = rawValue.trim();
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return trimmed.slice(1, -1);
+    }
+  }
+  if (trimmed.startsWith("'") && trimmed.endsWith("'")) {
+    return trimmed.slice(1, -1);
+  }
+  const commentIndex = trimmed.search(/\s#/);
+  if (commentIndex >= 0) {
+    return trimmed.slice(0, commentIndex).trim();
+  }
+  return trimmed;
+}
+
+function parseEnvVariables(rawEnvContent) {
+  const variables = new Map();
+  const lines = String(rawEnvContent ?? "").split(/\r?\n/u);
+
+  for (const line of lines) {
+    const match = line.match(ENV_ASSIGNMENT_RE);
+    if (!match) {
+      continue;
+    }
+    const [, key, rawValue] = match;
+    variables.set(key, parseQuotedEnvValue(rawValue));
+  }
+
+  return variables;
+}
+
+function escapeRegExp(source) {
+  return source.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function formatEnvValue(value) {
+  const normalized = String(value ?? "");
+  if (normalized.length === 0) {
+    return '""';
+  }
+  if (/[\s#"'`\\]/.test(normalized)) {
+    return JSON.stringify(normalized);
+  }
+  return normalized;
+}
+
+function upsertEnvVariable(rawEnvContent, key, value) {
+  const normalized = String(rawEnvContent ?? "").replace(/\r\n/g, "\n");
+  const lines = normalized.length > 0 ? normalized.split("\n") : [];
+  if (lines.length > 0 && lines.at(-1) === "") {
+    lines.pop();
+  }
+
+  const keyPattern = new RegExp(`^\\s*(?:export\\s+)?${escapeRegExp(key)}\\s*=`);
+  const nextLine = `${key}=${formatEnvValue(value)}`;
+  let updated = false;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!keyPattern.test(lines[index])) {
+      continue;
+    }
+    lines[index] = nextLine;
+    updated = true;
+    break;
+  }
+
+  if (!updated) {
+    lines.push(nextLine);
+  }
+
+  return lines.length > 0 ? `${lines.join("\n")}\n` : "";
+}
+
+async function readOrCreateFile(filePath, initialContent = "") {
+  try {
+    return await readFile(filePath, "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+    await writeFile(filePath, initialContent, "utf8");
+    return initialContent;
+  }
+}
+
+function parseAgentSwarmConfig(rawConfig) {
+  try {
+    const parsed = YAML.parse(rawConfig) ?? {};
+    return isObject(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizeAgentSwarmConfig(config) {
+  const base = isObject(config) ? { ...config } : {};
+  const target = isObject(base.target) ? { ...base.target } : {};
+  const auth = isObject(base.auth) ? { ...base.auth } : {};
+
+  if (!hasNonEmptyString(auth.github_token_env)) {
+    auth.github_token_env = "GITHUB_TOKEN";
+  }
+
+  return {
+    ...base,
+    target,
+    auth,
+  };
+}
+
+function buildConfigPayload({ config, envVars }) {
+  const targetOwner = hasNonEmptyString(config?.target?.owner) ? config.target.owner.trim() : "";
+  const targetRepo = hasNonEmptyString(config?.target?.repo) ? config.target.repo.trim() : "";
+
+  return {
+    targetOwner,
+    targetRepo,
+    projectNumber: toPositiveInteger(config?.target?.project_v2_number),
+    maxExecutors: toPositiveInteger(envVars.get("RUNNER_MAX_EXECUTORS")),
+    maxReviewers: toPositiveInteger(envVars.get("RUNNER_MAX_REVIEWERS")),
+    hasGithubToken: hasNonEmptyString(envVars.get("GITHUB_TOKEN")),
+  };
+}
+
+function parseConfigBody(body) {
+  if (!isObject(body)) {
+    return { error: "request body must be a JSON object" };
+  }
+
+  const targetOwner = parseRequiredString(body.targetOwner, "targetOwner");
+  if (targetOwner.error) {
+    return targetOwner;
+  }
+
+  const targetRepo = parseRequiredString(body.targetRepo, "targetRepo");
+  if (targetRepo.error) {
+    return targetRepo;
+  }
+
+  const projectNumber = parseRequiredPositiveInteger(body.projectNumber, "projectNumber");
+  if (projectNumber.error) {
+    return projectNumber;
+  }
+
+  const maxExecutors = parseRequiredPositiveInteger(body.maxExecutors, "maxExecutors");
+  if (maxExecutors.error) {
+    return maxExecutors;
+  }
+
+  const maxReviewers = parseRequiredPositiveInteger(body.maxReviewers, "maxReviewers");
+  if (maxReviewers.error) {
+    return maxReviewers;
+  }
+
+  if (body.githubToken !== undefined && typeof body.githubToken !== "string") {
+    return { error: "githubToken must be a string when provided" };
+  }
+
+  return {
+    value: {
+      targetOwner: targetOwner.value,
+      targetRepo: targetRepo.value,
+      projectNumber: projectNumber.value,
+      maxExecutors: maxExecutors.value,
+      maxReviewers: maxReviewers.value,
+      githubToken: hasNonEmptyString(body.githubToken) ? body.githubToken.trim() : "",
+    },
+  };
+}
+
+export function buildInternalConfigGetHandler({ repoRoot = DEFAULT_REPO_ROOT } = {}) {
+  return async function internalConfigGetHandler(_request, _reply) {
+    const configPath = resolve(repoRoot, AGENT_SWARM_CONFIG_PATH);
+    const envPath = resolve(repoRoot, ENV_FILE_PATH);
+
+    const [rawConfig, rawEnv] = await Promise.all([
+      readOrCreateFile(configPath, YAML.stringify(DEFAULT_AGENT_SWARM_CONFIG)),
+      readOrCreateFile(envPath, ""),
+    ]);
+
+    const config = normalizeAgentSwarmConfig(parseAgentSwarmConfig(rawConfig));
+    const envVars = parseEnvVariables(rawEnv);
+
+    return buildConfigPayload({ config, envVars });
+  };
+}
+
+export function buildInternalConfigPostHandler({ repoRoot = DEFAULT_REPO_ROOT } = {}) {
+  return async function internalConfigPostHandler(request, reply) {
+    const parsedBody = parseConfigBody(request?.body);
+    if (parsedBody.error) {
+      reply.code(400);
+      return { error: parsedBody.error };
+    }
+
+    const { targetOwner, targetRepo, projectNumber, maxExecutors, maxReviewers, githubToken } = parsedBody.value;
+    const configPath = resolve(repoRoot, AGENT_SWARM_CONFIG_PATH);
+    const envPath = resolve(repoRoot, ENV_FILE_PATH);
+
+    const [rawConfig, rawEnv] = await Promise.all([
+      readOrCreateFile(configPath, YAML.stringify(DEFAULT_AGENT_SWARM_CONFIG)),
+      readOrCreateFile(envPath, ""),
+    ]);
+
+    const config = normalizeAgentSwarmConfig(parseAgentSwarmConfig(rawConfig));
+    config.version = hasNonEmptyString(config.version) ? config.version.trim() : "1.0";
+    config.target = {
+      ...(isObject(config.target) ? config.target : {}),
+      owner: targetOwner,
+      repo: targetRepo,
+      project_v2_number: projectNumber,
+    };
+    config.auth = {
+      ...(isObject(config.auth) ? config.auth : {}),
+      github_token_env: "GITHUB_TOKEN",
+    };
+
+    let nextEnv = upsertEnvVariable(rawEnv, "RUNNER_MAX_EXECUTORS", String(maxExecutors));
+    nextEnv = upsertEnvVariable(nextEnv, "RUNNER_MAX_REVIEWERS", String(maxReviewers));
+    if (hasNonEmptyString(githubToken)) {
+      nextEnv = upsertEnvVariable(nextEnv, "GITHUB_TOKEN", githubToken);
+    }
+
+    await Promise.all([writeFile(configPath, YAML.stringify(config), "utf8"), writeFile(envPath, nextEnv, "utf8")]);
+
+    const envVars = parseEnvVariables(nextEnv);
+    return buildConfigPayload({ config, envVars });
+  };
+}
+
+export async function registerInternalConfigRoute(fastify, options = {}) {
+  fastify.get("/internal/config", buildInternalConfigGetHandler(options));
+  fastify.post("/internal/config", buildInternalConfigPostHandler(options));
+}
