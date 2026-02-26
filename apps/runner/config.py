@@ -2,9 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+from pathlib import Path
+import re
 from typing import Optional
 
+try:
+    import yaml
+except ModuleNotFoundError:  # pragma: no cover - dependency may be installed at runtime
+    yaml = None  # type: ignore[assignment]
+
 DEFAULT_BACKEND_BASE_URL = "http://localhost:4000"
+DEFAULT_AGENT_SWARM_CONFIG_PATH = ".agent-swarm.yml"
+DEFAULT_LEDGER_PATH = "./.runner-ledger.json"
+DEFAULT_ORCHESTRATOR_STATE_PATH = "./.orchestrator-state.json"
 
 
 @dataclass(frozen=True)
@@ -85,14 +95,69 @@ def _parse_bool(env: dict[str, str], key: str, default: bool = False) -> bool:
     return normalized in ("1", "true", "yes", "y", "on")
 
 
+def _sanitize_state_path_token(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", value.strip())
+
+
+def _read_target_repo_identity_from_agent_swarm(cwd: Path) -> Optional[tuple[str, str]]:
+    if yaml is None:
+        return None
+
+    config_path = cwd / DEFAULT_AGENT_SWARM_CONFIG_PATH
+    try:
+        raw = config_path.read_text(encoding="utf8")
+    except FileNotFoundError:
+        return None
+
+    try:
+        parsed = yaml.safe_load(raw) or {}
+    except Exception:
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+    target = parsed.get("target")
+    if not isinstance(target, dict):
+        return None
+
+    owner = target.get("owner")
+    repo = target.get("repo")
+    if not isinstance(owner, str) or not owner.strip():
+        return None
+    if not isinstance(repo, str) or not repo.strip():
+        return None
+
+    owner_token = _sanitize_state_path_token(owner)
+    repo_token = _sanitize_state_path_token(repo)
+    if not owner_token or not repo_token:
+        return None
+
+    return owner_token, repo_token
+
+
+def _resolve_repo_scoped_state_defaults(cwd: Path) -> tuple[str, str]:
+    identity = _read_target_repo_identity_from_agent_swarm(cwd)
+    if identity is None:
+        return DEFAULT_LEDGER_PATH, DEFAULT_ORCHESTRATOR_STATE_PATH
+
+    owner, repo = identity
+    return (
+        f"./.runner-ledger.{owner}.{repo}.json",
+        f"./.orchestrator-state.{owner}.{repo}.json",
+    )
+
+
 def load_config(
     *,
     env: Optional[dict[str, str]] = None,
     dry_run_flag: bool = False,
     once_flag: bool = False,
     orchestrator_sprint_override: Optional[str] = None,
+    cwd: Optional[str] = None,
 ) -> RunnerConfig:
     resolved_env = dict(os.environ) if env is None else dict(env)
+    resolved_cwd = Path(cwd).resolve() if cwd is not None else Path.cwd()
+    default_ledger_path, default_orchestrator_state_path = _resolve_repo_scoped_state_defaults(resolved_cwd)
 
     backend_base_url = resolved_env.get("BACKEND_BASE_URL", DEFAULT_BACKEND_BASE_URL).strip() or DEFAULT_BACKEND_BASE_URL
     backend_base_url = backend_base_url.rstrip("/")
@@ -117,11 +182,11 @@ def load_config(
     dry_run = dry_run_flag or _parse_bool(resolved_env, "RUNNER_DRY_RUN", False)
     once = once_flag
 
-    ledger_path = resolved_env.get("RUNNER_LEDGER_PATH", "./.runner-ledger.json").strip() or "./.runner-ledger.json"
+    ledger_path = resolved_env.get("RUNNER_LEDGER_PATH", default_ledger_path).strip() or default_ledger_path
     sprint_plan_path = resolved_env.get("RUNNER_SPRINT_PLAN_PATH", "./.runner-sprint-plan.json").strip() or "./.runner-sprint-plan.json"
     autopromote = _parse_bool(resolved_env, "RUNNER_AUTOPROMOTE", True)
     orchestrator_state_path = (
-        resolved_env.get("ORCHESTRATOR_STATE_PATH", "./.orchestrator-state.json").strip() or "./.orchestrator-state.json"
+        resolved_env.get("ORCHESTRATOR_STATE_PATH", default_orchestrator_state_path).strip() or default_orchestrator_state_path
     )
     orchestrator_cmd = resolved_env.get(
         "RUNNER_ORCHESTRATOR_CMD",
