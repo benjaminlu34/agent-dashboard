@@ -52,7 +52,7 @@ pnpm install
 
 2. Configure GitHub auth:
 ```bash
-export GITHUB_PAT="<token>"
+export GITHUB_TOKEN="<token>"
 ```
 
 3. Configure CLI target repo/project identity:
@@ -178,7 +178,7 @@ Optional:
 
 - Run API: `pnpm dev`
 - Run tests: `pnpm test`
-- Run CLI config parser test: `node --test apps/cli/test/*.test.js`
+- Run CLI config parser test: `pnpm test:cli`
 - Run doctor preflight checks: `pnpm doctor`
 - Run orchestrator once: `pnpm orchestrator`
 - Run runner once: `pnpm runner`

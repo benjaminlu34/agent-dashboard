@@ -145,7 +145,7 @@ async function checkToken({ tokenEnvName }) {
   if (!token || token.trim().length === 0) {
     return {
       ok: false,
-      title: `GITHUB token is available in ${tokenEnvName}`,
+      title: `GitHub token is missing in ${tokenEnvName}`,
       remediation: `Run: export ${tokenEnvName}=<your_github_pat_with_repo_and_project_access>`,
     };
   }
@@ -158,7 +158,7 @@ async function checkToken({ tokenEnvName }) {
   if (response.status === 401) {
     return {
       ok: false,
-      title: "GITHUB_TOKEN is valid and authenticated",
+      title: `${tokenEnvName} is invalid or unauthenticated`,
       remediation: `Run: gh auth login --scopes "repo,project" && export ${tokenEnvName}=$(gh auth token)`,
     };
   }
@@ -166,7 +166,7 @@ async function checkToken({ tokenEnvName }) {
   if (!response.ok) {
     return {
       ok: false,
-      title: "GITHUB_TOKEN is valid and authenticated",
+      title: `Failed to verify ${tokenEnvName} authentication (status ${response.status})`,
       remediation: `Run: curl -i -H "Authorization: Bearer $${tokenEnvName}" https://api.github.com/user`,
     };
   }
@@ -180,7 +180,7 @@ async function checkToken({ tokenEnvName }) {
   if (scopes.length === 0) {
     return {
       ok: false,
-      title: "GITHUB_TOKEN has active OAuth scopes",
+      title: `${tokenEnvName} has no active OAuth scopes`,
       remediation:
         `Regenerate token with scopes and export it: gh auth login --scopes "repo,project" && export ${tokenEnvName}=$(gh auth token)`,
     };
@@ -204,7 +204,7 @@ async function checkRepoConnection({ owner, repo, token, tokenEnvName }) {
   if (response.status === 404) {
     return {
       ok: false,
-      title: `Target repo ${owner}/${repo} is reachable`,
+      title: `Target repo ${owner}/${repo} is not reachable (404)`,
       remediation: `Fix ${owner}/${repo} in .agent-swarm.yml and verify with: curl -H "Authorization: Bearer $${tokenEnvName}" https://api.github.com/repos/${owner}/${repo}`,
     };
   }
@@ -212,7 +212,7 @@ async function checkRepoConnection({ owner, repo, token, tokenEnvName }) {
   if (!response.ok) {
     return {
       ok: false,
-      title: `Target repo ${owner}/${repo} is reachable`,
+      title: `Failed to verify repo access for ${owner}/${repo} (status ${response.status})`,
       remediation: `Run: curl -i -H "Authorization: Bearer $${tokenEnvName}" https://api.github.com/repos/${owner}/${repo}`,
     };
   }
@@ -223,7 +223,7 @@ async function checkRepoConnection({ owner, repo, token, tokenEnvName }) {
   if (!hasWrite) {
     return {
       ok: false,
-      title: `Read/write access to ${owner}/${repo}`,
+      title: `Read/write access to ${owner}/${repo} is missing`,
       remediation:
         `Grant this token write access to ${owner}/${repo} (Write/Maintain/Admin), then verify with: ` +
         `curl -H "Authorization: Bearer $${tokenEnvName}" https://api.github.com/repos/${owner}/${repo}`,
@@ -247,7 +247,7 @@ async function checkTemplateExists({ owner, repo, token, tokenEnvName }) {
   if (response.status === 404) {
     return {
       ok: false,
-      title: `Required issue template exists (${REQUIRED_TEMPLATE_PATH})`,
+      title: `Required issue template is missing (${REQUIRED_TEMPLATE_PATH})`,
       remediation: templateRemediation(owner, repo),
     };
   }
@@ -255,7 +255,7 @@ async function checkTemplateExists({ owner, repo, token, tokenEnvName }) {
   if (!response.ok) {
     return {
       ok: false,
-      title: `Required issue template exists (${REQUIRED_TEMPLATE_PATH})`,
+      title: `Failed to verify required issue template (${REQUIRED_TEMPLATE_PATH})`,
       remediation: `Run: curl -i -H "Authorization: Bearer $${tokenEnvName}" https://api.github.com/repos/${owner}/${repo}/contents/${encodedTemplatePath}`,
     };
   }
@@ -312,7 +312,7 @@ export function registerDoctorCommand(program) {
       } else {
         repoCheck = {
           ok: false,
-          title: `Read/write access to ${config.target.owner}/${config.target.repo}`,
+          title: `Read/write access to ${config.target.owner}/${config.target.repo} could not be verified`,
           remediation: `Fix check 1 first, then rerun: export ${config.auth.githubTokenEnv}=<your_github_pat_with_repo_and_project_access>`,
         };
       }
@@ -329,7 +329,7 @@ export function registerDoctorCommand(program) {
       } else {
         templateCheck = {
           ok: false,
-          title: `Required issue template exists (${REQUIRED_TEMPLATE_PATH})`,
+          title: `Required issue template could not be verified (${REQUIRED_TEMPLATE_PATH})`,
           remediation: `Fix checks 1 and 2 first, then rerun: node apps/cli/src/index.js doctor`,
         };
       }
