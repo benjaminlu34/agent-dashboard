@@ -105,6 +105,38 @@ test("GET /internal/config reads target and runner values from .agent-swarm.yml 
   });
 });
 
+test("GET /internal/config parses quoted .env values with inline comments", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-config-quoted-comment-"));
+  await writeFile(
+    join(repoRoot, ".agent-swarm.yml"),
+    ["target:", "  owner: acme", "  repo: swarm", "  project_v2_number: 7"].join("\n"),
+    "utf8",
+  );
+  await writeFile(
+    join(repoRoot, ".env"),
+    [
+      'GITHUB_TOKEN="token value" # local token',
+      'RUNNER_MAX_EXECUTORS="4" # executor cap',
+      "RUNNER_MAX_REVIEWERS='2' # reviewer cap",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const app = buildApp();
+  await registerInternalConfigRoute(app, { repoRoot });
+  const getHandler = app.routes.get("GET /internal/config");
+
+  const result = await getHandler({}, buildReply());
+  assert.deepEqual(result, {
+    targetOwner: "acme",
+    targetRepo: "swarm",
+    projectNumber: 7,
+    maxExecutors: 4,
+    maxReviewers: 2,
+    hasGithubToken: true,
+  });
+});
+
 test("POST /internal/config updates .agent-swarm.yml and upserts .env values", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-config-write-"));
   await writeFile(

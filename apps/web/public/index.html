@@ -690,11 +690,14 @@
             body: JSON.stringify(body),
           });
 
+          const rawResponseBody = await response.text();
           let payload = {};
-          try {
-            payload = asObject(await response.json());
-          } catch {
-            payload = {};
+          if (rawResponseBody.trim().length > 0) {
+            try {
+              payload = asObject(JSON.parse(rawResponseBody));
+            } catch {
+              payload = {};
+            }
           }
 
           if (!response.ok) {
@@ -707,7 +710,11 @@
             const serverMessages = serverErrors
               .map((error) => (typeof error?.message === "string" ? error.message : ""))
               .filter((message) => message.length > 0);
-            const message = serverMessages.length > 0 ? serverMessages.join(" ") : payload.error || `HTTP ${response.status}`;
+            const fallbackMessage =
+              (typeof payload.error === "string" && payload.error.trim().length > 0
+                ? payload.error.trim()
+                : rawResponseBody.trim()) || `HTTP ${response.status}`;
+            const message = serverMessages.length > 0 ? serverMessages.join(" ") : fallbackMessage;
             throw new Error(message);
           }
 

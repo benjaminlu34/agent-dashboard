@@ -110,21 +110,51 @@ function parseRequiredPositiveInteger(value, fieldName) {
 
 function parseQuotedEnvValue(rawValue) {
   const trimmed = rawValue.trim();
-  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
-    try {
-      return JSON.parse(trimmed);
-    } catch {
-      return trimmed.slice(1, -1);
+
+  let withoutInlineComment = trimmed;
+  let quote = "";
+  let escaped = false;
+  for (let index = 0; index < trimmed.length; index += 1) {
+    const char = trimmed[index];
+
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (char === quote) {
+        quote = "";
+      }
+      continue;
+    }
+
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+
+    if (char === "#" && (index === 0 || /\s/u.test(trimmed[index - 1]))) {
+      withoutInlineComment = trimmed.slice(0, index).trim();
+      break;
     }
   }
-  if (trimmed.startsWith("'") && trimmed.endsWith("'")) {
-    return trimmed.slice(1, -1);
+
+  if (withoutInlineComment.startsWith('"') && withoutInlineComment.endsWith('"')) {
+    try {
+      return JSON.parse(withoutInlineComment);
+    } catch {
+      return withoutInlineComment.slice(1, -1);
+    }
   }
-  const commentIndex = trimmed.search(/\s#/);
-  if (commentIndex >= 0) {
-    return trimmed.slice(0, commentIndex).trim();
+  if (withoutInlineComment.startsWith("'") && withoutInlineComment.endsWith("'")) {
+    return withoutInlineComment.slice(1, -1);
   }
-  return trimmed;
+
+  return withoutInlineComment;
 }
 
 function parseEnvVariables(rawEnvContent) {
