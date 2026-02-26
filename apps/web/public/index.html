@@ -257,6 +257,14 @@
       let activityCurrent = 0.12;
       let lastFrameTime = performance.now();
       let isSettingsOpen = false;
+      const settingsFieldByName = {
+        targetOwner: settingsTargetOwnerEl,
+        targetRepo: settingsTargetRepoEl,
+        projectNumber: settingsProjectNumberEl,
+        githubToken: settingsGithubTokenEl,
+        maxExecutors: settingsMaxExecutorsEl,
+        maxReviewers: settingsMaxReviewersEl,
+      };
 
       function asObject(value) {
         return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -570,6 +578,21 @@
         settingsSaveButtonEl.textContent = isLoading ? "Saving..." : "Save Settings";
       }
 
+      function clearSettingsFieldValidation() {
+        for (const field of Object.values(settingsFieldByName)) {
+          field.classList.remove("border-zinc-300", "ring-1", "ring-zinc-300/60");
+          field.classList.add("border-zinc-700");
+        }
+      }
+
+      function markSettingsFieldInvalid(field) {
+        if (!field) {
+          return;
+        }
+        field.classList.remove("border-zinc-700");
+        field.classList.add("border-zinc-300", "ring-1", "ring-zinc-300/60");
+      }
+
       function toPositiveInteger(value) {
         const parsed = Number(value);
         if (!Number.isInteger(parsed) || parsed <= 0) {
@@ -579,6 +602,7 @@
       }
 
       async function loadConfig() {
+        clearSettingsFieldValidation();
         try {
           const response = await fetch("/internal/config", { cache: "no-store" });
           if (!response.ok) {
@@ -607,6 +631,7 @@
       async function submitConfig(event) {
         event.preventDefault();
         clearSettingsMessage();
+        clearSettingsFieldValidation();
 
         const targetOwner = settingsTargetOwnerEl.value.trim();
         const targetRepo = settingsTargetRepoEl.value.trim();
@@ -615,8 +640,32 @@
         const maxReviewers = toPositiveInteger(settingsMaxReviewersEl.value);
         const githubToken = settingsGithubTokenEl.value.trim();
 
-        if (!targetOwner || !targetRepo || !projectNumber || !maxExecutors || !maxReviewers) {
-          showSettingsMessage("All fields except GitHub PAT are required and must be positive numbers where applicable.", "error");
+        const validationErrors = [];
+        if (!targetOwner) {
+          validationErrors.push({ field: "targetOwner", message: "Target Owner is required." });
+        }
+        if (!targetRepo) {
+          validationErrors.push({ field: "targetRepo", message: "Target Repo is required." });
+        }
+        if (!projectNumber) {
+          validationErrors.push({ field: "projectNumber", message: "Project V2 Number must be a positive integer." });
+        }
+        if (!maxExecutors) {
+          validationErrors.push({ field: "maxExecutors", message: "Max Executors must be a positive integer." });
+        }
+        if (!maxReviewers) {
+          validationErrors.push({ field: "maxReviewers", message: "Max Reviewers must be a positive integer." });
+        }
+
+        if (validationErrors.length > 0) {
+          for (const error of validationErrors) {
+            markSettingsFieldInvalid(settingsFieldByName[error.field]);
+          }
+          showSettingsMessage(validationErrors.map((error) => error.message).join(" "), "error");
+          const firstInvalidField = settingsFieldByName[validationErrors[0].field];
+          if (firstInvalidField) {
+            firstInvalidField.focus();
+          }
           return;
         }
 
@@ -649,7 +698,17 @@
           }
 
           if (!response.ok) {
-            throw new Error(payload.error || `HTTP ${response.status}`);
+            const serverErrors = Array.isArray(payload.errors) ? payload.errors : [];
+            for (const error of serverErrors) {
+              if (typeof error?.field === "string") {
+                markSettingsFieldInvalid(settingsFieldByName[error.field]);
+              }
+            }
+            const serverMessages = serverErrors
+              .map((error) => (typeof error?.message === "string" ? error.message : ""))
+              .filter((message) => message.length > 0);
+            const message = serverMessages.length > 0 ? serverMessages.join(" ") : payload.error || `HTTP ${response.status}`;
+            throw new Error(message);
           }
 
           settingsGithubTokenEl.value = "";

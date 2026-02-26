@@ -20,6 +20,60 @@ const DEFAULT_AGENT_SWARM_CONFIG = {
   },
 };
 const ENV_ASSIGNMENT_RE = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/;
+const REPO_CONFIG_MUTEXES = new Map();
+
+class AsyncMutex {
+  #locked = false;
+  #waiters = [];
+
+  async lock() {
+    return new Promise((resolve) => {
+      if (!this.#locked) {
+        this.#locked = true;
+        resolve(() => this.#unlock());
+        return;
+      }
+      this.#waiters.push(resolve);
+    });
+  }
+
+  #unlock() {
+    const next = this.#waiters.shift();
+    if (next) {
+      next(() => this.#unlock());
+      return;
+    }
+    this.#locked = false;
+  }
+
+  isIdle() {
+    return !this.#locked && this.#waiters.length === 0;
+  }
+}
+
+function getRepoConfigMutex(repoRoot) {
+  const key = resolve(repoRoot);
+  const existing = REPO_CONFIG_MUTEXES.get(key);
+  if (existing) {
+    return { key, mutex: existing };
+  }
+  const created = new AsyncMutex();
+  REPO_CONFIG_MUTEXES.set(key, created);
+  return { key, mutex: created };
+}
+
+async function withRepoConfigWriteLock(repoRoot, fn) {
+  const { key, mutex } = getRepoConfigMutex(repoRoot);
+  const unlock = await mutex.lock();
+  try {
+    return await fn();
+  } finally {
+    unlock();
+    if (mutex.isIdle()) {
+      REPO_CONFIG_MUTEXES.delete(key);
+    }
+  }
+}
 
 function isObject(value) {
   return value && typeof value === "object" && !Array.isArray(value);
@@ -89,10 +143,6 @@ function parseEnvVariables(rawEnvContent) {
   return variables;
 }
 
-function escapeRegExp(source) {
-  return source.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function formatEnvValue(value) {
   const normalized = String(value ?? "");
   if (normalized.length === 0) {
@@ -111,12 +161,12 @@ function upsertEnvVariable(rawEnvContent, key, value) {
     lines.pop();
   }
 
-  const keyPattern = new RegExp(`^\\s*(?:export\\s+)?${escapeRegExp(key)}\\s*=`);
   const nextLine = `${key}=${formatEnvValue(value)}`;
   let updated = false;
 
   for (let index = 0; index < lines.length; index += 1) {
-    if (!keyPattern.test(lines[index])) {
+    const match = lines[index].match(ENV_ASSIGNMENT_RE);
+    if (!match || match[1] !== key) {
       continue;
     }
     lines[index] = nextLine;
@@ -187,33 +237,38 @@ function parseConfigBody(body) {
     return { error: "request body must be a JSON object" };
   }
 
+  const errors = [];
   const targetOwner = parseRequiredString(body.targetOwner, "targetOwner");
-  if (targetOwner.error) {
-    return targetOwner;
-  }
-
   const targetRepo = parseRequiredString(body.targetRepo, "targetRepo");
-  if (targetRepo.error) {
-    return targetRepo;
-  }
-
   const projectNumber = parseRequiredPositiveInteger(body.projectNumber, "projectNumber");
-  if (projectNumber.error) {
-    return projectNumber;
-  }
-
   const maxExecutors = parseRequiredPositiveInteger(body.maxExecutors, "maxExecutors");
-  if (maxExecutors.error) {
-    return maxExecutors;
-  }
-
   const maxReviewers = parseRequiredPositiveInteger(body.maxReviewers, "maxReviewers");
+
+  if (targetOwner.error) {
+    errors.push({ field: "targetOwner", message: targetOwner.error });
+  }
+  if (targetRepo.error) {
+    errors.push({ field: "targetRepo", message: targetRepo.error });
+  }
+  if (projectNumber.error) {
+    errors.push({ field: "projectNumber", message: projectNumber.error });
+  }
+  if (maxExecutors.error) {
+    errors.push({ field: "maxExecutors", message: maxExecutors.error });
+  }
   if (maxReviewers.error) {
-    return maxReviewers;
+    errors.push({ field: "maxReviewers", message: maxReviewers.error });
   }
 
   if (body.githubToken !== undefined && typeof body.githubToken !== "string") {
-    return { error: "githubToken must be a string when provided" };
+    errors.push({ field: "githubToken", message: "githubToken must be a string when provided" });
+  }
+
+  if (errors.length > 0) {
+    return {
+      error: errors[0].message,
+      errors,
+    };
   }
 
   return {
@@ -250,41 +305,46 @@ export function buildInternalConfigPostHandler({ repoRoot = DEFAULT_REPO_ROOT } 
     const parsedBody = parseConfigBody(request?.body);
     if (parsedBody.error) {
       reply.code(400);
-      return { error: parsedBody.error };
+      return {
+        error: parsedBody.error,
+        errors: Array.isArray(parsedBody.errors) ? parsedBody.errors : undefined,
+      };
     }
 
-    const { targetOwner, targetRepo, projectNumber, maxExecutors, maxReviewers, githubToken } = parsedBody.value;
-    const configPath = resolve(repoRoot, AGENT_SWARM_CONFIG_PATH);
-    const envPath = resolve(repoRoot, ENV_FILE_PATH);
+    return withRepoConfigWriteLock(repoRoot, async () => {
+      const { targetOwner, targetRepo, projectNumber, maxExecutors, maxReviewers, githubToken } = parsedBody.value;
+      const configPath = resolve(repoRoot, AGENT_SWARM_CONFIG_PATH);
+      const envPath = resolve(repoRoot, ENV_FILE_PATH);
 
-    const [rawConfig, rawEnv] = await Promise.all([
-      readOrCreateFile(configPath, YAML.stringify(DEFAULT_AGENT_SWARM_CONFIG)),
-      readOrCreateFile(envPath, ""),
-    ]);
+      const [rawConfig, rawEnv] = await Promise.all([
+        readOrCreateFile(configPath, YAML.stringify(DEFAULT_AGENT_SWARM_CONFIG)),
+        readOrCreateFile(envPath, ""),
+      ]);
 
-    const config = normalizeAgentSwarmConfig(parseAgentSwarmConfig(rawConfig));
-    config.version = hasNonEmptyString(config.version) ? config.version.trim() : "1.0";
-    config.target = {
-      ...(isObject(config.target) ? config.target : {}),
-      owner: targetOwner,
-      repo: targetRepo,
-      project_v2_number: projectNumber,
-    };
-    config.auth = {
-      ...(isObject(config.auth) ? config.auth : {}),
-      github_token_env: "GITHUB_TOKEN",
-    };
+      const config = normalizeAgentSwarmConfig(parseAgentSwarmConfig(rawConfig));
+      config.version = hasNonEmptyString(config.version) ? config.version.trim() : "1.0";
+      config.target = {
+        ...(isObject(config.target) ? config.target : {}),
+        owner: targetOwner,
+        repo: targetRepo,
+        project_v2_number: projectNumber,
+      };
+      config.auth = {
+        ...(isObject(config.auth) ? config.auth : {}),
+        github_token_env: "GITHUB_TOKEN",
+      };
 
-    let nextEnv = upsertEnvVariable(rawEnv, "RUNNER_MAX_EXECUTORS", String(maxExecutors));
-    nextEnv = upsertEnvVariable(nextEnv, "RUNNER_MAX_REVIEWERS", String(maxReviewers));
-    if (hasNonEmptyString(githubToken)) {
-      nextEnv = upsertEnvVariable(nextEnv, "GITHUB_TOKEN", githubToken);
-    }
+      let nextEnv = upsertEnvVariable(rawEnv, "RUNNER_MAX_EXECUTORS", String(maxExecutors));
+      nextEnv = upsertEnvVariable(nextEnv, "RUNNER_MAX_REVIEWERS", String(maxReviewers));
+      if (hasNonEmptyString(githubToken)) {
+        nextEnv = upsertEnvVariable(nextEnv, "GITHUB_TOKEN", githubToken);
+      }
 
-    await Promise.all([writeFile(configPath, YAML.stringify(config), "utf8"), writeFile(envPath, nextEnv, "utf8")]);
+      await Promise.all([writeFile(configPath, YAML.stringify(config), "utf8"), writeFile(envPath, nextEnv, "utf8")]);
 
-    const envVars = parseEnvVariables(nextEnv);
-    return buildConfigPayload({ config, envVars });
+      const envVars = parseEnvVariables(nextEnv);
+      return buildConfigPayload({ config, envVars });
+    });
   };
 }
 

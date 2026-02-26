@@ -197,3 +197,33 @@ test("POST /internal/config keeps existing token when githubToken is omitted", a
   const updatedEnv = await readFile(join(repoRoot, ".env"), "utf8");
   assert.match(updatedEnv, /^GITHUB_TOKEN=already-set$/m);
 });
+
+test("POST /internal/config returns aggregated validation errors", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-config-validate-"));
+  const app = buildApp();
+  await registerInternalConfigRoute(app, { repoRoot });
+  const postHandler = app.routes.get("POST /internal/config");
+
+  const reply = buildReply();
+  const result = await postHandler(
+    {
+      body: {
+        targetOwner: "",
+        targetRepo: "",
+        projectNumber: 0,
+        maxExecutors: "nope",
+        maxReviewers: null,
+        githubToken: 42,
+      },
+    },
+    reply,
+  );
+
+  assert.equal(reply.statusCode, 400);
+  assert.equal(typeof result.error, "string");
+  assert.equal(Array.isArray(result.errors), true);
+  assert.deepEqual(
+    result.errors.map((entry) => entry.field),
+    ["targetOwner", "targetRepo", "projectNumber", "maxExecutors", "maxReviewers", "githubToken"],
+  );
+});
