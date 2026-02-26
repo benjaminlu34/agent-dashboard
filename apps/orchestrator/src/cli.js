@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import YAML from "yaml";
 
 import { loadAgentContextBundle } from "../../api/src/internal/agent-context-loader.js";
 import { createGitHubPlanApplyClient } from "../../api/src/internal/github-plan-apply-client.js";
@@ -17,7 +18,8 @@ const DEFAULT_STALL_MINUTES = 120;
 const DEFAULT_REVIEW_CHURN_POLLS = 3;
 const DEFAULT_REVIEWER_RETRY_POLLS = 20;
 const DEFAULT_MAX_REVIEWER_DISPATCHES_PER_STATUS = 2;
-const DEFAULT_STATE_PATH = ".orchestrator-state.json";
+const DEFAULT_STATE_PATH = "./.orchestrator-state.json";
+const AGENT_SWARM_CONFIG_PATH = ".agent-swarm.yml";
 
 function emptyOrchestratorState() {
   return {
@@ -30,6 +32,50 @@ function emptyOrchestratorState() {
 
 function hasNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function sanitizeStatePathToken(value) {
+  return String(value).trim().replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+function buildScopedStatePath(owner, repo) {
+  if (!hasNonEmptyString(owner) || !hasNonEmptyString(repo)) {
+    return DEFAULT_STATE_PATH;
+  }
+  const ownerToken = sanitizeStatePathToken(owner);
+  const repoToken = sanitizeStatePathToken(repo);
+  return `./.orchestrator-state.${ownerToken}.${repoToken}.json`;
+}
+
+async function resolveDefaultStatePath({ cwd = process.cwd() } = {}) {
+  const configPath = resolve(cwd, AGENT_SWARM_CONFIG_PATH);
+  let rawConfig;
+  try {
+    rawConfig = await readFile(configPath, "utf8");
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return DEFAULT_STATE_PATH;
+    }
+    throw error;
+  }
+
+  let parsed;
+  try {
+    parsed = YAML.parse(rawConfig) ?? {};
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    process.stderr.write(
+      `Warning: Failed to parse ${AGENT_SWARM_CONFIG_PATH}: ${detail}. Falling back to default state path.\n`,
+    );
+    return DEFAULT_STATE_PATH;
+  }
+
+  const target = parsed?.target;
+  if (!target || typeof target !== "object") {
+    return DEFAULT_STATE_PATH;
+  }
+
+  return buildScopedStatePath(target.owner, target.repo);
 }
 
 function withErrorCode(error, code) {
@@ -511,7 +557,9 @@ export async function runOrchestratorCli({
   const stallMinutes = parsePositiveIntEnv("ORCHESTRATOR_STALL_MINUTES", DEFAULT_STALL_MINUTES, env);
   const reviewChurnPolls = parsePositiveIntEnv("ORCHESTRATOR_REVIEW_CHURN_POLLS", DEFAULT_REVIEW_CHURN_POLLS, env);
   const sprint = resolveSprint(env);
-  const statePath = resolve(process.cwd(), env.ORCHESTRATOR_STATE_PATH || DEFAULT_STATE_PATH);
+  const defaultStatePath = await resolveDefaultStatePath({ cwd: process.cwd() });
+  const rawStatePath = hasNonEmptyString(env.ORCHESTRATOR_STATE_PATH) ? env.ORCHESTRATOR_STATE_PATH.trim() : defaultStatePath;
+  const statePath = resolve(process.cwd(), rawStatePath);
 
   do {
     const currentState = await readStateFile(statePath);
