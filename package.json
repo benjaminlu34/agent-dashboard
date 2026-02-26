@@ -9,10 +9,13 @@
     "dev": "node apps/api/src/index.js",
     "test": "node --test apps/api/test/*.test.js",
     "orchestrator": "node apps/orchestrator/src/cli.js --once",
+    "doctor": "node apps/cli/src/index.js doctor",
     "runner": "python3 -m apps.runner --once",
     "runner:dry": "python3 -m apps.runner --dry-run --once"
   },
   "dependencies": {
-    "fastify": "^4.26.0"
+    "commander": "^12.1.0",
+    "fastify": "^4.26.0",
+    "yaml": "^2.5.1"
   }
 }

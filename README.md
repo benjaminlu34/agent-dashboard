@@ -55,7 +55,20 @@ pnpm install
 export GITHUB_PAT="<token>"
 ```
 
-3. Configure target repo/project identity (recommended explicit mode):
+3. Configure CLI target repo/project identity:
+```bash
+cat > .agent-swarm.yml <<'YAML'
+version: "1.0"
+target:
+  owner: "<owner>"
+  repo: "<repo>"
+  project_v2_number: 1
+auth:
+  github_token_env: "GITHUB_TOKEN"
+YAML
+```
+
+4. Configure target repo/project identity for API+orchestrator (recommended explicit mode):
 ```bash
 export TARGET_OWNER_LOGIN="<owner>"
 export TARGET_OWNER_TYPE="user"   # or org
@@ -65,33 +78,39 @@ export TARGET_TEMPLATE_PATH=".github/ISSUE_TEMPLATE/milestone-task.yml"  # optio
 export TARGET_REF="HEAD"                                                # optional
 ```
 
-4. Start internal API:
+5. Start internal API:
 ```bash
 pnpm dev
 ```
 
-5. Run preflight manually:
+6. Run preflight manually:
 ```bash
 curl "http://localhost:4000/internal/preflight?role=ORCHESTRATOR"
 ```
 
-6. Run orchestrator once:
+7. Run CLI doctor preflight checks:
+```bash
+export GITHUB_TOKEN="<token>"
+pnpm doctor
+```
+
+8. Run orchestrator once:
 ```bash
 export ORCHESTRATOR_SPRINT="M1"
 pnpm orchestrator
 ```
 
-7. Run orchestrator loop mode:
+9. Run orchestrator loop mode:
 ```bash
 node apps/orchestrator/src/cli.js --loop
 ```
 
-8. Run runner once (executes orchestrator intents and workers):
+10. Run runner once (executes orchestrator intents and workers):
 ```bash
 pnpm runner
 ```
 
-9. Dry-run runner (no backend write endpoints, no worker execution):
+11. Dry-run runner (no backend write endpoints, no worker execution):
 ```bash
 pnpm runner:dry
 ```
@@ -159,6 +178,8 @@ Optional:
 
 - Run API: `pnpm dev`
 - Run tests: `pnpm test`
+- Run CLI config parser test: `node --test apps/cli/test/*.test.js`
+- Run doctor preflight checks: `pnpm doctor`
 - Run orchestrator once: `pnpm orchestrator`
 - Run runner once: `pnpm runner`
 - Run runner dry-run: `pnpm runner:dry`
