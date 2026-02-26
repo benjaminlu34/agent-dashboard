@@ -1917,6 +1917,53 @@ def _log_stderr(obj: Dict[str, Any]) -> None:
     sys.stderr.flush()
 
 
+_TRANSCRIPT_EVENT_QUEUE_MAX = 1024
+_transcript_event_queue: "queue.Queue[Tuple[Any, Dict[str, str]]]" = queue.Queue(maxsize=_TRANSCRIPT_EVENT_QUEUE_MAX)
+_transcript_sender_started = False
+_transcript_sender_lock = threading.Lock()
+
+
+def _post_live_transcript_event(*, backend: Any, body: Dict[str, str]) -> None:
+    try:
+        if isinstance(backend, BackendClient):
+            timeout_s = max(0.75, min(backend.timeout_s, 2.0))
+            backend.post_json("/internal/logs/events", body=body, timeout_s=timeout_s)
+            return
+        post_json = getattr(backend, "post_json", None)
+        if callable(post_json):
+            post_json("/internal/logs/events", body=body)
+    except Exception:
+        # Live transcript streaming must never interrupt orchestrator/runner execution.
+        pass
+
+
+def _transcript_sender_worker() -> None:
+    while True:
+        try:
+            backend, body = _transcript_event_queue.get()
+        except Exception:
+            continue
+        try:
+            _post_live_transcript_event(backend=backend, body=body)
+        finally:
+            try:
+                _transcript_event_queue.task_done()
+            except Exception:
+                pass
+
+
+def _ensure_transcript_sender_started() -> None:
+    global _transcript_sender_started
+    if _transcript_sender_started:
+        return
+    with _transcript_sender_lock:
+        if _transcript_sender_started:
+            return
+        thread = threading.Thread(target=_transcript_sender_worker, daemon=True, name="transcript-sender")
+        thread.start()
+        _transcript_sender_started = True
+
+
 def _emit_live_transcript_event(
     *,
     backend: Any,
@@ -1932,8 +1979,7 @@ def _emit_live_transcript_event(
     if not normalized_run_id or not normalized_role or not normalized_section or not normalized_content:
         return
 
-    post_json = getattr(backend, "post_json", None)
-    if not callable(post_json):
+    if not callable(getattr(backend, "post_json", None)):
         return
 
     body = {
@@ -1944,11 +1990,19 @@ def _emit_live_transcript_event(
     }
 
     try:
-        if isinstance(backend, BackendClient):
-            timeout_s = max(0.75, min(backend.timeout_s, 2.0))
-            backend.post_json("/internal/logs/events", body=body, timeout_s=timeout_s)
-            return
-        post_json("/internal/logs/events", body=body)
+        _ensure_transcript_sender_started()
+        _transcript_event_queue.put_nowait((backend, body))
+    except queue.Full:
+        # Prefer newer transcript chunks over stale backlog to keep UI current.
+        try:
+            _transcript_event_queue.get_nowait()
+            _transcript_event_queue.task_done()
+        except Exception:
+            pass
+        try:
+            _transcript_event_queue.put_nowait((backend, body))
+        except Exception:
+            pass
     except Exception:
         # Live transcript streaming must never interrupt orchestrator/runner execution.
         pass

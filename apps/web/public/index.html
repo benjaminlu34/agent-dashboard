@@ -348,6 +348,7 @@
       const POLL_INTERVAL_MS = 15000;
       const TERMINAL_STREAM_RECONNECT_MS = 1500;
       const TERMINAL_RECENT_WINDOW_MS = 20 * 60 * 1000;
+      const TERMINAL_LOG_CACHE_MAX_CHARS = 120000;
       const orchestratorItemsEl = document.getElementById("orchestrator-items");
       const orchestratorSummaryEl = document.getElementById("orchestrator-summary");
       const orchestratorSprintEl = document.getElementById("orchestrator-sprint");
@@ -846,13 +847,21 @@
         terminalStreamRunId = "";
       }
 
+      function capTerminalLogs(logs) {
+        const value = typeof logs === "string" ? logs : "";
+        if (value.length <= TERMINAL_LOG_CACHE_MAX_CHARS) {
+          return value;
+        }
+        return value.slice(value.length - TERMINAL_LOG_CACHE_MAX_CHARS);
+      }
+
       async function loadTerminalSnapshot(runId, sessionId) {
         const response = await fetch(`/internal/logs/${encodeURIComponent(runId)}`, { cache: "no-store" });
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
         }
         const payload = asObject(await response.json());
-        const logs = typeof payload.logs === "string" ? payload.logs : "";
+        const logs = capTerminalLogs(typeof payload.logs === "string" ? payload.logs : "");
         const seq = Number.isInteger(payload.seq) && payload.seq > 0 ? payload.seq : 0;
         terminalLogCache.set(runId, logs);
         terminalLogSeqByRun.set(runId, seq);
@@ -901,7 +910,7 @@
             return;
           }
           const previous = terminalLogCache.get(runId) ?? "";
-          const nextLogs = `${previous}${chunk}`;
+          const nextLogs = capTerminalLogs(`${previous}${chunk}`);
           terminalLogCache.set(runId, nextLogs);
           if (seq > 0) {
             terminalLogSeqByRun.set(runId, seq);
