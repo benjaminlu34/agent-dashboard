@@ -32,7 +32,7 @@ test("POST /internal/kickoff returns 400 when goal is missing", async () => {
   const app = buildApp();
   await registerInternalKickoffRoute(app, {
     repoRoot,
-    preflightHandler: async () => ({ status: "PASS" }),
+    preflightCheck: async () => ({ statusCode: 200, payload: { status: "PASS" } }),
   });
 
   const reply = buildReply();
@@ -48,10 +48,13 @@ test("POST /internal/kickoff returns 409 when preflight fails", async () => {
   const app = buildApp();
   await registerInternalKickoffRoute(app, {
     repoRoot,
-    preflightHandler: async () => ({
-      role: "ORCHESTRATOR",
-      status: "FAIL",
-      errors: [{ source: "template", message: "template missing" }],
+    preflightCheck: async () => ({
+      statusCode: 200,
+      payload: {
+        role: "ORCHESTRATOR",
+        status: "FAIL",
+        errors: [{ source: "template", message: "template missing" }],
+      },
     }),
   });
 
@@ -69,9 +72,12 @@ test("POST /internal/kickoff writes goal.txt and returns success", async () => {
   let requestedRole = "";
   await registerInternalKickoffRoute(app, {
     repoRoot,
-    preflightHandler: async (request) => {
-      requestedRole = String(request?.query?.role ?? "");
-      return { role: "ORCHESTRATOR", status: "PASS", errors: [] };
+    preflightCheck: async ({ role }) => {
+      requestedRole = String(role ?? "");
+      return {
+        statusCode: 200,
+        payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] },
+      };
     },
   });
 

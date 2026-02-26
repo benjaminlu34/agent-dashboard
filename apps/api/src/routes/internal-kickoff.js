@@ -2,25 +2,21 @@ import { writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { buildPreflightHandler } from "./internal-preflight.js";
+import { runPreflightCheck } from "./internal-preflight.js";
 
 const MODULE_DIRNAME = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../../");
 const GOAL_FILE_PATH = "goal.txt";
 const KICKOFF_ROLE = "ORCHESTRATOR";
 
-function createReplyRecorder() {
-  return {
-    statusCode: 200,
-    code(nextStatusCode) {
-      this.statusCode = nextStatusCode;
-      return this;
-    },
-  };
-}
-
-export function buildInternalKickoffHandler({ repoRoot = DEFAULT_REPO_ROOT, preflightHandler } = {}) {
-  const resolvedPreflightHandler = preflightHandler ?? buildPreflightHandler({ repoRoot });
+export function buildInternalKickoffHandler({ repoRoot = DEFAULT_REPO_ROOT, preflightCheck } = {}) {
+  const resolvedPreflightCheck =
+    preflightCheck ??
+    (async ({ role }) =>
+      runPreflightCheck({
+        role,
+        repoRoot,
+      }));
 
   return async function internalKickoffHandler(request, reply) {
     const goal = request?.body?.goal;
@@ -29,11 +25,12 @@ export function buildInternalKickoffHandler({ repoRoot = DEFAULT_REPO_ROOT, pref
       return { error: "body.goal must be a non-empty string" };
     }
 
-    const preflightReply = createReplyRecorder();
-    const preflightResult = await resolvedPreflightHandler({ query: { role: KICKOFF_ROLE } }, preflightReply);
+    const { statusCode: preflightStatusCode, payload: preflightResult } = await resolvedPreflightCheck({
+      role: KICKOFF_ROLE,
+    });
 
-    if (preflightReply.statusCode !== 200) {
-      reply.code(preflightReply.statusCode);
+    if (preflightStatusCode !== 200) {
+      reply.code(preflightStatusCode);
       return preflightResult;
     }
 
