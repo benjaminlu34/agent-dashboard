@@ -14,8 +14,8 @@ function validateIdentifier(value, fieldName) {
   if (trimmed.length === 0) {
     return `${fieldName} is required.`;
   }
-  if (/\s/.test(trimmed)) {
-    return `${fieldName} cannot contain spaces.`;
+  if (!/^[a-zA-Z0-9.-]+$/.test(trimmed)) {
+    return `${fieldName} contains invalid characters. Only alphanumeric, hyphens, and periods are allowed.`;
   }
   return true;
 }
