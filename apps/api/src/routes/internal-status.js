@@ -84,7 +84,15 @@ function resolveStatePaths({ repoRoot, env, targetIdentity }) {
 async function readJsonObjectOrEmpty(filePath) {
   try {
     const raw = await readFile(filePath, "utf8");
-    const parsed = JSON.parse(raw);
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        return {};
+      }
+      throw error;
+    }
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       return {};
     }

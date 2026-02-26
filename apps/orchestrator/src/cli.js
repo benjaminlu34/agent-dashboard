@@ -551,22 +551,23 @@ export async function runOrchestratorCli({
   env = process.env,
 } = {}) {
   const { runMode } = parseArgs(argv);
+  const resolvedRepoRoot = resolve(repoRoot);
   const maxExecutors = parsePositiveIntEnv("ORCHESTRATOR_MAX_EXECUTORS", DEFAULT_MAX_EXECUTORS, env);
   const maxReviewers = parsePositiveIntEnv("ORCHESTRATOR_MAX_REVIEWERS", DEFAULT_MAX_REVIEWERS, env);
   const pollIntervalMs = parsePositiveIntEnv("ORCHESTRATOR_POLL_INTERVAL_MS", DEFAULT_POLL_INTERVAL_MS, env);
   const stallMinutes = parsePositiveIntEnv("ORCHESTRATOR_STALL_MINUTES", DEFAULT_STALL_MINUTES, env);
   const reviewChurnPolls = parsePositiveIntEnv("ORCHESTRATOR_REVIEW_CHURN_POLLS", DEFAULT_REVIEW_CHURN_POLLS, env);
   const sprint = resolveSprint(env);
-  const defaultStatePath = await resolveDefaultStatePath({ cwd: process.cwd() });
+  const defaultStatePath = await resolveDefaultStatePath({ cwd: resolvedRepoRoot });
   const rawStatePath = hasNonEmptyString(env.ORCHESTRATOR_STATE_PATH) ? env.ORCHESTRATOR_STATE_PATH.trim() : defaultStatePath;
-  const statePath = resolve(process.cwd(), rawStatePath);
+  const statePath = resolve(resolvedRepoRoot, rawStatePath);
 
   do {
     const currentState = await readStateFile(statePath);
     let cycleResult;
     try {
       cycleResult = await runCycle({
-        repoRoot,
+        repoRoot: resolvedRepoRoot,
         backendBaseUrl,
         maxExecutors,
         maxReviewers,

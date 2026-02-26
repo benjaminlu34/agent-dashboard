@@ -53,7 +53,30 @@ This guide covers the fastest setup path using the local dashboard.
 
    If the template is missing, `pnpm doctor` prints exact remediation commands you can run.
 
-6. **Dry run the runner**
+6. **Initialize sprint goal in the dashboard**
+
+   - In the dashboard, use the **Initialize Sprint** section.
+   - Enter your high-level sprint objective in the textarea.
+   - Click **Write Goal & Kickoff**.
+   - Wait for success message: `Goal Received`.
+
+   This writes the goal text to `goal.txt` in the repository root.
+
+   API equivalent:
+
+   ```bash
+   curl -X POST http://localhost:4000/internal/kickoff \
+     -H "content-type: application/json" \
+     -d '{"goal":"Ship sprint kickoff flow with safe validation and visibility."}'
+   ```
+
+   Expected success payload:
+
+   ```json
+   { "status": "success", "message": "Goal Received." }
+   ```
+
+7. **Dry run the runner**
 
    ```bash
    pnpm runner:dry
@@ -61,11 +84,17 @@ This guide covers the fastest setup path using the local dashboard.
 
    This executes a safe run without modifying the target repository.
 
-7. **Monitor execution**
+8. **Monitor execution**
 
    Keep the dashboard open at `http://localhost:4000` to watch the live queue and execution states.
 
 ## Troubleshooting
+
+- **Kickoff write fails with validation error**
+  Ensure the `goal` is a non-empty string.
+
+- **Kickoff write fails with 409**
+  Run `pnpm doctor` and resolve preflight failures before retrying kickoff.
 
 - **Doctor fails on template check**
   Follow the remediation script printed by `pnpm doctor` (the `gh repo clone ...` flow) and rerun `pnpm doctor`.
