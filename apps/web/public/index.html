@@ -480,6 +480,7 @@
           .map(([projectItemId, value]) => ({
             projectItemId,
             issueNumber: Number(value?.last_seen_issue_number ?? 0),
+            issueTitle: typeof value?.last_seen_issue_title === "string" ? value.last_seen_issue_title.trim() : "",
             status: String(value?.last_seen_status ?? "Unknown"),
             lastSeenAt: value?.last_seen_at ?? "",
             statusSinceAt: value?.status_since_at ?? "",
@@ -526,8 +527,12 @@
               <article class="rounded-xl border border-zinc-800 bg-black p-4 shadow-md shadow-white/5 transition hover:-translate-y-0.5 hover:shadow-lg hover:shadow-white/10">
                 <div class="flex flex-wrap items-start justify-between gap-3">
                   <div>
-                    <p class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Project Item</p>
-                    <h3 class="mt-1 text-base font-semibold text-white">${entry.issueNumber > 0 ? `#${entry.issueNumber}` : "Unnumbered Issue"} · ${escapeHtml(entry.projectItemId)}</h3>
+                    <p class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Issue</p>
+                    <h3 class="mt-1 text-base font-semibold text-white">${
+                      entry.issueNumber > 0 ? `#${entry.issueNumber}` : "Unnumbered Issue"
+                    }${
+                      entry.issueTitle ? ` · ${escapeHtml(entry.issueTitle)}` : ""
+                    }</h3>
                   </div>
                   <span class="inline-flex rounded-full px-3 py-1 text-xs font-semibold ${statusBadgeClasses(entry.status)}">${escapeHtml(entry.status)}</span>
                 </div>

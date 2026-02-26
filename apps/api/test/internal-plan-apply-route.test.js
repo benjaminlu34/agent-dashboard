@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -460,4 +460,156 @@ test("POST /internal/plan-apply preserves bracket-prefixed titles and passes lab
   assert.equal(createdIssues[0].title, "[SPRINT GOAL] M1: Ship kickoff");
   assert.deepEqual(createdIssues[0].labels, ["meta:sprint-goal"]);
   assert.equal(createdIssues[1].title, "[TASK] Implement kickoff validator");
+});
+
+test("POST /internal/plan-apply writes orchestrator state to repo-scoped path by default", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-plan-apply-state-scoped-"));
+  await writeBundleFiles(repoRoot);
+
+  const scopedPath = join(repoRoot, ".orchestrator-state.benjaminlu34.agent-dashboard.json");
+  const defaultPath = join(repoRoot, ".orchestrator-state.json");
+  await writeFile(
+    scopedPath,
+    JSON.stringify(
+      {
+        poll_count: 9,
+        items: {
+          existing: { last_seen_status: "Backlog" },
+        },
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+
+  let issueCounter = 0;
+  const githubClientFactory = async () => ({
+    async createIssue() {
+      issueCounter += 1;
+      return {
+        issue_number: 700 + issueCounter,
+        issue_url: `https://github.com/benjaminlu34/agent-dashboard/issues/${700 + issueCounter}`,
+        issue_node_id: `I_kw_test_${700 + issueCounter}`,
+      };
+    },
+    async addIssueToProject() {
+      return { project_item_id: `PVTI_test_${issueCounter}` };
+    },
+    async setProjectFields() {},
+    async updateIssue() {},
+  });
+
+  const app = buildApp();
+  await registerInternalPlanApplyRoute(app, {
+    repoRoot,
+    env: {},
+    preflightHandler: buildPreflightPass(),
+    githubClientFactory,
+  });
+
+  const reply = buildReply();
+  const result = await app.handler(
+    {
+      body: {
+        role: "ORCHESTRATOR",
+        draft: {
+          sprint: "M1",
+          issues: [
+            {
+              title: "Scoped state write test",
+              goal: "Ensure plan metadata writes to scoped state file.",
+              non_goals: ["No external integrations"],
+              acceptance_criteria: ["Plan apply completes successfully."],
+              files_likely_touched: ["apps/api/src/routes/internal-plan-apply.js"],
+              definition_of_done: ["State file includes sprint_plan metadata."],
+              size: "S",
+              area: "api",
+              priority: "P1",
+            },
+          ],
+        },
+      },
+    },
+    reply,
+  );
+
+  assert.equal(reply.statusCode, 200);
+  assert.equal(result.status, "APPLIED");
+  const scopedState = JSON.parse(await readFile(scopedPath, "utf8"));
+  assert.equal(scopedState.poll_count, 9);
+  assert.deepEqual(scopedState.items, {
+    existing: { last_seen_status: "Backlog" },
+  });
+  assert.equal(typeof scopedState.sprint_plan, "object");
+  assert.equal(Object.keys(scopedState.sprint_plan).length, 1);
+  await assert.rejects(readFile(defaultPath, "utf8"), /ENOENT/);
+});
+
+test("POST /internal/plan-apply respects ORCHESTRATOR_STATE_PATH override", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-plan-apply-state-override-"));
+  await writeBundleFiles(repoRoot);
+
+  const customPath = join(repoRoot, "tmp", "custom-orchestrator.json");
+  const scopedPath = join(repoRoot, ".orchestrator-state.benjaminlu34.agent-dashboard.json");
+
+  let issueCounter = 0;
+  const githubClientFactory = async () => ({
+    async createIssue() {
+      issueCounter += 1;
+      return {
+        issue_number: 800 + issueCounter,
+        issue_url: `https://github.com/benjaminlu34/agent-dashboard/issues/${800 + issueCounter}`,
+        issue_node_id: `I_kw_test_${800 + issueCounter}`,
+      };
+    },
+    async addIssueToProject() {
+      return { project_item_id: `PVTI_test_${issueCounter}` };
+    },
+    async setProjectFields() {},
+    async updateIssue() {},
+  });
+
+  const app = buildApp();
+  await registerInternalPlanApplyRoute(app, {
+    repoRoot,
+    env: {
+      ORCHESTRATOR_STATE_PATH: "./tmp/custom-orchestrator.json",
+    },
+    preflightHandler: buildPreflightPass(),
+    githubClientFactory,
+  });
+
+  const reply = buildReply();
+  const result = await app.handler(
+    {
+      body: {
+        role: "ORCHESTRATOR",
+        draft: {
+          sprint: "M2",
+          issues: [
+            {
+              title: "State override write test",
+              goal: "Ensure explicit env override is honored.",
+              non_goals: ["No runner changes"],
+              acceptance_criteria: ["Plan apply writes to the override path."],
+              files_likely_touched: ["apps/api/src/routes/internal-plan-apply.js"],
+              definition_of_done: ["Custom orchestrator state path contains sprint_plan."],
+              size: "S",
+              area: "api",
+              priority: "P1",
+            },
+          ],
+        },
+      },
+    },
+    reply,
+  );
+
+  assert.equal(reply.statusCode, 200);
+  assert.equal(result.status, "APPLIED");
+  const customState = JSON.parse(await readFile(customPath, "utf8"));
+  assert.equal(typeof customState.sprint_plan, "object");
+  assert.equal(Object.keys(customState.sprint_plan).length, 1);
+  await assert.rejects(readFile(scopedPath, "utf8"), /ENOENT/);
 });
