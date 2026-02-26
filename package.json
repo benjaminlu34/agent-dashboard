@@ -7,6 +7,7 @@
   },
   "scripts": {
     "dev": "node apps/api/src/index.js",
+    "swarm:init": "node apps/cli/src/index.js init",
     "test": "node --test apps/api/test/*.test.js",
     "test:cli": "node --test apps/cli/test/*.test.js",
     "orchestrator": "node apps/orchestrator/src/cli.js --once",
