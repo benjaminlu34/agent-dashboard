@@ -151,18 +151,10 @@ export function buildInternalKickoffHandler({ repoRoot = DEFAULT_REPO_ROOT, pref
       return { error: "body.goal must be a non-empty string" };
     }
 
-    const { statusCode: preflightStatusCode, payload: preflightResult } = await resolvedPreflightCheck({
-      role: KICKOFF_ROLE,
-    });
-
-    if (preflightStatusCode !== 200) {
-      reply.code(preflightStatusCode);
-      return preflightResult;
-    }
-
-    if (preflightResult?.status === "FAIL") {
-      reply.code(409);
-      return preflightResult;
+    const preflightFailure = await validateKickoffPreflight({ preflightCheck: resolvedPreflightCheck });
+    if (preflightFailure) {
+      reply.code(preflightFailure.statusCode);
+      return preflightFailure.payload;
     }
 
     await writeFile(resolve(repoRoot, GOAL_FILE_PATH), goal, "utf8");
