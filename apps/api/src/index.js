@@ -11,6 +11,7 @@ import { registerInternalAgentContextRoute } from "./routes/internal-agent-conte
 import { registerInternalExecutorClaimReadyItemRoute } from "./routes/internal-executor-claim-ready-item.js";
 import { registerInternalReviewerResolveLinkedPrRoute } from "./routes/internal-reviewer-resolve-linked-pr.js";
 import { registerInternalStatusRoute } from "./routes/internal-status.js";
+import { registerInternalMetadataRoute } from "./routes/internal-metadata.js";
 
 const MODULE_DIRNAME = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../");
@@ -26,6 +27,7 @@ export async function buildApp({ repoRoot = DEFAULT_REPO_ROOT, logger = true } =
   await registerInternalAgentContextRoute(app, routeOptions);
   await registerInternalExecutorClaimReadyItemRoute(app, routeOptions);
   await registerInternalReviewerResolveLinkedPrRoute(app, routeOptions);
+  await registerInternalMetadataRoute(app, routeOptions);
   await registerInternalStatusRoute(app, {
     repoRoot,
     env: {
