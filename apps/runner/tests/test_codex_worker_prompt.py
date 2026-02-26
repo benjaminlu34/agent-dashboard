@@ -26,9 +26,9 @@ class CodexWorkerPromptTests(unittest.TestCase):
         self.assertIn("Never use /tmp", prompt)
         self.assertIn('"marker_verified": true|false|null', prompt)
 
-    def test_sandbox_for_role_is_restricted_by_role(self) -> None:
-        self.assertEqual(_sandbox_for_role("EXECUTOR"), "workspace-write")
-        self.assertEqual(_sandbox_for_role("REVIEWER"), "read-only")
+    def test_sandbox_for_role_allows_backend_access_for_worker_roles(self) -> None:
+        self.assertEqual(_sandbox_for_role("EXECUTOR"), "danger-full-access")
+        self.assertEqual(_sandbox_for_role("REVIEWER"), "danger-full-access")
         with self.assertRaises(CodexWorkerError):
             _sandbox_for_role("ORCHESTRATOR")
 

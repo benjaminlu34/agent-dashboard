@@ -202,7 +202,7 @@
             <div>
               <h2 class="text-xl font-semibold tracking-tight text-white">Initialize Sprint</h2>
               <p class="mt-1 text-sm text-zinc-400">
-                Step 1 saves your high-level sprint goal to local kickoff state. Step 2 starts kickoff loop execution so the swarm generates tasks and begins work.
+                Step 1 saves your high-level sprint goal to local kickoff state. Step 2 starts kickoff loop execution. If tasks already exist, you can start the runner loop directly without kickoff.
               </p>
             </div>
           </div>
@@ -223,6 +223,10 @@
               <p class="mt-1">
                 Click <span class="font-semibold text-zinc-200">Start Kickoff Loop (Step 2)</span> to launch kickoff from the GUI. Manual fallback:
                 `python3 -m apps.runner --kickoff --sprint M1 --goal-file ./goal.txt --loop`
+              </p>
+              <p class="mt-1">
+                Resume existing tasks without kickoff: click <span class="font-semibold text-zinc-200">Start Runner Loop (No Kickoff)</span> or run
+                `python3 -m apps.runner --sprint M1 --loop`
               </p>
             </div>
             <div class="mt-4 flex flex-wrap items-end gap-3">
@@ -261,6 +265,18 @@
                   aria-hidden="true"
                 ></span>
                 <span id="kickoff-start-loop-label">Start Kickoff Loop (Step 2)</span>
+              </button>
+              <button
+                id="kickoff-start-runner-loop-button"
+                type="button"
+                class="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-black px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-zinc-200 transition hover:border-zinc-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <span
+                  id="kickoff-start-runner-loop-spinner"
+                  class="hidden h-3 w-3 animate-spin rounded-full border-2 border-zinc-200 border-r-transparent"
+                  aria-hidden="true"
+                ></span>
+                <span id="kickoff-start-runner-loop-label">Start Runner Loop (No Kickoff)</span>
               </button>
             </div>
             <p
@@ -342,6 +358,9 @@
       const kickoffStartLoopButtonEl = document.getElementById("kickoff-start-loop-button");
       const kickoffStartLoopSpinnerEl = document.getElementById("kickoff-start-loop-spinner");
       const kickoffStartLoopLabelEl = document.getElementById("kickoff-start-loop-label");
+      const kickoffStartRunnerLoopButtonEl = document.getElementById("kickoff-start-runner-loop-button");
+      const kickoffStartRunnerLoopSpinnerEl = document.getElementById("kickoff-start-runner-loop-spinner");
+      const kickoffStartRunnerLoopLabelEl = document.getElementById("kickoff-start-runner-loop-label");
 
       const canvas = document.getElementById("bg-canvas");
       const ctx = canvas.getContext("2d");
@@ -480,6 +499,7 @@
           .map(([projectItemId, value]) => ({
             projectItemId,
             issueNumber: Number(value?.last_seen_issue_number ?? 0),
+            issueTitle: typeof value?.last_seen_issue_title === "string" ? value.last_seen_issue_title.trim() : "",
             status: String(value?.last_seen_status ?? "Unknown"),
             lastSeenAt: value?.last_seen_at ?? "",
             statusSinceAt: value?.status_since_at ?? "",
@@ -526,8 +546,12 @@
               <article class="rounded-xl border border-zinc-800 bg-black p-4 shadow-md shadow-white/5 transition hover:-translate-y-0.5 hover:shadow-lg hover:shadow-white/10">
                 <div class="flex flex-wrap items-start justify-between gap-3">
                   <div>
-                    <p class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Project Item</p>
-                    <h3 class="mt-1 text-base font-semibold text-white">${entry.issueNumber > 0 ? `#${entry.issueNumber}` : "Unnumbered Issue"} · ${escapeHtml(entry.projectItemId)}</h3>
+                    <p class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Issue</p>
+                    <h3 class="mt-1 text-base font-semibold text-white">${
+                      entry.issueNumber > 0 ? `#${entry.issueNumber}` : "Unnumbered Issue"
+                    }${
+                      entry.issueTitle ? ` · ${escapeHtml(entry.issueTitle)}` : ""
+                    }</h3>
                   </div>
                   <span class="inline-flex rounded-full px-3 py-1 text-xs font-semibold ${statusBadgeClasses(entry.status)}">${escapeHtml(entry.status)}</span>
                 </div>
@@ -707,16 +731,36 @@
         kickoffSubmitButtonEl.disabled = nextLoading;
         kickoffGoalEl.disabled = nextLoading;
         kickoffStartLoopButtonEl.disabled = nextLoading;
+        kickoffStartRunnerLoopButtonEl.disabled = nextLoading;
         kickoffButtonSpinnerEl.classList.toggle("hidden", !nextLoading);
         kickoffButtonLabelEl.textContent = nextLoading ? "Saving..." : "Save Goal (Step 1)";
       }
 
       function setKickoffLoopLoading(isLoading) {
+        setLoopStartLoading({
+          isLoading,
+          spinnerEl: kickoffStartLoopSpinnerEl,
+          labelEl: kickoffStartLoopLabelEl,
+          idleLabel: "Start Kickoff Loop (Step 2)",
+        });
+      }
+
+      function setRunnerLoopLoading(isLoading) {
+        setLoopStartLoading({
+          isLoading,
+          spinnerEl: kickoffStartRunnerLoopSpinnerEl,
+          labelEl: kickoffStartRunnerLoopLabelEl,
+          idleLabel: "Start Runner Loop (No Kickoff)",
+        });
+      }
+
+      function setLoopStartLoading({ isLoading, spinnerEl, labelEl, idleLabel }) {
         const nextLoading = Boolean(isLoading);
         kickoffStartLoopButtonEl.disabled = nextLoading;
+        kickoffStartRunnerLoopButtonEl.disabled = nextLoading;
         kickoffSprintEl.disabled = nextLoading;
-        kickoffStartLoopSpinnerEl.classList.toggle("hidden", !nextLoading);
-        kickoffStartLoopLabelEl.textContent = nextLoading ? "Starting..." : "Start Kickoff Loop (Step 2)";
+        spinnerEl.classList.toggle("hidden", !nextLoading);
+        labelEl.textContent = nextLoading ? "Starting..." : idleLabel;
       }
 
       async function submitKickoff(event) {
@@ -837,6 +881,75 @@
           showKickoffMessage(`Failed to start kickoff loop: ${error?.message ?? "Unknown error"}`, "error");
         } finally {
           setKickoffLoopLoading(false);
+        }
+      }
+
+      async function startRunnerLoop() {
+        clearKickoffMessage();
+
+        const sprint = normalizeSprint(kickoffSprintEl.value);
+        if (!sprint) {
+          showKickoffMessage("Sprint must be one of M1, M2, M3, or M4.", "error");
+          kickoffSprintEl.focus();
+          return;
+        }
+
+        kickoffSprintEl.value = sprint;
+        setRunnerLoopLoading(true);
+
+        try {
+          const response = await fetch("/internal/runner/start-loop", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ sprint }),
+          });
+
+          const rawResponseBody = await response.text();
+          let payload = {};
+          if (rawResponseBody.trim().length > 0) {
+            try {
+              payload = asObject(JSON.parse(rawResponseBody));
+            } catch {
+              payload = {};
+            }
+          }
+
+          if (!response.ok) {
+            if (response.status === 409 && String(payload.status ?? "") === "ALREADY_RUNNING") {
+              const runningSprint =
+                typeof payload.sprint === "string" && payload.sprint.trim().length > 0 ? payload.sprint.trim() : sprint;
+              const runningPid = Number(payload.pid);
+              const runningPidText = Number.isInteger(runningPid) && runningPid > 0 ? `, PID ${runningPid}` : "";
+              showKickoffMessage(`Runner loop is already running (Sprint ${runningSprint}${runningPidText}).`);
+              return;
+            }
+            const fallbackMessage =
+              (typeof payload.error === "string" && payload.error.trim().length > 0
+                ? payload.error.trim()
+                : rawResponseBody.trim()) || `HTTP ${response.status}`;
+            throw new Error(fallbackMessage);
+          }
+
+          const successMessage =
+            typeof payload.message === "string" && payload.message.trim().length > 0
+              ? payload.message.trim()
+              : "Runner loop started.";
+          const statusParts = [];
+          if (typeof payload.sprint === "string" && payload.sprint.trim().length > 0) {
+            statusParts.push(`Sprint ${payload.sprint.trim()}`);
+          }
+          const pid = Number(payload.pid);
+          if (Number.isInteger(pid) && pid > 0) {
+            statusParts.push(`PID ${pid}`);
+          }
+          const suffix = statusParts.length > 0 ? ` (${statusParts.join(", ")})` : "";
+          showKickoffMessage(`${successMessage}${suffix}`);
+        } catch (error) {
+          showKickoffMessage(`Failed to start runner loop: ${error?.message ?? "Unknown error"}`, "error");
+        } finally {
+          setRunnerLoopLoading(false);
         }
       }
 
@@ -1117,6 +1230,7 @@
       settingsFormEl.addEventListener("submit", submitConfig);
       kickoffFormEl.addEventListener("submit", submitKickoff);
       kickoffStartLoopButtonEl.addEventListener("click", startKickoffLoop);
+      kickoffStartRunnerLoopButtonEl.addEventListener("click", startRunnerLoop);
       window.addEventListener("keydown", (event) => {
         if (event.key === "Escape" && isSettingsOpen) {
           setSettingsOpen(false);

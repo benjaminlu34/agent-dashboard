@@ -41,6 +41,7 @@ test("POST /internal/kickoff returns 400 when goal is missing", async () => {
 
   assert.equal(app.routes.has("/internal/kickoff"), true);
   assert.equal(app.routes.has("/internal/kickoff/start-loop"), true);
+  assert.equal(app.routes.has("/internal/runner/start-loop"), true);
 
   const kickoffHandler = getPostHandler(app, "/internal/kickoff");
   const reply = buildReply();
@@ -236,5 +237,120 @@ test("POST /internal/kickoff/start-loop starts kickoff loop and returns 202", as
     pid: 9123,
     sprint: "M3",
     started_at: "2026-02-26T09:35:00.000Z",
+  });
+});
+
+test("POST /internal/runner/start-loop returns 400 when sprint is missing", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-runner-start-loop-400-sprint-"));
+  const app = buildApp();
+  await registerInternalKickoffRoute(app, {
+    repoRoot,
+    preflightCheck: async () => ({ statusCode: 200, payload: { status: "PASS" } }),
+  });
+
+  const startLoopHandler = getPostHandler(app, "/internal/runner/start-loop");
+  const reply = buildReply();
+  const result = await startLoopHandler({ body: {} }, reply);
+
+  assert.equal(reply.statusCode, 400);
+  assert.deepEqual(result, { error: "body.sprint must be one of M1, M2, M3, or M4" });
+});
+
+test("POST /internal/runner/start-loop does not require goal.txt", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-runner-start-loop-202-no-goal-"));
+  const app = buildApp();
+  let requestedRole = "";
+  let sprintSeenByManager = "";
+  await registerInternalKickoffRoute(app, {
+    repoRoot,
+    preflightCheck: async ({ role }) => {
+      requestedRole = String(role ?? "");
+      return { statusCode: 200, payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] } };
+    },
+    runnerLoopManager: {
+      getActive: () => null,
+      start: async ({ sprint }) => {
+        sprintSeenByManager = sprint;
+        return {
+          pid: 9021,
+          sprint,
+          startedAt: "2026-02-26T09:45:00.000Z",
+        };
+      },
+    },
+  });
+
+  const startLoopHandler = getPostHandler(app, "/internal/runner/start-loop");
+  const reply = buildReply();
+  const result = await startLoopHandler({ body: { sprint: "m4" } }, reply);
+
+  assert.equal(reply.statusCode, 202);
+  assert.equal(requestedRole, "ORCHESTRATOR");
+  assert.equal(sprintSeenByManager, "M4");
+  assert.deepEqual(result, {
+    status: "STARTED",
+    message: "Runner loop started.",
+    pid: 9021,
+    sprint: "M4",
+    started_at: "2026-02-26T09:45:00.000Z",
+  });
+});
+
+test("POST /internal/runner/start-loop returns 409 when preflight fails", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-runner-start-loop-409-preflight-"));
+  const app = buildApp();
+  await registerInternalKickoffRoute(app, {
+    repoRoot,
+    preflightCheck: async () => ({
+      statusCode: 200,
+      payload: {
+        role: "ORCHESTRATOR",
+        status: "FAIL",
+        errors: [{ source: "template", message: "template missing" }],
+      },
+    }),
+  });
+
+  const startLoopHandler = getPostHandler(app, "/internal/runner/start-loop");
+  const reply = buildReply();
+  const result = await startLoopHandler({ body: { sprint: "M1" } }, reply);
+
+  assert.equal(reply.statusCode, 409);
+  assert.equal(result.status, "FAIL");
+  assert.equal(Array.isArray(result.errors), true);
+});
+
+test("POST /internal/runner/start-loop returns 409 when runner loop is already running", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-runner-start-loop-409-running-"));
+  const app = buildApp();
+  let startCalled = false;
+  await registerInternalKickoffRoute(app, {
+    repoRoot,
+    preflightCheck: async () => ({ statusCode: 200, payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] } }),
+    runnerLoopManager: {
+      getActive: () => ({
+        pid: 5678,
+        sprint: "M2",
+        startedAt: "2026-02-26T09:50:00.000Z",
+      }),
+      start: async () => {
+        startCalled = true;
+        return null;
+      },
+    },
+  });
+
+  const startLoopHandler = getPostHandler(app, "/internal/runner/start-loop");
+  const reply = buildReply();
+  const result = await startLoopHandler({ body: { sprint: "M2" } }, reply);
+
+  assert.equal(reply.statusCode, 409);
+  assert.equal(startCalled, false);
+  assert.deepEqual(result, {
+    status: "ALREADY_RUNNING",
+    error: "Runner loop is already running for this repo",
+    pid: 5678,
+    sprint: "M2",
+    started_at: "2026-02-26T09:50:00.000Z",
   });
 });

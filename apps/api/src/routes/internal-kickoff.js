@@ -94,7 +94,49 @@ async function defaultStartKickoffLoopProcess({ repoRoot, sprint }) {
   });
 }
 
-function buildKickoffLoopManager({ repoRoot = DEFAULT_REPO_ROOT, startKickoffLoopProcess = defaultStartKickoffLoopProcess } = {}) {
+async function defaultStartRunnerLoopProcess({ repoRoot, sprint }) {
+  const args = ["-m", "apps.runner", "--sprint", sprint, "--loop"];
+  return new Promise((resolveStarted, rejectStart) => {
+    const child = spawn("python3", args, {
+      cwd: repoRoot,
+      detached: true,
+      stdio: "ignore",
+      env: { ...process.env },
+    });
+
+    const failStartup = (message) => {
+      cleanupStartup();
+      rejectStart(new Error(message));
+    };
+
+    const handleStartupError = (error) => {
+      const detail = typeof error?.message === "string" && error.message.trim().length > 0 ? error.message.trim() : "unknown error";
+      failStartup(`unable to start runner loop process: ${detail}`);
+    };
+
+    const handleStartupExit = (code, signal) => {
+      const reason = signal ? `signal ${signal}` : `exit code ${String(code ?? "unknown")}`;
+      failStartup(`runner loop process exited before startup check (${reason})`);
+    };
+
+    const startupTimer = setTimeout(() => {
+      cleanupStartup();
+      child.unref();
+      resolveStarted(child);
+    }, RUNNER_STARTUP_GRACE_MS);
+
+    function cleanupStartup() {
+      clearTimeout(startupTimer);
+      child.off("error", handleStartupError);
+      child.off("exit", handleStartupExit);
+    }
+
+    child.once("error", handleStartupError);
+    child.once("exit", handleStartupExit);
+  });
+}
+
+function buildLoopManager({ repoRoot = DEFAULT_REPO_ROOT, startLoopProcess = defaultStartKickoffLoopProcess } = {}) {
   return {
     getActive() {
       return getActiveKickoffLoopState(repoRoot);
@@ -110,7 +152,7 @@ function buildKickoffLoopManager({ repoRoot = DEFAULT_REPO_ROOT, startKickoffLoo
         return existing;
       }
 
-      const child = await startKickoffLoopProcess({ repoRoot, sprint: normalizedSprint });
+      const child = await startLoopProcess({ repoRoot, sprint: normalizedSprint });
       if (!Number.isInteger(child?.pid) || child.pid <= 0) {
         throw new Error("unable to determine kickoff loop process id");
       }
@@ -182,53 +224,61 @@ async function validateKickoffPreflight({ preflightCheck }) {
   return null;
 }
 
-export function buildInternalKickoffStartLoopHandler({
-  repoRoot = DEFAULT_REPO_ROOT,
-  preflightCheck,
-  kickoffLoopManager,
-} = {}) {
-  const resolvedPreflightCheck =
+function resolvePreflightCheck({ preflightCheck, repoRoot }) {
+  return (
     preflightCheck ??
     (async ({ role }) =>
       runPreflightCheck({
         role,
         repoRoot,
-      }));
-  const resolvedKickoffLoopManager = kickoffLoopManager ?? buildKickoffLoopManager({ repoRoot });
+      }))
+  );
+}
 
-  return async function internalKickoffStartLoopHandler(request, reply) {
+function buildInternalStartLoopHandler({
+  repoRoot,
+  preflightCheck,
+  loopManager,
+  requireGoalFile,
+  alreadyRunningError,
+  startedMessage,
+  startFailurePrefix,
+}) {
+  return async function internalStartLoopHandler(request, reply) {
     const sprint = normalizeSprint(request?.body?.sprint);
     if (!sprint) {
       reply.code(400);
       return { error: "body.sprint must be one of M1, M2, M3, or M4" };
     }
 
-    const goalPath = resolve(repoRoot, GOAL_FILE_PATH);
-    let goalContent = "";
-    try {
-      goalContent = await readFile(goalPath, "utf8");
-    } catch (error) {
-      if (error?.code !== "ENOENT") {
-        throw error;
+    if (requireGoalFile) {
+      const goalPath = resolve(repoRoot, GOAL_FILE_PATH);
+      let goalContent = "";
+      try {
+        goalContent = await readFile(goalPath, "utf8");
+      } catch (error) {
+        if (error?.code !== "ENOENT") {
+          throw error;
+        }
+      }
+      if (goalContent.trim().length === 0) {
+        reply.code(400);
+        return { error: "goal.txt is missing or empty; save a kickoff goal first" };
       }
     }
-    if (goalContent.trim().length === 0) {
-      reply.code(400);
-      return { error: "goal.txt is missing or empty; save a kickoff goal first" };
-    }
 
-    const preflightFailure = await validateKickoffPreflight({ preflightCheck: resolvedPreflightCheck });
+    const preflightFailure = await validateKickoffPreflight({ preflightCheck });
     if (preflightFailure) {
       reply.code(preflightFailure.statusCode);
       return preflightFailure.payload;
     }
 
-    const active = resolvedKickoffLoopManager.getActive();
+    const active = loopManager.getActive();
     if (active) {
       reply.code(409);
       return {
         status: "ALREADY_RUNNING",
-        error: "Kickoff loop is already running for this repo",
+        error: alreadyRunningError,
         pid: active.pid,
         sprint: active.sprint,
         started_at: active.startedAt,
@@ -236,11 +286,11 @@ export function buildInternalKickoffStartLoopHandler({
     }
 
     try {
-      const started = await resolvedKickoffLoopManager.start({ sprint });
+      const started = await loopManager.start({ sprint });
       reply.code(202);
       return {
         status: "STARTED",
-        message: "Kickoff loop started.",
+        message: startedMessage,
         pid: started.pid,
         sprint: started.sprint,
         started_at: started.startedAt,
@@ -248,13 +298,57 @@ export function buildInternalKickoffStartLoopHandler({
     } catch (error) {
       reply.code(500);
       return {
-        error: `Failed to start kickoff loop: ${error?.message ?? "Unknown error"}`,
+        error: `Failed to start ${startFailurePrefix}: ${error?.message ?? "Unknown error"}`,
       };
     }
   };
 }
 
+export function buildInternalKickoffStartLoopHandler({
+  repoRoot = DEFAULT_REPO_ROOT,
+  preflightCheck,
+  kickoffLoopManager,
+} = {}) {
+  const resolvedPreflightCheck = resolvePreflightCheck({ preflightCheck, repoRoot });
+  const resolvedKickoffLoopManager = kickoffLoopManager ?? buildLoopManager({ repoRoot });
+
+  return buildInternalStartLoopHandler({
+    repoRoot,
+    preflightCheck: resolvedPreflightCheck,
+    loopManager: resolvedKickoffLoopManager,
+    requireGoalFile: true,
+    alreadyRunningError: "Kickoff loop is already running for this repo",
+    startedMessage: "Kickoff loop started.",
+    startFailurePrefix: "kickoff loop",
+  });
+}
+
+export function buildInternalRunnerStartLoopHandler({
+  repoRoot = DEFAULT_REPO_ROOT,
+  preflightCheck,
+  runnerLoopManager,
+} = {}) {
+  const resolvedPreflightCheck = resolvePreflightCheck({ preflightCheck, repoRoot });
+  const resolvedRunnerLoopManager =
+    runnerLoopManager ??
+    buildLoopManager({
+      repoRoot,
+      startLoopProcess: defaultStartRunnerLoopProcess,
+    });
+
+  return buildInternalStartLoopHandler({
+    repoRoot,
+    preflightCheck: resolvedPreflightCheck,
+    loopManager: resolvedRunnerLoopManager,
+    requireGoalFile: false,
+    alreadyRunningError: "Runner loop is already running for this repo",
+    startedMessage: "Runner loop started.",
+    startFailurePrefix: "runner loop",
+  });
+}
+
 export async function registerInternalKickoffRoute(fastify, options = {}) {
   fastify.post("/internal/kickoff", buildInternalKickoffHandler(options));
   fastify.post("/internal/kickoff/start-loop", buildInternalKickoffStartLoopHandler(options));
+  fastify.post("/internal/runner/start-loop", buildInternalRunnerStartLoopHandler(options));
 }

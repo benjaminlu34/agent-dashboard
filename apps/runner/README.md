@@ -97,8 +97,8 @@ Non-dry-run execution spawns `codex mcp-server` per intent and calls the MCP `co
 See `docs/runner-contract.md`.
 
 Worker sandbox policy:
-- `EXECUTOR` runs with `workspace-write` sandbox (repo workspace writes only).
-- `REVIEWER` runs with `read-only` sandbox.
+- `EXECUTOR` runs with `danger-full-access` sandbox so backend endpoint calls can succeed.
+- `REVIEWER` runs with `danger-full-access` sandbox for the same backend communication path.
 - Worker prompts also require no reads/writes outside repository workspace.
 
 ## Automation behaviors

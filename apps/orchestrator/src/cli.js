@@ -17,6 +17,7 @@ const DEFAULT_POLL_INTERVAL_MS = 15000;
 const DEFAULT_STALL_MINUTES = 120;
 const DEFAULT_REVIEW_CHURN_POLLS = 3;
 const DEFAULT_REVIEWER_RETRY_POLLS = 20;
+const DEFAULT_EXECUTOR_RETRY_POLLS = 20;
 const DEFAULT_MAX_REVIEWER_DISPATCHES_PER_STATUS = 2;
 const DEFAULT_STATE_PATH = "./.orchestrator-state.json";
 const AGENT_SWARM_CONFIG_PATH = ".agent-swarm.yml";
@@ -526,6 +527,11 @@ async function runCycle({
     reviewerRetryPolls: parseNonNegativeIntEnv(
       "ORCHESTRATOR_REVIEWER_RETRY_POLLS",
       DEFAULT_REVIEWER_RETRY_POLLS,
+      env,
+    ),
+    executorRetryPolls: parseNonNegativeIntEnv(
+      "ORCHESTRATOR_EXECUTOR_RETRY_POLLS",
+      DEFAULT_EXECUTOR_RETRY_POLLS,
       env,
     ),
   });

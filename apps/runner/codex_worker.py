@@ -119,12 +119,9 @@ class _JsonRpcClient:
 
 def _sandbox_for_role(role: str) -> str:
     normalized = str(role or "").strip().upper()
-    if normalized == "EXECUTOR":
-        # Executor needs to modify repository files but must stay within workspace.
-        return "workspace-write"
-    if normalized == "REVIEWER":
-        # Reviewer is comment-only and should not write files.
-        return "read-only"
+    if normalized in ("EXECUTOR", "REVIEWER"):
+        # Worker roles must reach backend internal endpoints for claim/linkage/transition calls.
+        return "danger-full-access"
     raise CodexWorkerError("intent role must be EXECUTOR or REVIEWER", code="worker_invalid_intent")
 
 

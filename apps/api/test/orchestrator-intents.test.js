@@ -140,6 +140,25 @@ test("buildRunPlan emits again when status changes to a dispatchable role", () =
   assert.equal(third.intents[0].body.issue_number, 10);
 });
 
+test("buildRunPlan stores issue title in state when project item includes issue_title", () => {
+  const result = buildRunPlan({
+    projectItems: [
+      {
+        issue_number: 10,
+        issue_title: "[TASK] Add launch-group configuration model",
+        project_item_id: "PVTI_10",
+        fields: { Sprint: "M1", Status: "Ready" },
+      },
+    ],
+    allowedStatusOptions: ALLOWED_STATUSES,
+    sprint: "M1",
+    uuidFactory: () => "run-1",
+    nowIso: "2026-02-07T12:00:00.000Z",
+  });
+
+  assert.equal(result.nextState.items.PVTI_10.last_seen_issue_title, "[TASK] Add launch-group configuration model");
+});
+
 test("buildRunPlan marks sprint complete when no active statuses remain and backlog is empty", () => {
   const result = buildRunPlan({
     projectItems: [
@@ -259,6 +278,45 @@ test("buildRunPlan redispatches reviewer once after stall threshold", () => {
   assert.equal(result.intents.length, 1);
   assert.equal(result.intents[0].role, "REVIEWER");
   assert.equal(result.intents[0].run_id, "run-review-2");
+});
+
+test("buildRunPlan redispatches executor for unchanged Ready items after retry threshold", () => {
+  const result = buildRunPlan({
+    projectItems: [{ issue_number: 77, project_item_id: "PVTI_77", fields: { Sprint: "M1", Status: "Ready" } }],
+    allowedStatusOptions: ALLOWED_STATUSES,
+    sprint: "M1",
+    previousState: {
+      poll_count: 50,
+      items: {
+        PVTI_77: {
+          last_seen_status: "Ready",
+          last_seen_sprint: "M1",
+          last_seen_issue_number: 77,
+          last_seen_at: "2026-02-07T12:00:00.000Z",
+          status_since_at: "2026-02-07T10:00:00.000Z",
+          status_since_poll: 1,
+          last_activity_at: "2026-02-07T10:00:00.000Z",
+          last_activity_indicator: "status_changed",
+          last_dispatched_role: "EXECUTOR",
+          last_dispatched_status: "Ready",
+          last_dispatched_at: "2026-02-07T12:00:00.000Z",
+          last_dispatched_poll: 1,
+          last_run_id: "run-exec-1",
+          reviewer_dispatches_for_current_status: 0,
+          review_cycle_count: 0,
+        },
+      },
+    },
+    maxExecutors: 1,
+    executorRetryPolls: 50,
+    uuidFactory: () => "run-exec-2",
+    nowIso: "2026-02-07T13:00:00.000Z",
+  });
+
+  assert.equal(result.intents.length, 1);
+  assert.equal(result.intents[0].role, "EXECUTOR");
+  assert.equal(result.intents[0].endpoint, "/internal/executor/claim-ready-item");
+  assert.equal(result.intents[0].run_id, "run-exec-2");
 });
 
 test("buildRunPlan dispatches executor first when In Review entered from Needs Human Approval", () => {

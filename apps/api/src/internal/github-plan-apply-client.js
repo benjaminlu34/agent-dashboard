@@ -475,16 +475,17 @@ export async function createGitHubPlanApplyClient({
                       hasNextPage
                       endCursor
                     }
-                    nodes {
-                      id
-                      content {
-                        ... on Issue {
-                          number
-                          url
-                          repository {
-                            name
-                            owner {
-                              login
+	                    nodes {
+	                      id
+	                      content {
+	                        ... on Issue {
+	                          number
+	                          title
+	                          url
+	                          repository {
+	                            name
+	                            owner {
+	                              login
                             }
                           }
                         }
@@ -523,13 +524,14 @@ export async function createGitHubPlanApplyClient({
             continue;
           }
 
-          items.push({
-            project_item_id: node.id,
-            issue_number: issueNumber,
-            issue_url: issueUrl,
-            fields: parseProjectItemFields(node?.fieldValues?.nodes),
-          });
-        }
+	          items.push({
+	            project_item_id: node.id,
+	            issue_number: issueNumber,
+	            issue_title: isNonEmptyString(node?.content?.title) ? node.content.title.trim() : "",
+	            issue_url: issueUrl,
+	            fields: parseProjectItemFields(node?.fieldValues?.nodes),
+	          });
+	        }
 
         if (!connection?.pageInfo?.hasNextPage) {
           break;

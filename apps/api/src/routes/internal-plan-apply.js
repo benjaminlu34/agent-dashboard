@@ -20,9 +20,25 @@ const VALID_SIZES = new Set(["S", "M", "L"]);
 const VALID_AREAS = new Set(["db", "api", "web", "providers", "infra", "docs"]);
 const VALID_PRIORITIES = new Set(["P0", "P1", "P2"]);
 const VALID_INITIAL_STATUSES = new Set(["Backlog", "Ready"]);
+const DEFAULT_ORCHESTRATOR_STATE_PATH = "./.orchestrator-state.json";
 
 function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function sanitizeStatePathToken(value) {
+  return String(value).trim().replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+function resolveOrchestratorStatePath({ repoRoot, env, ownerLogin, repoName }) {
+  const hasScopedIdentity = isNonEmptyString(ownerLogin) && isNonEmptyString(repoName);
+  const defaultPath = hasScopedIdentity
+    ? `./.orchestrator-state.${sanitizeStatePathToken(ownerLogin)}.${sanitizeStatePathToken(repoName)}.json`
+    : DEFAULT_ORCHESTRATOR_STATE_PATH;
+  const configuredPath = isNonEmptyString(env?.ORCHESTRATOR_STATE_PATH)
+    ? env.ORCHESTRATOR_STATE_PATH.trim()
+    : defaultPath;
+  return resolve(repoRoot, configuredPath);
 }
 
 function ensureStringArray(value) {
@@ -260,10 +276,12 @@ export function buildInternalPlanApplyHandler({
       throw error;
     }
 
+    let targetIdentity;
     let projectIdentity;
     try {
       const repoPolicy = parseProjectIdentityPolicyFromBundle(bundle);
       const target = resolveTargetIdentity({ env, repoPolicy });
+      targetIdentity = target;
       projectIdentity = {
         owner_login: target.owner_login,
         owner_type: target.owner_type,
@@ -384,7 +402,12 @@ export function buildInternalPlanApplyHandler({
       }
     }
 
-    const orchestratorStatePath = resolve(repoRoot, env.ORCHESTRATOR_STATE_PATH || ".orchestrator-state.json");
+    const orchestratorStatePath = resolveOrchestratorStatePath({
+      repoRoot,
+      env,
+      ownerLogin: targetIdentity?.owner_login,
+      repoName: targetIdentity?.repo_name,
+    });
     try {
       const state = await readOrchestratorStateFile(orchestratorStatePath);
       const next = {

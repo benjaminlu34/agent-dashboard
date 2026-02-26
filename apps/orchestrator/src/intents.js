@@ -100,6 +100,11 @@ function updateSeenState({
   pollCount,
 }) {
   const previous = stateByItemId[item.project_item_id] ?? {};
+  const issueTitle = hasNonEmptyString(item?.issue_title)
+    ? item.issue_title.trim()
+    : hasNonEmptyString(previous.last_seen_issue_title)
+      ? previous.last_seen_issue_title.trim()
+      : "";
   const statusChanged = previous.last_seen_status !== status;
   const statusSinceAt = statusChanged ? nowIso : toIsoTimestamp(previous.status_since_at) || nowIso;
   const statusSincePoll = statusChanged
@@ -140,6 +145,7 @@ function updateSeenState({
     last_seen_status: status,
     last_seen_sprint: sprint,
     last_seen_issue_number: item.issue_number,
+    last_seen_issue_title: issueTitle,
     last_seen_at: nowIso,
     status_since_at: statusSinceAt,
     status_since_poll: statusSincePoll,
@@ -188,6 +194,7 @@ export function buildRunPlan({
   reviewChurnPolls = 3,
   maxReviewerDispatchesPerStatus = 1,
   reviewerRetryPolls = 0,
+  executorRetryPolls = 0,
   maxReviewCycles = 5,
 } = {}) {
   if (!Array.isArray(projectItems)) {
@@ -207,6 +214,9 @@ export function buildRunPlan({
   assertPositiveInteger(maxReviewCycles, "maxReviewCycles");
   if (!Number.isInteger(reviewerRetryPolls) || reviewerRetryPolls < 0) {
     throw new Error("reviewerRetryPolls must be a non-negative integer");
+  }
+  if (!Number.isInteger(executorRetryPolls) || executorRetryPolls < 0) {
+    throw new Error("executorRetryPolls must be a non-negative integer");
   }
 
   const normalizedNowIso = toIsoTimestamp(nowIso);
@@ -321,8 +331,13 @@ export function buildRunPlan({
         item.status === "In Review" &&
         stateItem.reviewer_dispatches_for_current_status < maxReviewerDispatchesPerStatus &&
         pollCount - stateItem.last_dispatched_poll >= reviewerRetryPolls;
+      const canRetryExecutor =
+        role === "EXECUTOR" &&
+        item.status === "Ready" &&
+        executorRetryPolls > 0 &&
+        pollCount - stateItem.last_dispatched_poll >= executorRetryPolls;
 
-      if (!canRetryReviewer) {
+      if (!canRetryReviewer && !canRetryExecutor) {
         summary.skipped.dedupe_same_status += 1;
         return false;
       }
