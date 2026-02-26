@@ -85,6 +85,14 @@
               </button>
             </div>
             <p class="mt-2 text-sm text-zinc-400">Update local `.agent-swarm.yml` and `.env` configuration.</p>
+            <div class="mt-4 rounded-xl border border-zinc-800 bg-black/60 p-3">
+              <p class="text-xs font-semibold uppercase tracking-[0.16em] text-zinc-300">Configure via GUI</p>
+              <ul class="mt-2 space-y-1 text-xs text-zinc-400">
+                <li><span class="font-semibold text-zinc-200">Target Owner:</span> Use the organization or username slug (e.g., `openai`).</li>
+                <li><span class="font-semibold text-zinc-200">Target Repo:</span> Use the repository name slug (e.g., `whisper`).</li>
+                <li><span class="font-semibold text-zinc-200">Important:</span> Do not paste full URLs into these fields.</li>
+              </ul>
+            </div>
 
             <form id="settings-form" class="mt-5 space-y-4">
               <label class="block">
@@ -95,6 +103,7 @@
                   type="text"
                   required
                   autocomplete="off"
+                  placeholder="openai"
                   class="w-full rounded-lg border border-zinc-700 bg-black px-3 py-2 text-sm text-white outline-none transition focus:border-zinc-500"
                 />
               </label>
@@ -106,6 +115,7 @@
                   type="text"
                   required
                   autocomplete="off"
+                  placeholder="whisper"
                   class="w-full rounded-lg border border-zinc-700 bg-black px-3 py-2 text-sm text-white outline-none transition focus:border-zinc-500"
                 />
               </label>
@@ -118,6 +128,7 @@
                   required
                   min="1"
                   step="1"
+                  placeholder="7"
                   class="w-full rounded-lg border border-zinc-700 bg-black px-3 py-2 text-sm text-white outline-none transition focus:border-zinc-500"
                 />
               </label>
@@ -190,7 +201,9 @@
           <div class="flex flex-wrap items-center justify-between gap-4">
             <div>
               <h2 class="text-xl font-semibold tracking-tight text-white">Initialize Sprint</h2>
-              <p class="mt-1 text-sm text-zinc-400">Capture the high-level sprint goal and persist it to local kickoff state.</p>
+              <p class="mt-1 text-sm text-zinc-400">
+                Capture a high-level sprint goal; the swarm will automatically process it into individual tasks and persist kickoff state locally.
+              </p>
             </div>
           </div>
 
@@ -202,7 +215,7 @@
               id="kickoff-goal"
               name="goal"
               rows="7"
-              placeholder="Describe the primary sprint objective and intended outcomes."
+              placeholder="Example: Ship sprint kickoff validation hardening and add tests for claim lease expiration handling."
               class="w-full rounded-xl border border-zinc-700 bg-black px-4 py-3 text-sm text-zinc-100 outline-none transition focus:border-zinc-500"
             ></textarea>
             <div class="mt-4 flex flex-wrap items-center justify-between gap-3">

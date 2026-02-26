@@ -26,7 +26,7 @@ This guide covers the fastest setup path using the local dashboard.
    pnpm dev
    ```
 
-4. **Configure in the GUI**
+4. **Configure via GUI**
 
    - Open `http://localhost:4000` in your browser.
    - Click **Settings** in the header.
@@ -35,6 +35,10 @@ This guide covers the fastest setup path using the local dashboard.
      - `Target Repo`
      - `Project V2 Number`
      - `GitHub PAT`
+   - Notes:
+     - **Target Owner:** Use the organization or username slug (e.g., `openai`).
+     - **Target Repo:** Use the repository name slug (e.g., `whisper`).
+     - **Important:** Do not paste full URLs into these fields.
    - Click **Save Settings**.
 
 5. **Run preflight checks**
@@ -57,6 +61,7 @@ This guide covers the fastest setup path using the local dashboard.
 
    - In the dashboard, use the **Initialize Sprint** section.
    - Enter your high-level sprint objective in the textarea.
+   - The swarm automatically processes the high-level goal into individual tasks.
    - Click **Write Goal & Kickoff**.
    - Wait for success message: `Goal Received`.
 
