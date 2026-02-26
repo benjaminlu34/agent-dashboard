@@ -40,7 +40,8 @@ What still needs to be done for deploy-grade alpha:
 - `pnpm`.
 - Python `3.12+` (runner).
 - GitHub token with permissions to read/write the configured target project/repo as required by routes.
-  - Set one of: `GITHUB_PAT` or `GITHUB_TOKEN`.
+  - `pnpm doctor` defaults to `GITHUB_TOKEN` (via `.agent-swarm.yml auth.github_token_env`).
+  - Existing API/orchestrator flows accept `GITHUB_PAT` or `GITHUB_TOKEN`.
 - Codex CLI with MCP servers `github` and `github_projects` enabled (runner).
 
 ## Quick Start
@@ -52,10 +53,23 @@ pnpm install
 
 2. Configure GitHub auth:
 ```bash
-export GITHUB_PAT="<token>"
+export GITHUB_TOKEN="<token>"
 ```
 
-3. Configure target repo/project identity (recommended explicit mode):
+3. Configure CLI target repo/project identity:
+```bash
+cat > .agent-swarm.yml <<'YAML'
+version: "1.0"
+target:
+  owner: "<owner>"
+  repo: "<repo>"
+  project_v2_number: 1
+auth:
+  github_token_env: "GITHUB_TOKEN"
+YAML
+```
+
+4. Configure target repo/project identity for API+orchestrator (recommended explicit mode):
 ```bash
 export TARGET_OWNER_LOGIN="<owner>"
 export TARGET_OWNER_TYPE="user"   # or org
@@ -65,36 +79,58 @@ export TARGET_TEMPLATE_PATH=".github/ISSUE_TEMPLATE/milestone-task.yml"  # optio
 export TARGET_REF="HEAD"                                                # optional
 ```
 
-4. Start internal API:
+5. Start internal API:
 ```bash
 pnpm dev
 ```
 
-5. Run preflight manually:
+6. Run preflight manually:
 ```bash
 curl "http://localhost:4000/internal/preflight?role=ORCHESTRATOR"
 ```
 
-6. Run orchestrator once:
+7. Run CLI doctor preflight checks:
+```bash
+export GITHUB_TOKEN="<token>"
+pnpm doctor
+```
+
+8. Run orchestrator once:
 ```bash
 export ORCHESTRATOR_SPRINT="M1"
 pnpm orchestrator
 ```
 
-7. Run orchestrator loop mode:
+9. Run orchestrator loop mode:
 ```bash
 node apps/orchestrator/src/cli.js --loop
 ```
 
-8. Run runner once (executes orchestrator intents and workers):
+10. Run runner once (executes orchestrator intents and workers):
 ```bash
 pnpm runner
 ```
 
-9. Dry-run runner (no backend write endpoints, no worker execution):
+11. Dry-run runner (no backend write endpoints, no worker execution):
 ```bash
 pnpm runner:dry
 ```
+
+## CLI Doctor
+
+`pnpm doctor` reads `.agent-swarm.yml` in your current working directory and runs three preflight checks:
+- Check 1: token presence/auth/scopes using `auth.github_token_env` (defaults to `GITHUB_TOKEN`).
+- Check 2: read/write connectivity for `target.owner` + `target.repo`.
+- Check 3: required template presence at `.github/ISSUE_TEMPLATE/milestone-task.yml`.
+
+Doctor exit codes:
+- `0`: all checks passed.
+- `1`: one or more checks failed.
+
+Remediation output is intentionally safe-by-default:
+- Template fix remediation uses `mktemp`, creates a dedicated branch, and does not push to the default branch.
+- The script refuses to overwrite an existing template file.
+- A human review/approval step is still required before merge.
 
 ## Orchestrator Runtime Config
 
@@ -159,6 +195,8 @@ Optional:
 
 - Run API: `pnpm dev`
 - Run tests: `pnpm test`
+- Run CLI config parser test: `pnpm test:cli`
+- Run doctor preflight checks: `pnpm doctor`
 - Run orchestrator once: `pnpm orchestrator`
 - Run runner once: `pnpm runner`
 - Run runner dry-run: `pnpm runner:dry`
