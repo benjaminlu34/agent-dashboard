@@ -40,7 +40,8 @@ What still needs to be done for deploy-grade alpha:
 - `pnpm`.
 - Python `3.12+` (runner).
 - GitHub token with permissions to read/write the configured target project/repo as required by routes.
-  - Set one of: `GITHUB_PAT` or `GITHUB_TOKEN`.
+  - `pnpm doctor` defaults to `GITHUB_TOKEN` (via `.agent-swarm.yml auth.github_token_env`).
+  - Existing API/orchestrator flows accept `GITHUB_PAT` or `GITHUB_TOKEN`.
 - Codex CLI with MCP servers `github` and `github_projects` enabled (runner).
 
 ## Quick Start
@@ -114,6 +115,22 @@ pnpm runner
 ```bash
 pnpm runner:dry
 ```
+
+## CLI Doctor
+
+`pnpm doctor` reads `.agent-swarm.yml` in your current working directory and runs three preflight checks:
+- Check 1: token presence/auth/scopes using `auth.github_token_env` (defaults to `GITHUB_TOKEN`).
+- Check 2: read/write connectivity for `target.owner` + `target.repo`.
+- Check 3: required template presence at `.github/ISSUE_TEMPLATE/milestone-task.yml`.
+
+Doctor exit codes:
+- `0`: all checks passed.
+- `1`: one or more checks failed.
+
+Remediation output is intentionally safe-by-default:
+- Template fix remediation uses `mktemp`, creates a dedicated branch, and does not push to the default branch.
+- The script refuses to overwrite an existing template file.
+- A human review/approval step is still required before merge.
 
 ## Orchestrator Runtime Config
 

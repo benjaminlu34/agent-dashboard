@@ -1,0 +1,88 @@
+export const GITHUB_API_BASE = "https://api.github.com";
+export const GITHUB_API_VERSION = "2022-11-28";
+export const DOCTOR_USER_AGENT = "agent-swarm-cli/0.1.0";
+
+export const REQUIRED_TEMPLATE_PATH = ".github/ISSUE_TEMPLATE/milestone-task.yml";
+export const SAFE_TEMPLATE_FIX_BRANCH = "chore/add-required-milestone-template";
+
+export const REQUIRED_TEMPLATE_CONTENT = `name: Milestone Task
+description: Create a concrete, testable milestone task with explicit scope and outcomes.
+title: "[TASK] "
+labels:
+  - infrastructure
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for milestone-scoped tasks only.
+
+        Vague tasks are not allowed.
+        Every task must be testable, include clear success criteria, and avoid ambiguous wording.
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: State one concrete outcome.
+      placeholder: Describe the exact result this task must produce.
+    validations:
+      required: true
+
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: Explicitly list what is out of scope.
+      placeholder: |
+        - Not included:
+        - Not included:
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance Criteria
+      description: Provide a checklist of testable, objective criteria.
+      placeholder: |
+        - [ ]
+        - [ ]
+        - [ ]
+    validations:
+      required: true
+
+  - type: textarea
+    id: files_likely_touched
+    attributes:
+      label: Files Likely Touched
+      description: List expected files or directories.
+      placeholder: |
+        - path/to/file
+        - path/to/dir/
+    validations:
+      required: true
+
+  - type: textarea
+    id: definition_of_done
+    attributes:
+      label: Definition of Done
+      description: Define the completion checklist.
+      placeholder: |
+        - [ ] Implementation complete
+        - [ ] Tests pass
+        - [ ] Documentation updated (if needed)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: size
+    attributes:
+      label: Size (S/M/L only)
+      description: Select one size.
+      options:
+        - S
+        - M
+        - L
+    validations:
+      required: true
+`;

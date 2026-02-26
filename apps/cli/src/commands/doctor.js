@@ -1,90 +1,14 @@
 import process from "node:process";
 
+import {
+  DOCTOR_USER_AGENT,
+  GITHUB_API_BASE,
+  GITHUB_API_VERSION,
+  REQUIRED_TEMPLATE_CONTENT,
+  REQUIRED_TEMPLATE_PATH,
+  SAFE_TEMPLATE_FIX_BRANCH,
+} from "../constants/doctor.js";
 import { loadAgentSwarmConfig } from "../config.js";
-
-const GITHUB_API_BASE = "https://api.github.com";
-const REQUIRED_TEMPLATE_PATH = ".github/ISSUE_TEMPLATE/milestone-task.yml";
-const REQUIRED_TEMPLATE_CONTENT = `name: Milestone Task
-description: Create a concrete, testable milestone task with explicit scope and outcomes.
-title: "[TASK] "
-labels:
-  - infrastructure
-body:
-  - type: markdown
-    attributes:
-      value: |
-        Use this template for milestone-scoped tasks only.
-
-        Vague tasks are not allowed.
-        Every task must be testable, include clear success criteria, and avoid ambiguous wording.
-
-  - type: textarea
-    id: goal
-    attributes:
-      label: Goal
-      description: State one concrete outcome.
-      placeholder: Describe the exact result this task must produce.
-    validations:
-      required: true
-
-  - type: textarea
-    id: non_goals
-    attributes:
-      label: Non-goals
-      description: Explicitly list what is out of scope.
-      placeholder: |
-        - Not included:
-        - Not included:
-    validations:
-      required: true
-
-  - type: textarea
-    id: acceptance_criteria
-    attributes:
-      label: Acceptance Criteria
-      description: Provide a checklist of testable, objective criteria.
-      placeholder: |
-        - [ ]
-        - [ ]
-        - [ ]
-    validations:
-      required: true
-
-  - type: textarea
-    id: files_likely_touched
-    attributes:
-      label: Files Likely Touched
-      description: List expected files or directories.
-      placeholder: |
-        - path/to/file
-        - path/to/dir/
-    validations:
-      required: true
-
-  - type: textarea
-    id: definition_of_done
-    attributes:
-      label: Definition of Done
-      description: Define the completion checklist.
-      placeholder: |
-        - [ ] Implementation complete
-        - [ ] Tests pass
-        - [ ] Documentation updated (if needed)
-    validations:
-      required: true
-
-  - type: dropdown
-    id: size
-    attributes:
-      label: Size (S/M/L only)
-      description: Select one size.
-      options:
-        - S
-        - M
-        - L
-    validations:
-      required: true
-`;
 
 function green(text) {
   return `\u001b[32m${text}\u001b[0m`;
@@ -94,11 +18,44 @@ function red(text) {
   return `\u001b[31m${text}\u001b[0m`;
 }
 
+function success(title, { detail, extra } = {}) {
+  return {
+    ok: true,
+    title,
+    ...(detail ? { detail } : {}),
+    ...(extra ?? {}),
+  };
+}
+
+function failure(title, remediation) {
+  return {
+    ok: false,
+    title,
+    remediation,
+  };
+}
+
+function blocked(title, remediation) {
+  return failure(`${title} could not be verified`, remediation);
+}
+
 function encodeContentPath(path) {
   return path
     .split("/")
     .map((part) => encodeURIComponent(part))
     .join("/");
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function buildCurlCommand({ tokenEnvName, apiPath }) {
+  return `curl -i -H "Authorization: Bearer $${tokenEnvName}" "${GITHUB_API_BASE}${apiPath}"`;
+}
+
+function formatRemediationScript(lines) {
+  return ["Run:", ...lines].join("\n");
 }
 
 async function githubJsonRequest({ path, token, method = "GET", body }) {
@@ -107,8 +64,8 @@ async function githubJsonRequest({ path, token, method = "GET", body }) {
     headers: {
       Accept: "application/vnd.github+json",
       Authorization: `Bearer ${token}`,
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "agent-swarm-cli/0.1.0",
+      "X-GitHub-Api-Version": GITHUB_API_VERSION,
+      "User-Agent": DOCTOR_USER_AGENT,
       ...(body ? { "Content-Type": "application/json" } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
@@ -128,26 +85,44 @@ async function githubJsonRequest({ path, token, method = "GET", body }) {
 }
 
 function templateRemediation(owner, repo) {
-  return [
-    `gh repo clone ${owner}/${repo} /tmp/${repo}`,
-    `cd /tmp/${repo}`,
-    "mkdir -p .github/ISSUE_TEMPLATE",
-    "cat > .github/ISSUE_TEMPLATE/milestone-task.yml <<'YAML'",
+  const repoSlug = `${owner}/${repo}`;
+
+  return formatRemediationScript([
+    "bash <<'BASH'",
+    "set -euo pipefail",
+    `REPO_SLUG=${shellQuote(repoSlug)}`,
+    `TEMPLATE_PATH=${shellQuote(REQUIRED_TEMPLATE_PATH)}`,
+    `BRANCH_NAME=${shellQuote(SAFE_TEMPLATE_FIX_BRANCH)}`,
+    "command -v gh >/dev/null",
+    "gh auth status >/dev/null",
+    "WORKDIR=$(mktemp -d -t agent-swarm-template-XXXXXX)",
+    "trap 'rm -rf \"$WORKDIR\"' EXIT",
+    "gh repo clone \"$REPO_SLUG\" \"$WORKDIR/repo\"",
+    "cd \"$WORKDIR/repo\"",
+    "git switch -c \"$BRANCH_NAME\"",
+    "mkdir -p \"$(dirname \"$TEMPLATE_PATH\")\"",
+    "if [ -f \"$TEMPLATE_PATH\" ]; then",
+    "  echo \"Template already exists at $TEMPLATE_PATH; refusing to overwrite.\" >&2",
+    "  exit 1",
+    "fi",
+    "cat > \"$TEMPLATE_PATH\" <<'YAML'",
     REQUIRED_TEMPLATE_CONTENT.trimEnd(),
     "YAML",
-    'git add .github/ISSUE_TEMPLATE/milestone-task.yml && git commit -m "Add required milestone task template"',
-    "git push",
-  ].join("\n");
+    "git add \"$TEMPLATE_PATH\"",
+    "git commit -m \"Add required milestone task template\"",
+    "git push --set-upstream origin \"$BRANCH_NAME\"",
+    "echo \"Open a PR from $BRANCH_NAME for human approval before merge.\"",
+    "BASH",
+  ]);
 }
 
 async function checkToken({ tokenEnvName }) {
   const token = process.env[tokenEnvName];
   if (!token || token.trim().length === 0) {
-    return {
-      ok: false,
-      title: `GitHub token is missing in ${tokenEnvName}`,
-      remediation: `Run: export ${tokenEnvName}=<your_github_pat_with_repo_and_project_access>`,
-    };
+    return failure(
+      `GitHub token is missing in ${tokenEnvName}`,
+      `Run: export ${tokenEnvName}=<your_github_pat_with_repo_and_project_access>`,
+    );
   }
 
   const { response, data } = await githubJsonRequest({
@@ -156,19 +131,17 @@ async function checkToken({ tokenEnvName }) {
   });
 
   if (response.status === 401) {
-    return {
-      ok: false,
-      title: `${tokenEnvName} is invalid or unauthenticated`,
-      remediation: `Run: gh auth login --scopes "repo,project" && export ${tokenEnvName}=$(gh auth token)`,
-    };
+    return failure(
+      `${tokenEnvName} is invalid or unauthenticated`,
+      `Run: gh auth login --scopes \"repo,project\" && export ${tokenEnvName}=$(gh auth token)`,
+    );
   }
 
   if (!response.ok) {
-    return {
-      ok: false,
-      title: `Failed to verify ${tokenEnvName} authentication (status ${response.status})`,
-      remediation: `Run: curl -i -H "Authorization: Bearer $${tokenEnvName}" https://api.github.com/user`,
-    };
+    return failure(
+      `Failed to verify ${tokenEnvName} authentication (status ${response.status})`,
+      `Run: ${buildCurlCommand({ tokenEnvName, apiPath: "/user" })}`,
+    );
   }
 
   const scopesHeader = response.headers.get("x-oauth-scopes") ?? "";
@@ -178,20 +151,16 @@ async function checkToken({ tokenEnvName }) {
     .filter(Boolean);
 
   if (scopes.length === 0) {
-    return {
-      ok: false,
-      title: `${tokenEnvName} has no active OAuth scopes`,
-      remediation:
-        `Regenerate token with scopes and export it: gh auth login --scopes "repo,project" && export ${tokenEnvName}=$(gh auth token)`,
-    };
+    return failure(
+      `${tokenEnvName} has no active OAuth scopes`,
+      `Run: gh auth login --scopes \"repo,project\" && export ${tokenEnvName}=$(gh auth token)`,
+    );
   }
 
-  return {
-    ok: true,
-    title: "GITHUB_TOKEN is set and has active scopes",
+  return success(`${tokenEnvName} is set and has active scopes`, {
     detail: `as ${data?.login ?? "unknown-user"} with scopes: ${scopes.join(", ")}`,
-    token,
-  };
+    extra: { token },
+  });
 }
 
 async function checkRepoConnection({ owner, repo, token, tokenEnvName }) {
@@ -202,68 +171,54 @@ async function checkRepoConnection({ owner, repo, token, tokenEnvName }) {
   });
 
   if (response.status === 404) {
-    return {
-      ok: false,
-      title: `Target repo ${owner}/${repo} is not reachable (404)`,
-      remediation: `Fix ${owner}/${repo} in .agent-swarm.yml and verify with: curl -H "Authorization: Bearer $${tokenEnvName}" https://api.github.com/repos/${owner}/${repo}`,
-    };
+    return failure(
+      `Target repo ${owner}/${repo} is not reachable (404)`,
+      `Run: ${buildCurlCommand({ tokenEnvName, apiPath: repoPath })}`,
+    );
   }
 
   if (!response.ok) {
-    return {
-      ok: false,
-      title: `Failed to verify repo access for ${owner}/${repo} (status ${response.status})`,
-      remediation: `Run: curl -i -H "Authorization: Bearer $${tokenEnvName}" https://api.github.com/repos/${owner}/${repo}`,
-    };
+    return failure(
+      `Failed to verify repo access for ${owner}/${repo} (status ${response.status})`,
+      `Run: ${buildCurlCommand({ tokenEnvName, apiPath: repoPath })}`,
+    );
   }
 
   const permissions = data?.permissions && typeof data.permissions === "object" ? data.permissions : {};
   const hasWrite = Boolean(permissions.admin || permissions.maintain || permissions.push);
 
   if (!hasWrite) {
-    return {
-      ok: false,
-      title: `Read/write access to ${owner}/${repo} is missing`,
-      remediation:
-        `Grant this token write access to ${owner}/${repo} (Write/Maintain/Admin), then verify with: ` +
-        `curl -H "Authorization: Bearer $${tokenEnvName}" https://api.github.com/repos/${owner}/${repo}`,
-    };
+    return failure(
+      `Read/write access to ${owner}/${repo} is missing`,
+      `Grant this token write access to ${owner}/${repo} (Write/Maintain/Admin), then verify with: ${buildCurlCommand({ tokenEnvName, apiPath: repoPath })}`,
+    );
   }
 
-  return {
-    ok: true,
-    title: `Read/write access to ${owner}/${repo}`,
+  return success(`Read/write access to ${owner}/${repo}`, {
     detail: "repository read and write permissions confirmed",
-  };
+  });
 }
 
 async function checkTemplateExists({ owner, repo, token, tokenEnvName }) {
   const encodedTemplatePath = encodeContentPath(REQUIRED_TEMPLATE_PATH);
+  const apiPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodedTemplatePath}`;
   const { response } = await githubJsonRequest({
-    path: `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodedTemplatePath}`,
+    path: apiPath,
     token,
   });
 
   if (response.status === 404) {
-    return {
-      ok: false,
-      title: `Required issue template is missing (${REQUIRED_TEMPLATE_PATH})`,
-      remediation: templateRemediation(owner, repo),
-    };
+    return failure(`Required issue template is missing (${REQUIRED_TEMPLATE_PATH})`, templateRemediation(owner, repo));
   }
 
   if (!response.ok) {
-    return {
-      ok: false,
-      title: `Failed to verify required issue template (${REQUIRED_TEMPLATE_PATH})`,
-      remediation: `Run: curl -i -H "Authorization: Bearer $${tokenEnvName}" https://api.github.com/repos/${owner}/${repo}/contents/${encodedTemplatePath}`,
-    };
+    return failure(
+      `Failed to verify required issue template (${REQUIRED_TEMPLATE_PATH})`,
+      `Run: ${buildCurlCommand({ tokenEnvName, apiPath })}`,
+    );
   }
 
-  return {
-    ok: true,
-    title: `Required issue template exists (${REQUIRED_TEMPLATE_PATH})`,
-  };
+  return success(`Required issue template exists (${REQUIRED_TEMPLATE_PATH})`);
 }
 
 function printResult(result) {
@@ -272,6 +227,7 @@ function printResult(result) {
     process.stdout.write(`${green("✔")} ${result.title}${suffix}\n`);
     return;
   }
+
   process.stderr.write(`${red("X")} ${result.title}\n`);
   process.stderr.write(`  Remediation:\n${result.remediation}\n`);
 }
@@ -298,44 +254,40 @@ export function registerDoctorCommand(program) {
         `Running doctor checks for ${config.target.owner}/${config.target.repo} (Project V2 #${config.target.projectV2Number})\n`,
       );
 
+      const checks = [];
+
       const tokenCheck = await checkToken({ tokenEnvName: config.auth.githubTokenEnv });
-      printResult(tokenCheck);
+      checks.push(tokenCheck);
 
-      let repoCheck;
-      if (tokenCheck.ok) {
-        repoCheck = await checkRepoConnection({
-          owner: config.target.owner,
-          repo: config.target.repo,
-          token: tokenCheck.token,
-          tokenEnvName: config.auth.githubTokenEnv,
-        });
-      } else {
-        repoCheck = {
-          ok: false,
-          title: `Read/write access to ${config.target.owner}/${config.target.repo} could not be verified`,
-          remediation: `Fix check 1 first, then rerun: export ${config.auth.githubTokenEnv}=<your_github_pat_with_repo_and_project_access>`,
-        };
+      const repoCheck = tokenCheck.ok
+        ? await checkRepoConnection({
+            owner: config.target.owner,
+            repo: config.target.repo,
+            token: tokenCheck.token,
+            tokenEnvName: config.auth.githubTokenEnv,
+          })
+        : blocked(
+            `Read/write access to ${config.target.owner}/${config.target.repo}`,
+            `Fix check 1 first, then rerun: export ${config.auth.githubTokenEnv}=<your_github_pat_with_repo_and_project_access>`,
+          );
+      checks.push(repoCheck);
+
+      const templateCheck = tokenCheck.ok && repoCheck.ok
+        ? await checkTemplateExists({
+            owner: config.target.owner,
+            repo: config.target.repo,
+            token: tokenCheck.token,
+            tokenEnvName: config.auth.githubTokenEnv,
+          })
+        : blocked(
+            `Required issue template (${REQUIRED_TEMPLATE_PATH})`,
+            "Fix checks 1 and 2 first, then rerun: pnpm doctor",
+          );
+      checks.push(templateCheck);
+
+      for (const check of checks) {
+        printResult(check);
       }
-      printResult(repoCheck);
-
-      let templateCheck;
-      if (tokenCheck.ok && repoCheck.ok) {
-        templateCheck = await checkTemplateExists({
-          owner: config.target.owner,
-          repo: config.target.repo,
-          token: tokenCheck.token,
-          tokenEnvName: config.auth.githubTokenEnv,
-        });
-      } else {
-        templateCheck = {
-          ok: false,
-          title: `Required issue template could not be verified (${REQUIRED_TEMPLATE_PATH})`,
-          remediation: `Fix checks 1 and 2 first, then rerun: node apps/cli/src/index.js doctor`,
-        };
-      }
-      printResult(templateCheck);
-
-      const checks = [tokenCheck, repoCheck, templateCheck];
 
       const failures = checks.filter((check) => !check.ok).length;
       if (failures > 0) {
