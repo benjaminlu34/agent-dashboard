@@ -72,6 +72,13 @@ In dry-run mode, runner:
 
 In kickoff dry-run mode, runner may still spawn Codex MCP to generate the kickoff JSON plan, but must not apply it (no `plan-apply` or status updates).
 
+## Dependency graph sanitization and promotion
+
+Runner applies dependency-graph sanitization before Ready-buffer promotion decisions (autopromote and kickoff fallback):
+- Dependencies without `owns_paths` overlap are pruned.
+- Dependencies from non-doc tasks to doc-only tasks are pruned.
+- Cycles trigger bounded regeneration attempts; remaining cycles produce a regeneration request file at `{ORCHESTRATOR_STATE_PATH}.regen-request.json` and exit with code `6` (handoff) or `5` (regen exhausted).
+
 ## Ledger semantics
 
 Ledger is a JSON file keyed by `run_id`:

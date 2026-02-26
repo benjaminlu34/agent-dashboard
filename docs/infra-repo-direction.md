@@ -45,12 +45,8 @@ For infra-repo operation, validate the issue template against the **target repo 
 - Local infra file validation is insufficient once infra and target repos are different.
 - Optional/disabled template validation is unsafe and violates fail-closed governance.
 
-## Minimal Safe Step Implemented in Phase 3
-- No backend endpoint changes were introduced.
-- Orchestrator loop remains policy-gated through `/internal/preflight`.
-- Target identity now supports deterministic env overrides (`TARGET_*`) with policy fallback.
-- Preflight template validation reads target repo template metadata from GitHub and fails closed on missing/transient-exhausted conditions.
-
-## Deferred Work
-- Add a target-repo template reader to preflight (GitHub Contents API), defaulting to current local mode for backward compatibility.
-- Add explicit `target_repository` contract in project identity/policy for multi-target runs.
+## Current Implementation
+- Orchestrator loop is policy-gated through `/internal/preflight`.
+- Target identity supports deterministic env overrides (`TARGET_*`) with policy fallback.
+- Preflight reads the target repo issue template metadata from GitHub and fails closed on missing or invalid template data.
+- Preflight compares the live project schema to `policy/project-schema.json` and fails closed on mismatches.

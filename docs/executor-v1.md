@@ -24,6 +24,7 @@ This runbook defines a minimal Executor v1 workflow for one issue at a time.
 - Status transitions only through backend `POST /internal/project-item/update-field`.
 - Fail closed on ambiguity.
 - Executor never merges PRs and never closes issues.
+- Claim leases expire after `EXECUTOR_CLAIM_TTL_MINUTES` minutes (default `15`); expired claim markers are ignored to prevent deadlocks.
 
 ## Procedure
 

@@ -11,6 +11,7 @@ Current maturity is **alpha (local/internal)**, not deploy-complete production a
 What exists now:
 - Policy-gated internal API (`apps/api`) with preflight, planner/apply, executor claim, reviewer PR resolution, and status update endpoints.
 - Orchestrator CLI (`apps/orchestrator`) that emits deterministic JSON run intents for worker roles.
+- Python runner (`apps/runner`) that consumes orchestrator JSONL intents, executes Codex MCP workers, handles kickoff planning, maintains a run ledger, and manages resiliency loops (review stalls, blocked retries, watchdogs).
 - Target-repo identity overrides via env (`TARGET_*`) with fail-closed validation.
 - Preflight template validation against the **target repo on GitHub**.
 - Test suite for policy, linkage, preflight, orchestrator loop behavior.
@@ -29,6 +30,7 @@ What still needs to be done for deploy-grade alpha:
 - `policy/*.json`: machine-readable policy (project schema, transitions, permissions, target identity fallback).
 - `apps/api`: Fastify internal control-plane API.
 - `apps/orchestrator`: scheduler/dispatcher CLI that emits JSON run intents.
+- `apps/runner`: Python runner that executes run intents and automates promotion/review handling.
 - `apps/web`: scaffold only (not active runtime).
 - `docs/`: design, runbooks, and orchestration docs.
 
@@ -36,8 +38,10 @@ What still needs to be done for deploy-grade alpha:
 
 - Node.js `>=18` (repo uses ESM).
 - `pnpm`.
+- Python `3.12+` (runner).
 - GitHub token with permissions to read/write the configured target project/repo as required by routes.
   - Set one of: `GITHUB_PAT` or `GITHUB_TOKEN`.
+- Codex CLI with MCP servers `github` and `github_projects` enabled (runner).
 
 ## Quick Start
 
@@ -82,6 +86,16 @@ pnpm orchestrator
 node apps/orchestrator/src/cli.js --loop
 ```
 
+8. Run runner once (executes orchestrator intents and workers):
+```bash
+pnpm runner
+```
+
+9. Dry-run runner (no backend write endpoints, no worker execution):
+```bash
+pnpm runner:dry
+```
+
 ## Orchestrator Runtime Config
 
 Required:
@@ -89,11 +103,14 @@ Required:
 
 Optional:
 - `ORCHESTRATOR_BACKEND_BASE_URL` (default `http://localhost:4000`)
+- `ORCHESTRATOR_REPO_ROOT` (default repo root)
 - `ORCHESTRATOR_MAX_EXECUTORS` (default `1`)
 - `ORCHESTRATOR_MAX_REVIEWERS` (default `1`)
 - `ORCHESTRATOR_POLL_INTERVAL_MS` (default `15000`)
 - `ORCHESTRATOR_STALL_MINUTES` (default `120`)
 - `ORCHESTRATOR_REVIEW_CHURN_POLLS` (default `3`)
+- `ORCHESTRATOR_REVIEWER_RETRY_POLLS` (default `20`)
+- `ORCHESTRATOR_MAX_REVIEWER_DISPATCHES_PER_STATUS` (default `2`)
 - `ORCHESTRATOR_STATE_PATH` (default `./.orchestrator-state.json`)
 - `ORCHESTRATOR_ITEMS_FILE` (fixture JSON for local testing)
 
@@ -102,6 +119,31 @@ Exit codes:
 - `2`: preflight/identity/validation hard stop
 - `3`: malformed sprint-scoped item data
 - `4`: transient preflight/template retries exhausted
+
+## Runner Runtime Config
+
+Required:
+- `ORCHESTRATOR_SPRINT` (or pass `--sprint`)
+
+Optional:
+- `BACKEND_BASE_URL` (default `http://localhost:4000`)
+- `BACKEND_TIMEOUT_S` (default `120`)
+- `RUNNER_MAX_EXECUTORS` (default `3`)
+- `RUNNER_MAX_REVIEWERS` (default `2`)
+- `RUNNER_READY_BUFFER` (default `2`)
+- `REVIEW_STALL_POLLS` (default `50`)
+- `BLOCKED_RETRY_MINUTES` (default `15`)
+- `RUNNER_WATCHDOG_TIMEOUT_S` (default `900`)
+- `RUNNER_DRY_RUN` (default `false`)
+- `RUNNER_LEDGER_PATH` (default `./.runner-ledger.json`)
+- `RUNNER_SPRINT_PLAN_PATH` (default `./.runner-sprint-plan.json`)
+- `RUNNER_AUTOPROMOTE` (default `true`)
+- `ORCHESTRATOR_STATE_PATH` (default `./.orchestrator-state.json`)
+- `RUNNER_ORCHESTRATOR_CMD` (default `node apps/orchestrator/src/cli.js --loop`)
+- `CODEX_BIN` (default `codex`)
+- `CODEX_MCP_ARGS` (default `mcp-server`)
+- `CODEX_TOOLS_CALL_TIMEOUT_S` (default `1800`)
+- `ORCHESTRATOR_SANITIZATION_REGEN_ATTEMPTS` (default `2`)
 
 ## API Endpoints (Internal)
 
@@ -118,6 +160,8 @@ Exit codes:
 - Run API: `pnpm dev`
 - Run tests: `pnpm test`
 - Run orchestrator once: `pnpm orchestrator`
+- Run runner once: `pnpm runner`
+- Run runner dry-run: `pnpm runner:dry`
 
 ## Notes on Identity Resolution
 
@@ -132,3 +176,5 @@ Target identity precedence is deterministic:
 - `docs/executor-v1.md`
 - `docs/reviewer-v1-runbook.md`
 - `docs/agent-orchestrator.md`
+- `docs/runner-contract.md`
+- `apps/runner/README.md`

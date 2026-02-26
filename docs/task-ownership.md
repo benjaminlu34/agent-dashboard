@@ -4,6 +4,8 @@ Concurrent executors are valuable, but they also amplify merge conflicts when tw
 This project adds deterministic "ownership" metadata to sprint issues so the orchestration layer can prevent
 conflicting work from being in `Ready` at the same time.
 
+Runner autopromotion uses this metadata to maintain the Ready buffer when enabled.
+
 ## Metadata
 
 Each sprint task issue includes a `## Scope` section with:
@@ -29,6 +31,13 @@ Backlog -> Ready promotion is gated:
 - `CHAINED`: can be promoted only if all `depends_on` issues have reached `Done`.
   Overlaps with `Ready`/`In Progress`/`In Review` issues remain blocked; overlaps with prerequisites already in
   `Done` are allowed.
+
+## Dependency Sanitization
+
+- `depends_on` edges are pruned when the tasks do not overlap on `owns_paths` (prefix-based).
+- `depends_on` edges from non-doc tasks to doc-only tasks are pruned.
+- Doc-only tasks are tasks whose `touch_paths` stay within documentation paths or doc-only file extensions (`.md`, `.txt`, `.rst`).
+- Cycles are invalid and must be resolved before promotion can proceed.
 
 ## Scope Expansion
 

@@ -25,7 +25,7 @@ The orchestrator must assemble a fixed context bundle before execution:
 ## 6. Mandatory preflight checks
 Execution must not start until both checks pass:
 - Issue template exists and is unchanged:
-  - Required path: `.github/ISSUE_TEMPLATE/milestone-task.yml`.
+  - Required path: `.github/ISSUE_TEMPLATE/milestone-task.yml` in the resolved target repo/ref.
   - Missing file or contract drift is a hard stop.
 - Project schema matches `policy/project-schema.json`:
   - Required project and required field options must match exactly.
