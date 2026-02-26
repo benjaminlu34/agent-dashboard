@@ -37,6 +37,30 @@ function withErrorCode(error, code) {
   return error;
 }
 
+function isLikelyNetworkFetchError(error) {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const message = typeof error.message === "string" ? error.message.toLowerCase() : "";
+  if (message.includes("fetch failed") || message.includes("network")) {
+    return true;
+  }
+  const causeCode = typeof error.cause?.code === "string" ? error.cause.code : "";
+  return [
+    "ECONNRESET",
+    "ECONNREFUSED",
+    "ENOTFOUND",
+    "EAI_AGAIN",
+    "ETIMEDOUT",
+    "UND_ERR_CONNECT_TIMEOUT",
+  ].includes(causeCode);
+}
+
+function toTransientNetworkError(error, prefix) {
+  const detail = error instanceof Error ? error.message : String(error);
+  return withErrorCode(new Error(`${prefix}: ${detail}`), "transient_network_error");
+}
+
 function parsePositiveIntEnv(name, fallback, env) {
   const rawValue = env[name];
   if (!hasNonEmptyString(rawValue)) {
@@ -206,6 +230,14 @@ export function mergeRunnerManagedStateFields({ nextState, diskState }) {
       merged.last_executor_response_at = nextExecutorResponseAt;
     }
 
+    const nextInReviewOrigin = hasNonEmptyString(nextItem.in_review_origin) ? String(nextItem.in_review_origin).trim() : "";
+    const diskInReviewOrigin = hasNonEmptyString(diskItem.in_review_origin) ? String(diskItem.in_review_origin).trim() : "";
+    if (nextItem.last_seen_status === "In Review") {
+      merged.in_review_origin = nextInReviewOrigin || diskInReviewOrigin;
+    } else {
+      merged.in_review_origin = "";
+    }
+
     mergedItems[projectItemId] = merged;
   }
 
@@ -218,7 +250,15 @@ export function mergeRunnerManagedStateFields({ nextState, diskState }) {
 }
 
 async function runPreflight({ backendBaseUrl }) {
-  const response = await fetch(`${backendBaseUrl}/internal/preflight?role=ORCHESTRATOR`);
+  let response;
+  try {
+    response = await fetch(`${backendBaseUrl}/internal/preflight?role=ORCHESTRATOR`);
+  } catch (error) {
+    if (isLikelyNetworkFetchError(error)) {
+      throw toTransientNetworkError(error, "preflight network request failed");
+    }
+    throw error;
+  }
   let payload = null;
   try {
     payload = await response.json();
@@ -267,7 +307,14 @@ async function readProjectItems({ githubClient, env }) {
     throw withErrorCode(new Error("github client is required when ORCHESTRATOR_ITEMS_FILE is not set"), "validation_failed");
   }
 
-  return await githubClient.listProjectItems();
+  try {
+    return await githubClient.listProjectItems();
+  } catch (error) {
+    if (isLikelyNetworkFetchError(error)) {
+      throw toTransientNetworkError(error, "listProjectItems network request failed");
+    }
+    throw error;
+  }
 }
 
 async function readStateFile(statePath) {
@@ -439,7 +486,7 @@ async function runCycle({
 }
 
 function resolveExitCode(error) {
-  if (error?.code === "transient_retries_exhausted") {
+  if (error?.code === "transient_retries_exhausted" || error?.code === "transient_network_error") {
     return 4;
   }
   if (error?.code === "malformed_item_data") {
@@ -468,17 +515,34 @@ export async function runOrchestratorCli({
 
   do {
     const currentState = await readStateFile(statePath);
-    const cycleResult = await runCycle({
-      repoRoot,
-      backendBaseUrl,
-      maxExecutors,
-      maxReviewers,
-      sprint,
-      stallMinutes,
-      reviewChurnPolls,
-      previousState: currentState,
-      env,
-    });
+    let cycleResult;
+    try {
+      cycleResult = await runCycle({
+        repoRoot,
+        backendBaseUrl,
+        maxExecutors,
+        maxReviewers,
+        sprint,
+        stallMinutes,
+        reviewChurnPolls,
+        previousState: currentState,
+        env,
+      });
+    } catch (error) {
+      if (runMode === "loop" && (error?.code === "transient_network_error" || error?.code === "transient_retries_exhausted")) {
+        process.stderr.write(
+          `${JSON.stringify({
+            type: "ORCHESTRATOR_CYCLE_TRANSIENT_ERROR",
+            code: error?.code ?? "",
+            error: error instanceof Error ? error.message : String(error),
+            retry_in_ms: pollIntervalMs,
+          })}\n`,
+        );
+        await sleep(pollIntervalMs);
+        continue;
+      }
+      throw error;
+    }
 
     const latestState = await readStateFile(statePath);
     const mergedState = mergeRunnerManagedStateFields({

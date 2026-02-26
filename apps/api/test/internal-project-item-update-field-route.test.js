@@ -23,6 +23,7 @@ async function writeBundleFiles(repoRoot) {
   await mkdir(join(repoRoot, "policy"), { recursive: true });
   await writeFile(join(repoRoot, "AGENTS.md"), "root governance\n", "utf8");
   await writeFile(join(repoRoot, "agents/ORCHESTRATOR.md"), "orchestrator overlay\n", "utf8");
+  await writeFile(join(repoRoot, "agents/HUMAN.md"), "human overlay\n", "utf8");
   await writeFile(
     join(repoRoot, "policy/github-project.json"),
     '{"owner_login":"benjaminlu34","owner_type":"user","project_name":"Codex Task Board","repository_name":"agent-dashboard"}\n',
@@ -59,8 +60,15 @@ async function writeBundleFiles(repoRoot) {
           { from: "Backlog", to: "Ready", allowed_roles: ["Orchestrator"] },
           { from: "Ready", to: "In Progress", allowed_roles: ["Executor"] },
           { from: "In Progress", to: "Blocked", allowed_roles: ["Orchestrator"] },
+          { from: "In Review", to: "Blocked", allowed_roles: ["Orchestrator", "Executor"] },
           { from: "Blocked", to: "Ready", allowed_roles: ["Orchestrator"] },
           { from: "In Review", to: "Needs Human Approval", allowed_roles: ["Orchestrator"] },
+          {
+            from: "Needs Human Approval",
+            to: "In Review",
+            allowed_roles: ["Human"],
+            automation_allowed: false,
+          },
         ],
       },
       null,
@@ -75,6 +83,7 @@ async function writeBundleFiles(repoRoot) {
         Orchestrator: { can_set_project_fields: true, can_update_status_only: false },
         Executor: { can_set_project_fields: false, can_update_status_only: true },
         Reviewer: { can_set_project_fields: false, can_update_status_only: true },
+        Human: { can_set_project_fields: false, can_update_status_only: true },
       },
       null,
       2,
@@ -308,6 +317,69 @@ test("POST /internal/project-item/update-field requires handoff metadata and wri
   await app.close();
 });
 
+test("POST /internal/project-item/update-field requires metadata and writes issue comment for human rework handoff", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "project-item-update-human-rework-"));
+  await writeBundleFiles(repoRoot);
+
+  const commentCalls = [];
+  const app = await buildTestApp({
+    repoRoot,
+    preflightHandler: buildPreflightPass(),
+    githubClientFactory: async () => ({
+      async getProjectItemFieldValue() {
+        return "Needs Human Approval";
+      },
+      async updateProjectItemField() {},
+      async createIssueComment(payload) {
+        commentCalls.push(payload);
+        return {
+          id: 1000,
+          html_url: "https://github.com/benjaminlu34/agent-dashboard/issues/777#issuecomment-1000",
+        };
+      },
+    }),
+  });
+
+  const missingMetadata = await app.inject({
+    method: "POST",
+    url: "/internal/project-item/update-field",
+    payload: {
+      role: "HUMAN",
+      project_item_id: "PVTI_test_777",
+      field: "Status",
+      value: "In Review",
+      issue_number: 777,
+    },
+  });
+  assert.equal(missingMetadata.statusCode, 400);
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/internal/project-item/update-field",
+    payload: {
+      role: "HUMAN",
+      project_item_id: "PVTI_test_777",
+      field: "Status",
+      value: "In Review",
+      issue_number: 777,
+      human_rework_reason: "Please address reviewer findings before merge.",
+      requested_actions: ["Fix failing acceptance criteria item R2", "Push updates to existing PR branch"],
+      run_id: "abcdabcd-abcd-4bcd-8bcd-abcdabcdabcd",
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  const payload = response.json();
+  assert.equal(payload.updated.Status, "In Review");
+  assert.equal(payload.rework_comment.id, 1000);
+  assert.equal(commentCalls.length, 1);
+  assert.equal(commentCalls[0].issueNumber, 777);
+  assert.match(commentCalls[0].body, /Human rework request: Needs Human Approval -> In Review/);
+  assert.match(commentCalls[0].body, /HUMAN_REWORK_REQUEST_V1/);
+  assert.match(commentCalls[0].body, /requested_by_role: HUMAN/);
+  await app.close();
+});
+
 test("POST /internal/project-item/update-field requires failure metadata and writes issue comment for executor failure handoff", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "project-item-update-executor-blocked-"));
   await writeBundleFiles(repoRoot);
@@ -367,6 +439,66 @@ test("POST /internal/project-item/update-field requires failure metadata and wri
   assert.equal(commentCalls[0].issueNumber, 321);
   assert.match(commentCalls[0].body, /Executor failure handoff: Blocked/);
   assert.match(commentCalls[0].body, /Failure classification: ITEM_STOP/);
+  await app.close();
+});
+
+test("POST /internal/project-item/update-field requires failure metadata for In Review to Blocked and writes issue comment", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "project-item-update-review-failure-blocked-"));
+  await writeBundleFiles(repoRoot);
+
+  const commentCalls = [];
+  const app = await buildTestApp({
+    repoRoot,
+    preflightHandler: buildPreflightPass(),
+    githubClientFactory: async () => ({
+      async getProjectItemFieldValue() {
+        return "In Review";
+      },
+      async updateProjectItemField() {},
+      async createIssueComment(payload) {
+        commentCalls.push(payload);
+        return {
+          id: 1003,
+          html_url: "https://github.com/benjaminlu34/agent-dashboard/issues/654#issuecomment-1003",
+        };
+      },
+    }),
+  });
+
+  const missingMetadata = await app.inject({
+    method: "POST",
+    url: "/internal/project-item/update-field",
+    payload: {
+      role: "ORCHESTRATOR",
+      project_item_id: "PVTI_test_654",
+      field: "Status",
+      value: "Blocked",
+    },
+  });
+  assert.equal(missingMetadata.statusCode, 400);
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/internal/project-item/update-field",
+    payload: {
+      role: "ORCHESTRATOR",
+      project_item_id: "PVTI_test_654",
+      field: "Status",
+      value: "Blocked",
+      issue_number: 654,
+      failure_classification: "ITEM_STOP",
+      failure_message: "executor fixup failed in review loop",
+      suggested_next_steps: ["Address R1 on existing PR branch", "Move status back to In Review once resolved"],
+      run_id: "44444444-4444-4444-8444-444444444444",
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  const payload = response.json();
+  assert.equal(payload.updated.Status, "Blocked");
+  assert.equal(payload.failure_comment.id, 1003);
+  assert.equal(commentCalls.length, 1);
+  assert.match(commentCalls[0].body, /Failure stage: In Review -> Blocked/);
   await app.close();
 });
 

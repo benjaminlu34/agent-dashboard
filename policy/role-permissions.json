@@ -24,5 +24,12 @@
     "can_close_issues": false,
     "can_comment_on_pr": true,
     "can_request_changes": true
+  },
+  "Human": {
+    "can_update_status_only": true,
+    "can_write_code": false,
+    "can_open_pr": false,
+    "can_merge": true,
+    "can_close_issues": true
   }
 }

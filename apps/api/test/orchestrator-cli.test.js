@@ -203,6 +203,24 @@ test("orchestrator CLI exits 4 when preflight reports transient template retries
   assert.match(result.stderr, /preflight failed for ORCHESTRATOR/);
 });
 
+test("orchestrator CLI exits 4 when backend is unreachable (fetch transient)", async () => {
+  const result = await runNodeProcess({
+    args: ["apps/orchestrator/src/cli.js", "--once"],
+    env: {
+      ...process.env,
+      ORCHESTRATOR_SPRINT: "M1",
+      ORCHESTRATOR_BACKEND_BASE_URL: "http://127.0.0.1:1",
+      TARGET_OWNER_LOGIN: "o",
+      TARGET_OWNER_TYPE: "user",
+      TARGET_REPO_NAME: "r",
+      TARGET_PROJECT_NAME: "Codex Task Board",
+    },
+  });
+
+  assert.equal(result.code, 4);
+  assert.match(result.stderr, /network request failed|fetch failed/i);
+});
+
 test("orchestrator CLI prints end-of-sprint summary and exits 0 when sprint is complete", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "orchestrator-cli-complete-"));
   const statePath = join(tempDir, "state.json");
@@ -252,6 +270,7 @@ test("mergeRunnerManagedStateFields preserves newer runner feedback in same stat
         last_reviewer_outcome: "",
         last_reviewer_feedback_at: "",
         last_executor_response_at: "",
+        in_review_origin: "",
       },
     },
   };
@@ -265,6 +284,7 @@ test("mergeRunnerManagedStateFields preserves newer runner feedback in same stat
         last_reviewer_outcome: "FAIL",
         last_reviewer_feedback_at: "2026-02-07T12:01:00.000Z",
         last_executor_response_at: "",
+        in_review_origin: "needs_human_approval",
       },
     },
   };
@@ -273,6 +293,7 @@ test("mergeRunnerManagedStateFields preserves newer runner feedback in same stat
   assert.equal(merged.items.PVTI_1.last_reviewer_outcome, "FAIL");
   assert.equal(merged.items.PVTI_1.last_reviewer_feedback_at, "2026-02-07T12:01:00.000Z");
   assert.equal(merged.items.PVTI_1.review_cycle_count, 1);
+  assert.equal(merged.items.PVTI_1.in_review_origin, "needs_human_approval");
 });
 
 test("mergeRunnerManagedStateFields does not carry feedback across status epoch changes", () => {
@@ -286,6 +307,7 @@ test("mergeRunnerManagedStateFields does not carry feedback across status epoch 
         last_reviewer_outcome: "",
         last_reviewer_feedback_at: "",
         last_executor_response_at: "",
+        in_review_origin: "",
       },
     },
   };
@@ -299,6 +321,7 @@ test("mergeRunnerManagedStateFields does not carry feedback across status epoch 
         last_reviewer_outcome: "FAIL",
         last_reviewer_feedback_at: "2026-02-07T12:01:00.000Z",
         last_executor_response_at: "2026-02-07T12:02:00.000Z",
+        in_review_origin: "needs_human_approval",
       },
     },
   };
@@ -308,4 +331,5 @@ test("mergeRunnerManagedStateFields does not carry feedback across status epoch 
   assert.equal(merged.items.PVTI_1.last_reviewer_feedback_at, "");
   assert.equal(merged.items.PVTI_1.last_executor_response_at, "");
   assert.equal(merged.items.PVTI_1.review_cycle_count, 0);
+  assert.equal(merged.items.PVTI_1.in_review_origin, "");
 });

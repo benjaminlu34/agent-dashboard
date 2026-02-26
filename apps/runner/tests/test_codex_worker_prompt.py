@@ -1,6 +1,6 @@
 import unittest
 
-from apps.runner.codex_worker import CodexWorkerError, _build_worker_prompt, _extract_worker_result
+from apps.runner.codex_worker import CodexWorkerError, _build_worker_prompt, _extract_worker_result, _sandbox_for_role
 
 
 class CodexWorkerPromptTests(unittest.TestCase):
@@ -23,7 +23,14 @@ class CodexWorkerPromptTests(unittest.TestCase):
         self.assertIn("MUST set marker_verified=true", prompt)
         self.assertIn("In Review fixup run", prompt)
         self.assertIn("descend from head_sha", prompt)
+        self.assertIn("Never use /tmp", prompt)
         self.assertIn('"marker_verified": true|false|null', prompt)
+
+    def test_sandbox_for_role_is_restricted_by_role(self) -> None:
+        self.assertEqual(_sandbox_for_role("EXECUTOR"), "workspace-write")
+        self.assertEqual(_sandbox_for_role("REVIEWER"), "read-only")
+        with self.assertRaises(CodexWorkerError):
+            _sandbox_for_role("ORCHESTRATOR")
 
     def test_extract_worker_result_requires_reviewer_outcome(self) -> None:
         with self.assertRaises(CodexWorkerError):

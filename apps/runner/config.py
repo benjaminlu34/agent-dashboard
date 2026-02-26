@@ -28,6 +28,7 @@ class RunnerConfig:
     codex_bin: str
     codex_mcp_args: str
     codex_tools_call_timeout_s: float
+    orchestrator_sanitization_regen_attempts: int
 
 
 def _require_non_empty(env: dict[str, str], key: str) -> str:
@@ -63,6 +64,19 @@ def _parse_positive_float(env: dict[str, str], key: str, default: float) -> floa
     return value
 
 
+def _parse_non_negative_int(env: dict[str, str], key: str, default: int) -> int:
+    raw = env.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{key} must be an integer") from None
+    if value < 0:
+        raise ValueError(f"{key} must be a non-negative integer")
+    return value
+
+
 def _parse_bool(env: dict[str, str], key: str, default: bool = False) -> bool:
     raw = env.get(key)
     if raw is None:
@@ -93,8 +107,8 @@ def load_config(
         except ValueError:
             raise ValueError("sprint is required") from None
 
-    runner_max_executors = _parse_positive_int(resolved_env, "RUNNER_MAX_EXECUTORS", 1)
-    runner_max_reviewers = _parse_positive_int(resolved_env, "RUNNER_MAX_REVIEWERS", 1)
+    runner_max_executors = _parse_positive_int(resolved_env, "RUNNER_MAX_EXECUTORS", 3)
+    runner_max_reviewers = _parse_positive_int(resolved_env, "RUNNER_MAX_REVIEWERS", 2)
     runner_ready_buffer = _parse_positive_int(resolved_env, "RUNNER_READY_BUFFER", 2)
     review_stall_polls = _parse_positive_int(resolved_env, "REVIEW_STALL_POLLS", 50)
     blocked_retry_minutes = _parse_positive_int(resolved_env, "BLOCKED_RETRY_MINUTES", 15)
@@ -116,6 +130,11 @@ def load_config(
     codex_bin = resolved_env.get("CODEX_BIN", "codex").strip() or "codex"
     codex_mcp_args = resolved_env.get("CODEX_MCP_ARGS", "mcp-server").strip() or "mcp-server"
     codex_tools_call_timeout_s = _parse_positive_float(resolved_env, "CODEX_TOOLS_CALL_TIMEOUT_S", 1800.0)
+    orchestrator_sanitization_regen_attempts = _parse_non_negative_int(
+        resolved_env,
+        "ORCHESTRATOR_SANITIZATION_REGEN_ATTEMPTS",
+        2,
+    )
 
     return RunnerConfig(
         backend_base_url=backend_base_url,
@@ -137,4 +156,5 @@ def load_config(
         codex_bin=codex_bin,
         codex_mcp_args=codex_mcp_args,
         codex_tools_call_timeout_s=codex_tools_call_timeout_s,
+        orchestrator_sanitization_regen_attempts=orchestrator_sanitization_regen_attempts,
     )

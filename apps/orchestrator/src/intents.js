@@ -126,6 +126,15 @@ function updateSeenState({
       : "";
   const lastReviewerFeedbackAt = statusChanged ? "" : toIsoTimestamp(previous.last_reviewer_feedback_at);
   const lastExecutorResponseAt = statusChanged ? "" : toIsoTimestamp(previous.last_executor_response_at);
+  const previousInReviewOrigin = hasNonEmptyString(previous.in_review_origin) ? String(previous.in_review_origin).trim() : "";
+  const inReviewOrigin =
+    status === "In Review"
+      ? statusChanged
+        ? previous.last_seen_status === "Needs Human Approval"
+          ? "needs_human_approval"
+          : ""
+        : previousInReviewOrigin
+      : "";
 
   stateByItemId[item.project_item_id] = {
     last_seen_status: status,
@@ -149,6 +158,7 @@ function updateSeenState({
     last_reviewer_outcome: lastReviewerOutcome,
     last_reviewer_feedback_at: lastReviewerFeedbackAt,
     last_executor_response_at: lastExecutorResponseAt,
+    in_review_origin: inReviewOrigin,
   };
 
   return stateByItemId[item.project_item_id];
@@ -314,13 +324,13 @@ export function buildRunPlan({
 
       if (!canRetryReviewer) {
         summary.skipped.dedupe_same_status += 1;
-        return;
+        return false;
       }
     }
 
     if (summary.intents_emitted[role] >= maxCount) {
       summary.skipped.concurrency_limit += 1;
-      return;
+      return false;
     }
 
     const runId = uuidFactory();
@@ -351,6 +361,7 @@ export function buildRunPlan({
 
     summary.intents_emitted[role] += 1;
     summary.intents_emitted.total += 1;
+    return true;
   }
 
   for (const item of scopedItems) {
@@ -365,6 +376,8 @@ export function buildRunPlan({
         ? stateItem.last_reviewer_outcome.trim().toUpperCase()
         : "";
       const reviewCycleCount = Number.isInteger(stateItem.review_cycle_count) ? stateItem.review_cycle_count : 0;
+      const inReviewOrigin = hasNonEmptyString(stateItem.in_review_origin) ? String(stateItem.in_review_origin).trim() : "";
+      const hasExecutorResponse = hasNonEmptyString(stateItem.last_executor_response_at);
 
       if (lastOutcome === "PASS") {
         continue;
@@ -373,8 +386,19 @@ export function buildRunPlan({
         continue;
       }
 
+      if (inReviewOrigin === "needs_human_approval" && !hasNonEmptyString(lastOutcome)) {
+        if (!hasExecutorResponse) {
+          maybeDispatch(item, "EXECUTOR", "/internal/reviewer/resolve-linked-pr", maxExecutors);
+        } else {
+          const dispatched = maybeDispatch(item, "REVIEWER", "/internal/reviewer/resolve-linked-pr", maxReviewers);
+          if (dispatched) {
+            stateItem.in_review_origin = "";
+          }
+        }
+        continue;
+      }
+
       const hasReviewerFeedback = hasNonEmptyString(stateItem.last_reviewer_feedback_at);
-      const hasExecutorResponse = hasNonEmptyString(stateItem.last_executor_response_at);
       const executorRespondedAfterFeedback =
         hasReviewerFeedback && hasExecutorResponse
           ? isAfterIso(stateItem.last_executor_response_at, stateItem.last_reviewer_feedback_at)
@@ -445,6 +469,7 @@ export function buildRunPlan({
               is_stalled: stuckMinutes >= stallMinutes,
             }
           : null,
+      in_review_origin: item.status === "In Review" ? stateItem.in_review_origin ?? "" : "",
     });
   }
 

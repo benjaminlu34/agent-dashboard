@@ -40,10 +40,13 @@ class RunnerConfigTests(unittest.TestCase):
             }
         )
         self.assertTrue(config.autopromote)
+        self.assertEqual(config.runner_max_executors, 3)
+        self.assertEqual(config.runner_max_reviewers, 2)
         self.assertEqual(config.runner_ready_buffer, 2)
         self.assertEqual(config.review_stall_polls, 50)
         self.assertEqual(config.blocked_retry_minutes, 15)
         self.assertEqual(config.watchdog_timeout_s, 900)
+        self.assertEqual(config.orchestrator_sanitization_regen_attempts, 2)
 
     def test_accepts_ready_buffer_override(self) -> None:
         config = load_config(
@@ -60,3 +63,13 @@ class RunnerConfigTests(unittest.TestCase):
         self.assertEqual(config.review_stall_polls, 60)
         self.assertEqual(config.blocked_retry_minutes, 20)
         self.assertEqual(config.watchdog_timeout_s, 1200)
+
+    def test_accepts_sanitization_regen_attempts_override_and_zero(self) -> None:
+        config = load_config(
+            env={
+                "BACKEND_BASE_URL": "http://localhost:4000",
+                "ORCHESTRATOR_SPRINT": "M1",
+                "ORCHESTRATOR_SANITIZATION_REGEN_ATTEMPTS": "0",
+            }
+        )
+        self.assertEqual(config.orchestrator_sanitization_regen_attempts, 0)

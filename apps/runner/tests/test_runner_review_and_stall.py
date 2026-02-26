@@ -637,3 +637,55 @@ class RunnerReviewAndStallTests(unittest.TestCase):
         update_calls = [call for call in backend.calls if call[0] == "/internal/project-item/update-field"]
         self.assertEqual(len(update_calls), 1)
         self.assertEqual(update_calls[0][1]["value"], "Blocked")
+
+    def test_watchdog_times_out_running_executor_in_review_and_blocks_item(self) -> None:
+        backend = _BackendStub()
+        ledger = _LedgerStub(
+            {
+                "run-watchdog-review": {
+                    "status": "running",
+                    "running_at": "2026-02-08T00:00:00.000Z",
+                    "received_at": "2026-02-08T00:00:00.000Z",
+                    "result": None,
+                }
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = f"{tmp_dir}/orchestrator-state.json"
+            Path(state_path).write_text(
+                json.dumps(
+                    {
+                        "poll_count": 1,
+                        "items": {
+                            "PVTI_W2": {
+                                "last_seen_issue_number": 52,
+                                "last_seen_status": "In Review",
+                                "last_run_id": "run-watchdog-review",
+                                "last_dispatched_role": "EXECUTOR",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            runner = _build_runner(
+                backend=backend,
+                state_path=state_path,
+                ledger=ledger,
+                watchdog_timeout_s=1,
+            )
+            summary = {
+                "processed_items": [
+                    {"issue_number": 52, "project_item_id": "PVTI_W2", "status": "In Review"},
+                ]
+            }
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                runner.handle_dispatch_summary(summary=summary)
+            self.assertIn('"type":"WORKER_WATCHDOG_TIMEOUT"', stderr.getvalue())
+            self.assertEqual(len(ledger.mark_result_calls), 1)
+
+        update_calls = [call for call in backend.calls if call[0] == "/internal/project-item/update-field"]
+        self.assertEqual(len(update_calls), 1)
+        self.assertEqual(update_calls[0][1]["value"], "Blocked")

@@ -261,6 +261,82 @@ test("buildRunPlan redispatches reviewer once after stall threshold", () => {
   assert.equal(result.intents[0].run_id, "run-review-2");
 });
 
+test("buildRunPlan dispatches executor first when In Review entered from Needs Human Approval", () => {
+  const first = buildRunPlan({
+    projectItems: [{ issue_number: 88, project_item_id: "PVTI_88", fields: { Sprint: "M1", Status: "In Review" } }],
+    allowedStatusOptions: ALLOWED_STATUSES,
+    sprint: "M1",
+    previousState: {
+      poll_count: 5,
+      items: {
+        PVTI_88: {
+          last_seen_status: "Needs Human Approval",
+          status_since_poll: 4,
+          reviewer_dispatches_for_current_status: 0,
+          review_cycle_count: 0,
+        },
+      },
+    },
+    uuidFactory: () => "run-exec-fixup-1",
+    nowIso: "2026-02-07T12:00:00.000Z",
+  });
+  assert.equal(first.intents.length, 1);
+  assert.equal(first.intents[0].role, "EXECUTOR");
+  assert.equal(first.intents[0].endpoint, "/internal/reviewer/resolve-linked-pr");
+  assert.equal(first.nextState.items.PVTI_88.in_review_origin, "needs_human_approval");
+
+  const second = buildRunPlan({
+    projectItems: [{ issue_number: 88, project_item_id: "PVTI_88", fields: { Sprint: "M1", Status: "In Review" } }],
+    allowedStatusOptions: ALLOWED_STATUSES,
+    sprint: "M1",
+    previousState: first.nextState,
+    uuidFactory: () => "run-exec-fixup-2",
+    nowIso: "2026-02-07T12:01:00.000Z",
+  });
+  assert.equal(second.intents.length, 0);
+});
+
+test("buildRunPlan dispatches reviewer after executor response for human rework origin", () => {
+  const first = buildRunPlan({
+    projectItems: [{ issue_number: 88, project_item_id: "PVTI_88", fields: { Sprint: "M1", Status: "In Review" } }],
+    allowedStatusOptions: ALLOWED_STATUSES,
+    sprint: "M1",
+    previousState: {
+      poll_count: 5,
+      items: {
+        PVTI_88: {
+          last_seen_status: "Needs Human Approval",
+          status_since_poll: 4,
+        },
+      },
+    },
+    uuidFactory: () => "run-exec-fixup-1",
+    nowIso: "2026-02-07T12:00:00.000Z",
+  });
+
+  const second = buildRunPlan({
+    projectItems: [{ issue_number: 88, project_item_id: "PVTI_88", fields: { Sprint: "M1", Status: "In Review" } }],
+    allowedStatusOptions: ALLOWED_STATUSES,
+    sprint: "M1",
+    previousState: {
+      ...first.nextState,
+      items: {
+        ...first.nextState.items,
+        PVTI_88: {
+          ...first.nextState.items.PVTI_88,
+          last_executor_response_at: "2026-02-07T12:01:30.000Z",
+        },
+      },
+    },
+    uuidFactory: () => "run-review-after-fixup",
+    nowIso: "2026-02-07T12:02:00.000Z",
+  });
+
+  assert.equal(second.intents.length, 1);
+  assert.equal(second.intents[0].role, "REVIEWER");
+  assert.equal(second.intents[0].endpoint, "/internal/reviewer/resolve-linked-pr");
+});
+
 test("buildRunPlan alternates In Review between reviewer and executor after feedback", () => {
   const first = buildRunPlan({
     projectItems: [{ issue_number: 88, project_item_id: "PVTI_88", fields: { Sprint: "M1", Status: "In Review" } }],

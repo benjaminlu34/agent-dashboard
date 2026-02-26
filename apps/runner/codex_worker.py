@@ -117,6 +117,17 @@ class _JsonRpcClient:
         return value
 
 
+def _sandbox_for_role(role: str) -> str:
+    normalized = str(role or "").strip().upper()
+    if normalized == "EXECUTOR":
+        # Executor needs to modify repository files but must stay within workspace.
+        return "workspace-write"
+    if normalized == "REVIEWER":
+        # Reviewer is comment-only and should not write files.
+        return "read-only"
+    raise CodexWorkerError("intent role must be EXECUTOR or REVIEWER", code="worker_invalid_intent")
+
+
 def _spawn_codex_mcp_server(*, codex_bin: str, codex_mcp_args: str) -> subprocess.Popen[str]:
     argv = [codex_bin, *shlex.split(codex_mcp_args)]
     return subprocess.Popen(
@@ -298,6 +309,7 @@ def _build_worker_prompt(*, role_bundle: Dict[str, Any], intent: Dict[str, Any],
         "- Do not merge PRs. Do not close issues. Do not use auto-close keywords.\n"
         "- Never bypass backend policy gates; all state changes must go through backend endpoints.\n"
         "- Do NOT attempt to start or run the backend server; if the backend endpoint is unreachable, fail closed.\n"
+        "- Do not read or write files outside the repository workspace. Never use /tmp or home-directory paths.\n"
         "- Fail closed on ambiguity.\n\n"
         f"Backend base URL: {backend_base_url}\n\n"
         f"{role_specific_rules}\n"
@@ -337,6 +349,7 @@ def run_intent_with_codex_mcp(
     expected_run_id = str(intent.get("run_id") or "").strip()
     if expected_role not in ("EXECUTOR", "REVIEWER"):
         raise CodexWorkerError("intent role must be EXECUTOR or REVIEWER", code="worker_invalid_intent")
+    sandbox_mode = _sandbox_for_role(expected_role)
     if not expected_run_id:
         raise CodexWorkerError("intent run_id is required", code="worker_invalid_intent")
 
@@ -386,12 +399,11 @@ def run_intent_with_codex_mcp(
                     "developer-instructions": (
                         "Treat base-instructions as executable contract. Do not rewrite or summarize it. "
                         "Do not attempt to start the backend server. "
+                        "Do not read or write outside the repository workspace. "
                         "Never merge PRs or close issues. Fail closed on ambiguity."
                     ),
                     "cwd": ".",
-                    # Codex sandbox restrictions can prevent reaching a locally running backend on localhost.
-                    # Worker must be able to call the backend endpoints to claim/transition safely.
-                    "sandbox": "danger-full-access",
+                    "sandbox": sandbox_mode,
                     "approval-policy": "never",
                 },
             },

@@ -38,6 +38,14 @@
     },
     {
       "from": "Needs Human Approval",
+      "to": "In Review",
+      "allowed_roles": [
+        "Human"
+      ],
+      "automation_allowed": false
+    },
+    {
+      "from": "Needs Human Approval",
       "to": "Blocked",
       "allowed_roles": [
         "Orchestrator"

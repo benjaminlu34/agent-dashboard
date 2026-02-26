@@ -17,12 +17,12 @@ Optional:
 - `BACKEND_BASE_URL` (default `http://localhost:4000`)
 
 Optional:
-- `RUNNER_MAX_EXECUTORS` (default `1`)
-- `RUNNER_MAX_REVIEWERS` (default `1`)
+- `RUNNER_MAX_EXECUTORS` (default `3`)
+- `RUNNER_MAX_REVIEWERS` (default `2`)
 - `RUNNER_READY_BUFFER` (default `2`) - minimum number of `Ready` items runner tries to maintain via promotion
 - `REVIEW_STALL_POLLS` (default `50`) - after this many `In Review` polls, allow one retry reviewer dispatch; if still stalled, escalate
 - `BLOCKED_RETRY_MINUTES` (default `15`) - cooldown before auto-retrying retryable `Blocked` items back to `Ready`
-- `RUNNER_WATCHDOG_TIMEOUT_S` (default `900`) - timeout for stale `running` executor runs before forced `In Progress -> Blocked`
+- `RUNNER_WATCHDOG_TIMEOUT_S` (default `900`) - timeout for stale `running` executor runs before forced `In Progress/In Review -> Blocked`
 - `RUNNER_DRY_RUN` (default `false`)
 - `RUNNER_LEDGER_PATH` (default `./.runner-ledger.json`)
 - `RUNNER_SPRINT_PLAN_PATH` (default `./.runner-sprint-plan.json`)
@@ -32,6 +32,7 @@ Optional:
 - `CODEX_BIN` (default `codex`)
 - `CODEX_MCP_ARGS` (default `mcp-server`)
 - `CODEX_TOOLS_CALL_TIMEOUT_S` (default `1800`) - timeout for a single Codex MCP `tools/call` worker run
+- `ORCHESTRATOR_SANITIZATION_REGEN_ATTEMPTS` (default `2`) - dependency sanitization regen tries (`0` disables regen and preserves immediate malformed-item stop)
 
 Target repo identity config (`TARGET_*`) is passed through to `apps/orchestrator` and the backend via env.
 
@@ -84,6 +85,18 @@ python3 -m apps.runner.tests
 
 Non-dry-run execution spawns `codex mcp-server` per intent and calls the MCP `codex` tool once per intent.
 See `docs/runner-contract.md`.
+
+Worker sandbox policy:
+- `EXECUTOR` runs with `workspace-write` sandbox (repo workspace writes only).
+- `REVIEWER` runs with `read-only` sandbox.
+- Worker prompts also require no reads/writes outside repository workspace.
+
+## Human Rework Loop
+
+When an item is in `Needs Human Approval`, request additional changes by moving:
+- `Needs Human Approval` -> `In Review`
+
+Do not move it back to `Ready`. This keeps one-PR linkage intact and causes orchestrator to run executor fixups on the existing linked PR branch.
 
 ## Operational events
 

@@ -44,6 +44,20 @@ test("Needs Human Approval -> Done is Human-only and marked non-automation", asy
   });
 });
 
+test("Needs Human Approval -> In Review is Human-only and marked non-automation", async () => {
+  const humanResult = await isStatusTransitionAllowed("Human", "Needs Human Approval", "In Review");
+  assert.deepEqual(humanResult, {
+    allowed: true,
+    automation_allowed: false,
+  });
+
+  const reviewerResult = await isStatusTransitionAllowed("Reviewer", "Needs Human Approval", "In Review");
+  assert.deepEqual(reviewerResult, {
+    allowed: false,
+    automation_allowed: false,
+  });
+});
+
 test("In Progress -> Blocked is Orchestrator-only", async () => {
   const orchestratorResult = await isStatusTransitionAllowed("Orchestrator", "In Progress", "Blocked");
   assert.deepEqual(orchestratorResult, {

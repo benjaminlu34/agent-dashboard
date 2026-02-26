@@ -19,6 +19,8 @@ const IN_REVIEW_STATUS = "In Review";
 const IN_PROGRESS_STATUS = "In Progress";
 const BLOCKED_STATUS = "Blocked";
 const READY_STATUS = "Ready";
+const HUMAN_ROLE = "HUMAN";
+const ORCHESTRATOR_ROLE = "ORCHESTRATOR";
 
 function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
@@ -82,8 +84,39 @@ function buildHumanApprovalComment({
   return lines.join("\n");
 }
 
+function buildHumanReworkRequestComment({
+  issueNumber,
+  reworkReason,
+  requestedActions,
+  projectItemId,
+  role,
+  runId = "",
+}) {
+  const lines = [
+    "Human rework request: Needs Human Approval -> In Review",
+    "",
+    `Linked issue: #${issueNumber}`,
+    `Reason: ${reworkReason}`,
+    "",
+    "Requested actions:",
+    ...requestedActions.map((entry) => `- ${entry}`),
+    "",
+    "<!-- HUMAN_REWORK_REQUEST_V1",
+    `project_item_id: ${projectItemId}`,
+    "from: Needs Human Approval",
+    "to: In Review",
+    `requested_by_role: ${role}`,
+  ];
+  if (isNonEmptyString(runId)) {
+    lines.push(`run_id: ${runId}`);
+  }
+  lines.push("-->");
+  return lines.join("\n");
+}
+
 function buildExecutionFailureBlockedComment({
   issueNumber,
+  fromStatus,
   failureClassification,
   failureMessage,
   suggestedNextSteps,
@@ -94,6 +127,7 @@ function buildExecutionFailureBlockedComment({
     "Executor failure handoff: Blocked",
     "",
     `Linked issue: #${issueNumber}`,
+    `Failure stage: ${fromStatus} -> Blocked`,
     `Failure classification: ${failureClassification}`,
     "",
     "Failure message:",
@@ -178,7 +212,34 @@ function parseNeedsHumanApprovalMetadata(body) {
   };
 }
 
-function parseExecutionFailureBlockedMetadata(body) {
+function parseHumanReworkMetadata(body) {
+  const issueNumber = body?.issue_number;
+  const requestedActions = normalizeStringArray(body?.requested_actions);
+  const runId = isNonEmptyString(body?.run_id) ? body.run_id.trim() : "";
+  const reasonCandidate = isNonEmptyString(body?.human_rework_reason)
+    ? body.human_rework_reason
+    : isNonEmptyString(body?.human_step)
+      ? body.human_step
+      : "";
+
+  if (!isPositiveInteger(issueNumber)) {
+    return { error: "body.issue_number must be a positive integer for Needs Human Approval -> In Review transition" };
+  }
+  if (!isNonEmptyString(reasonCandidate)) {
+    return { error: "body.human_rework_reason (or body.human_step) is required for Needs Human Approval -> In Review transition" };
+  }
+
+  const normalizedRequestedActions = requestedActions.length > 0 ? requestedActions : [reasonCandidate.trim()];
+  return {
+    issueNumber,
+    reworkReason: reasonCandidate.trim(),
+    requestedActions: normalizedRequestedActions,
+    runId,
+  };
+}
+
+function parseExecutionFailureBlockedMetadata(body, { fromStatus }) {
+  const transitionLabel = `${fromStatus} -> Blocked`;
   const issueNumber = body?.issue_number;
   const failureClassification = body?.failure_classification;
   const failureMessage = body?.failure_message;
@@ -186,20 +247,21 @@ function parseExecutionFailureBlockedMetadata(body) {
   const runId = isNonEmptyString(body?.run_id) ? body.run_id.trim() : "";
 
   if (!isPositiveInteger(issueNumber)) {
-    return { error: "body.issue_number must be a positive integer for In Progress -> Blocked transition" };
+    return { error: `body.issue_number must be a positive integer for ${transitionLabel} transition` };
   }
   if (!isNonEmptyString(failureClassification)) {
-    return { error: "body.failure_classification is required for In Progress -> Blocked transition" };
+    return { error: `body.failure_classification is required for ${transitionLabel} transition` };
   }
   if (!isNonEmptyString(failureMessage)) {
-    return { error: "body.failure_message is required for In Progress -> Blocked transition" };
+    return { error: `body.failure_message is required for ${transitionLabel} transition` };
   }
   if (suggestedNextSteps.length === 0) {
-    return { error: "body.suggested_next_steps must be a non-empty array of strings for In Progress -> Blocked transition" };
+    return { error: `body.suggested_next_steps must be a non-empty array of strings for ${transitionLabel} transition` };
   }
 
   return {
     issueNumber,
+    fromStatus,
     failureClassification: failureClassification.trim(),
     failureMessage: failureMessage.trim(),
     suggestedNextSteps,
@@ -439,20 +501,26 @@ export function buildInternalProjectItemUpdateFieldHandler({
 
     const requiresHumanApprovalHandoff =
       field === "Status" &&
-      normalizedRole === "ORCHESTRATOR" &&
+      normalizedRole === ORCHESTRATOR_ROLE &&
       value === NEEDS_HUMAN_APPROVAL_STATUS &&
       currentStatus === IN_REVIEW_STATUS;
+    const requiresHumanReworkHandoff =
+      field === "Status" &&
+      (normalizedRole === HUMAN_ROLE || normalizedRole === ORCHESTRATOR_ROLE) &&
+      value === IN_REVIEW_STATUS &&
+      currentStatus === NEEDS_HUMAN_APPROVAL_STATUS;
     const requiresExecutionFailureHandoff =
       field === "Status" &&
-      normalizedRole === "ORCHESTRATOR" &&
+      normalizedRole === ORCHESTRATOR_ROLE &&
       value === BLOCKED_STATUS &&
-      currentStatus === IN_PROGRESS_STATUS;
+      (currentStatus === IN_PROGRESS_STATUS || currentStatus === IN_REVIEW_STATUS);
     const requiresBlockedRetryHandoff =
       field === "Status" &&
-      normalizedRole === "ORCHESTRATOR" &&
+      normalizedRole === ORCHESTRATOR_ROLE &&
       value === READY_STATUS &&
       currentStatus === BLOCKED_STATUS;
     let handoffMetadata = null;
+    let humanReworkMetadata = null;
     let failureMetadata = null;
     let blockedRetryMetadata = null;
     if (requiresHumanApprovalHandoff) {
@@ -462,8 +530,15 @@ export function buildInternalProjectItemUpdateFieldHandler({
         return { error: handoffMetadata.error };
       }
     }
+    if (requiresHumanReworkHandoff) {
+      humanReworkMetadata = parseHumanReworkMetadata(request?.body);
+      if (humanReworkMetadata.error) {
+        reply.code(400);
+        return { error: humanReworkMetadata.error };
+      }
+    }
     if (requiresExecutionFailureHandoff) {
-      failureMetadata = parseExecutionFailureBlockedMetadata(request?.body);
+      failureMetadata = parseExecutionFailureBlockedMetadata(request?.body, { fromStatus: currentStatus });
       if (failureMetadata.error) {
         reply.code(400);
         return { error: failureMetadata.error };
@@ -513,6 +588,7 @@ export function buildInternalProjectItemUpdateFieldHandler({
     if (failureMetadata) {
       const commentBody = buildExecutionFailureBlockedComment({
         issueNumber: failureMetadata.issueNumber,
+        fromStatus: failureMetadata.fromStatus,
         failureClassification: failureMetadata.failureClassification,
         failureMessage: failureMetadata.failureMessage,
         suggestedNextSteps: failureMetadata.suggestedNextSteps,
@@ -522,6 +598,26 @@ export function buildInternalProjectItemUpdateFieldHandler({
       try {
         failureComment = await githubClient.createIssueComment({
           issueNumber: failureMetadata.issueNumber,
+          body: commentBody,
+        });
+      } catch (error) {
+        reply.code(502);
+        return { error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+    let humanReworkComment = null;
+    if (humanReworkMetadata) {
+      const commentBody = buildHumanReworkRequestComment({
+        issueNumber: humanReworkMetadata.issueNumber,
+        reworkReason: humanReworkMetadata.reworkReason,
+        requestedActions: humanReworkMetadata.requestedActions,
+        projectItemId,
+        role: normalizedRole,
+        runId: humanReworkMetadata.runId,
+      });
+      try {
+        humanReworkComment = await githubClient.createIssueComment({
+          issueNumber: humanReworkMetadata.issueNumber,
           body: commentBody,
         });
       } catch (error) {
@@ -571,6 +667,14 @@ export function buildInternalProjectItemUpdateFieldHandler({
             failure_comment: {
               id: failureComment.id,
               html_url: failureComment.html_url,
+            },
+          }
+        : {}),
+      ...(humanReworkComment
+        ? {
+            rework_comment: {
+              id: humanReworkComment.id,
+              html_url: humanReworkComment.html_url,
             },
           }
         : {}),

@@ -60,8 +60,8 @@ class RunnerCliModeTests(unittest.TestCase):
         self.assertIsNotNone(captured["env"])
         assert captured["env"] is not None
         self.assertEqual(captured["env"].get("ORCHESTRATOR_SPRINT"), "M1")
-        self.assertEqual(captured["env"].get("ORCHESTRATOR_MAX_EXECUTORS"), "1")
-        self.assertEqual(captured["env"].get("ORCHESTRATOR_MAX_REVIEWERS"), "1")
+        self.assertEqual(captured["env"].get("ORCHESTRATOR_MAX_EXECUTORS"), "3")
+        self.assertEqual(captured["env"].get("ORCHESTRATOR_MAX_REVIEWERS"), "2")
         self.assertIn("--loop", str(captured["cmd"]))
 
     def test_loop_without_kickoff_without_sprint_is_config_error(self) -> None:

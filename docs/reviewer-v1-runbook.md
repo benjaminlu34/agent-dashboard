@@ -20,6 +20,7 @@ This runbook defines a minimal Reviewer v1 workflow. Reviewer is comment-only fo
 - One PR per issue enforced with deterministic linkage.
 - Fail closed on ambiguity.
 - PASS review must emit reviewer outcome `PASS`; runner applies status handoff.
+- Human change requests are routed by status transition, not reviewer status edits.
 
 ## Procedure
 
@@ -76,6 +77,14 @@ This runbook defines a minimal Reviewer v1 workflow. Reviewer is comment-only fo
 8. End.
    - No merge actions.
    - No issue close actions.
+
+## Human Rework Request (Post-PASS)
+
+If a human requests changes after an item is in `Needs Human Approval`:
+- Human should move project status to `In Review` (not `Ready`).
+- Include a clear rework reason in issue/PR comments.
+- Orchestrator will dispatch `EXECUTOR` first to fix the existing linked PR branch.
+- Reviewer runs again after executor response and returns `PASS`/`FAIL`/`INCOMPLETE`.
 
 ## Stop Conditions
 

@@ -113,6 +113,8 @@ Runner classifications:
 - `2`: hard-stop due to policy/template/schema/identity/validation failure
 - `3`: malformed item data / unknown status/sprint in scope
 - `4`: transient error retries exhausted
+- `5`: sanitization regen exhausted (all regen attempts failed; full attempt history emitted)
+- `6`: sanitization regen handoff requested (external planner regen request file written)
 
 ## MCP execution requirement
 
@@ -136,5 +138,21 @@ Runner requires Codex CLI to have GitHub MCP servers enabled (checked via `codex
 ## Endpoint allowlist (MVP)
 
 Runner enforces a strict per-role allowlist:
-- `EXECUTOR`: `/internal/executor/claim-ready-item`
+- `EXECUTOR`: `/internal/executor/claim-ready-item`, `/internal/reviewer/resolve-linked-pr`
 - `REVIEWER`: `/internal/reviewer/resolve-linked-pr`
+
+## Human Rework Loop
+
+When a task is already in `Needs Human Approval`, humans request additional work by moving:
+- `Needs Human Approval` -> `In Review`
+
+Runner/orchestrator behavior for this transition epoch:
+- Orchestrator marks the `In Review` origin as `needs_human_approval`.
+- First dispatch is `EXECUTOR` to `/internal/reviewer/resolve-linked-pr` (existing PR branch fixup).
+- After executor response, orchestrator dispatches `REVIEWER` for re-review.
+- On reviewer `PASS`, runner transitions back to `Needs Human Approval`.
+- Human can then merge and move the item to `Done`.
+
+Failure handling:
+- If executor fixup fails while status is `In Review`, runner transitions the item to `Blocked`
+  with structured failure metadata and issue comment audit trail.
