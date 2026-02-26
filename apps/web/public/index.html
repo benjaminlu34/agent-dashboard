@@ -321,16 +321,45 @@
             <div id="runner-runs" class="mt-5 space-y-4"></div>
           </section>
         </main>
+
+        <section class="mt-7 rounded-2xl border border-zinc-800 bg-zinc-900 p-5 shadow-lg shadow-white/10 sm:p-6">
+          <div>
+            <h2 class="text-xl font-semibold tracking-tight text-white">Live Agent Terminals</h2>
+            <p class="mt-1 text-sm text-zinc-400">Real-time transcript stream for active and recently completed runs.</p>
+          </div>
+          <div
+            id="terminal-health-banner"
+            class="mt-4 hidden rounded-xl border border-zinc-600 bg-zinc-950/90 px-4 py-3 text-xs text-zinc-200"
+          ></div>
+          <div class="mt-5">
+            <ul id="terminal-tabs" class="flex overflow-x-auto border-b border-zinc-800"></ul>
+            <div
+              id="terminal-window"
+              class="bg-black text-zinc-300 font-mono text-[10px] sm:text-xs p-4 h-96 overflow-y-auto rounded-b-xl border border-zinc-800 shadow-inner"
+            >
+              <pre id="terminal-output" class="whitespace-pre text-zinc-300">Waiting for an active run...</pre>
+            </div>
+          </div>
+        </section>
       </div>
     </div>
 
     <script>
       const POLL_INTERVAL_MS = 15000;
+      const TERMINAL_WAIT_TIMEOUT_RUNNING_MS = 25000;
+      const TERMINAL_WAIT_TIMEOUT_IDLE_MS = 12000;
+      const TERMINAL_HIDDEN_POLL_INTERVAL_MS = 10000;
+      const TERMINAL_RETRY_DELAY_MS = 1500;
+      const TERMINAL_RECENT_WINDOW_MS = 20 * 60 * 1000;
       const orchestratorItemsEl = document.getElementById("orchestrator-items");
       const orchestratorSummaryEl = document.getElementById("orchestrator-summary");
       const orchestratorSprintEl = document.getElementById("orchestrator-sprint");
       const runnerRunsEl = document.getElementById("runner-runs");
       const runnerCountEl = document.getElementById("runner-count");
+      const terminalTabsEl = document.getElementById("terminal-tabs");
+      const terminalWindowEl = document.getElementById("terminal-window");
+      const terminalOutputEl = document.getElementById("terminal-output");
+      const terminalHealthBannerEl = document.getElementById("terminal-health-banner");
       const targetRepoEl = document.getElementById("target-repo");
       const lastRefreshEl = document.getElementById("last-refresh");
       const errorBannerEl = document.getElementById("error-banner");
@@ -372,6 +401,15 @@
       let activityCurrent = 0.12;
       let lastFrameTime = performance.now();
       let isSettingsOpen = false;
+      let activeTerminalRunId = "";
+      let terminalRunIds = [];
+      const terminalLogCache = new Map();
+      const terminalLogEtagByRun = new Map();
+      const terminalRunMetaById = new Map();
+      let terminalPollSequence = 0;
+      let terminalPollInFlight = false;
+      let terminalPollTimerId = 0;
+      let terminalPollAbortController = null;
       const settingsFieldByName = {
         targetOwner: settingsTargetOwnerEl,
         targetRepo: settingsTargetRepoEl,
@@ -572,8 +610,16 @@
           .join("");
       }
 
-      function renderRunner(runner) {
-        const entries = Object.values(asObject(runner))
+      function toTimestampMs(value) {
+        const parsed = new Date(value ?? "").getTime();
+        if (Number.isNaN(parsed)) {
+          return 0;
+        }
+        return parsed;
+      }
+
+      function buildRunnerEntries(runner) {
+        return Object.values(asObject(runner))
           .filter((value) => value && typeof value === "object")
           .map((value) => {
             const timestamp =
@@ -589,14 +635,30 @@
               value?.result?.error ??
               value?.result?.message ??
               "";
+            const summary = typeof value?.result?.summary === "string" ? value.result.summary : "";
+            const errorMessages = Array.isArray(value?.result?.errors)
+              ? value.result.errors
+                  .map((errorEntry) => {
+                    if (errorEntry && typeof errorEntry === "object") {
+                      const message = errorEntry.message ?? errorEntry.error ?? errorEntry.code;
+                      return typeof message === "string" ? message.trim() : "";
+                    }
+                    return typeof errorEntry === "string" ? errorEntry.trim() : "";
+                  })
+                  .filter((message) => message.length > 0)
+              : [];
 
+            const timestampMs = toTimestampMs(timestamp);
             return {
               runId: value?.run_id ?? "",
               role: value?.role ?? "UNKNOWN",
               status: value?.status ?? "unknown",
               timestamp,
+              timestampMs,
               receivedAt: value?.received_at ?? "",
               outcome: value?.result?.outcome ?? "",
+              summary,
+              errorMessages,
               blockedReason: typeof blockedReason === "string" ? blockedReason : "",
               prUrl:
                 value?.result?.pr_url ??
@@ -605,16 +667,349 @@
                 "",
             };
           })
-          .sort((left, right) => {
-            const leftMs = new Date(left.timestamp ?? "").getTime();
-            const rightMs = new Date(right.timestamp ?? "").getTime();
-            if (Number.isNaN(leftMs) && Number.isNaN(rightMs)) return 0;
-            if (Number.isNaN(leftMs)) return 1;
-            if (Number.isNaN(rightMs)) return -1;
-            return rightMs - leftMs;
-          })
+          .sort((left, right) => right.timestampMs - left.timestampMs)
           .slice(0, 30);
+      }
 
+      function collectTerminalRunIds(runnerEntries) {
+        const nowMs = Date.now();
+        const runIds = [];
+        const seen = new Set();
+        for (const entry of runnerEntries) {
+          const runId = String(entry?.runId ?? "").trim();
+          if (!runId || seen.has(runId)) {
+            continue;
+          }
+
+          const normalizedStatus = String(entry?.status ?? "").toUpperCase();
+          const isRunning = normalizedStatus === "RUNNING";
+          const isFinished = normalizedStatus === "SUCCEEDED" || normalizedStatus === "FAILED" || normalizedStatus === "SKIPPED";
+          const isRecentlyFinished = isFinished && entry.timestampMs > 0 && nowMs - entry.timestampMs <= TERMINAL_RECENT_WINDOW_MS;
+
+          if (!isRunning && !isRecentlyFinished) {
+            continue;
+          }
+
+          seen.add(runId);
+          runIds.push(runId);
+        }
+        return runIds;
+      }
+
+      function normalizeRoleLabel(value) {
+        const normalized = String(value ?? "").trim().toUpperCase();
+        if (normalized) {
+          return normalized;
+        }
+        return "AGENT";
+      }
+
+      function shortRunSuffix(runId) {
+        const normalized = String(runId ?? "").replaceAll(/[^A-Za-z0-9]/g, "").toLowerCase();
+        if (!normalized) {
+          return "0000";
+        }
+        return normalized.slice(0, 4);
+      }
+
+      function isScrolledToBottom(element) {
+        if (!element) {
+          return true;
+        }
+        return element.scrollTop + element.clientHeight >= element.scrollHeight - 8;
+      }
+
+      function renderTerminalOutput(logs) {
+        const shouldStickToBottom = isScrolledToBottom(terminalWindowEl);
+        const content = typeof logs === "string" && logs.length > 0 ? logs : "No logs available for this run yet.";
+        terminalOutputEl.textContent = content;
+        if (shouldStickToBottom) {
+          terminalWindowEl.scrollTop = terminalWindowEl.scrollHeight;
+        }
+      }
+
+      function renderTerminalTabs() {
+        if (terminalRunIds.length === 0) {
+          terminalTabsEl.innerHTML = `
+            <li class="px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">No active runs</li>
+          `;
+          terminalOutputEl.textContent = "Waiting for an active or recently finished run...";
+          return;
+        }
+
+        const roleCounts = {};
+        for (const runId of terminalRunIds) {
+          const role = normalizeRoleLabel(terminalRunMetaById.get(runId)?.role);
+          roleCounts[role] = (roleCounts[role] ?? 0) + 1;
+        }
+
+        terminalTabsEl.innerHTML = terminalRunIds
+          .map((runId) => {
+            const isActive = runId === activeTerminalRunId;
+            const role = normalizeRoleLabel(terminalRunMetaById.get(runId)?.role);
+            const label = roleCounts[role] > 1 ? `${role} (${shortRunSuffix(runId)})` : role;
+            return `
+              <li>
+                <button
+                  type="button"
+                  data-run-id="${escapeHtml(runId)}"
+                  class="border-r border-zinc-800 px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.14em] transition ${
+                    isActive ? "bg-zinc-800 text-white" : "bg-transparent text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200"
+                  }"
+                >
+                  ${escapeHtml(label)}
+                </button>
+              </li>
+            `;
+          })
+          .join("");
+
+        const cachedLogs = terminalLogCache.get(activeTerminalRunId);
+        if (typeof cachedLogs === "string") {
+          renderTerminalOutput(cachedLogs);
+          return;
+        }
+        terminalOutputEl.textContent = "Loading logs...";
+      }
+
+      function setActiveTerminalRun(runId) {
+        const normalizedRunId = String(runId ?? "").trim();
+        if (!normalizedRunId || !terminalRunIds.includes(normalizedRunId)) {
+          return;
+        }
+        if (normalizedRunId === activeTerminalRunId) {
+          return;
+        }
+        activeTerminalRunId = normalizedRunId;
+        renderTerminalTabs();
+        restartTerminalPollNow();
+      }
+
+      function syncTerminalRuns(runnerEntries) {
+        terminalRunIds = collectTerminalRunIds(runnerEntries);
+        terminalRunMetaById.clear();
+        for (const entry of runnerEntries) {
+          const runId = String(entry?.runId ?? "").trim();
+          if (!runId || !terminalRunIds.includes(runId)) {
+            continue;
+          }
+          if (!terminalRunMetaById.has(runId)) {
+            terminalRunMetaById.set(runId, entry);
+          }
+        }
+        if (terminalRunIds.length === 0) {
+          activeTerminalRunId = "";
+          terminalLogCache.clear();
+          terminalLogEtagByRun.clear();
+          abortTerminalPollRequest();
+          clearTerminalPollTimer();
+          renderTerminalTabs();
+          return;
+        }
+
+        for (const runId of Array.from(terminalLogCache.keys())) {
+          if (!terminalRunIds.includes(runId) && runId !== activeTerminalRunId) {
+            terminalLogCache.delete(runId);
+          }
+        }
+        for (const runId of Array.from(terminalLogEtagByRun.keys())) {
+          if (!terminalRunIds.includes(runId) && runId !== activeTerminalRunId) {
+            terminalLogEtagByRun.delete(runId);
+          }
+        }
+
+        if (!terminalRunIds.includes(activeTerminalRunId)) {
+          activeTerminalRunId = terminalRunIds[0];
+        }
+
+        renderTerminalTabs();
+        restartTerminalPollNow();
+      }
+
+      function activeTerminalLongPollTimeoutMs() {
+        const activeMeta = terminalRunMetaById.get(activeTerminalRunId);
+        const activeStatus = String(activeMeta?.status ?? "").toUpperCase();
+        if (activeStatus === "RUNNING") {
+          return TERMINAL_WAIT_TIMEOUT_RUNNING_MS;
+        }
+        return TERMINAL_WAIT_TIMEOUT_IDLE_MS;
+      }
+
+      function clearTerminalPollTimer() {
+        if (terminalPollTimerId) {
+          window.clearTimeout(terminalPollTimerId);
+          terminalPollTimerId = 0;
+        }
+      }
+
+      function abortTerminalPollRequest() {
+        if (!terminalPollAbortController) {
+          return;
+        }
+        try {
+          terminalPollAbortController.abort();
+        } catch {
+          // no-op
+        }
+        terminalPollAbortController = null;
+      }
+
+      function restartTerminalPollNow() {
+        abortTerminalPollRequest();
+        clearTerminalPollTimer();
+        scheduleTerminalPoll(0);
+      }
+
+      function scheduleTerminalPoll(delayMs = 0) {
+        clearTerminalPollTimer();
+        terminalPollTimerId = window.setTimeout(() => {
+          void pollActiveTerminalLogs();
+        }, Math.max(150, Number(delayMs) || 0));
+      }
+
+      async function pollActiveTerminalLogs() {
+        if (!activeTerminalRunId) {
+          return;
+        }
+        if (document.hidden) {
+          scheduleTerminalPoll(TERMINAL_HIDDEN_POLL_INTERVAL_MS);
+          return;
+        }
+        if (terminalPollInFlight) {
+          return;
+        }
+
+        const runId = activeTerminalRunId;
+        const sequence = ++terminalPollSequence;
+        let nextDelayMs = 0;
+        terminalPollInFlight = true;
+        const abortController = new AbortController();
+        terminalPollAbortController = abortController;
+        try {
+          const headers = {};
+          const cachedEtag = terminalLogEtagByRun.get(runId);
+          if (typeof cachedEtag === "string" && cachedEtag.length > 0) {
+            headers["If-None-Match"] = cachedEtag;
+          }
+          const timeoutMs = activeTerminalLongPollTimeoutMs();
+          const response = await fetch(`/internal/logs/${encodeURIComponent(runId)}?wait=1&timeoutMs=${timeoutMs}`, {
+            cache: "no-store",
+            headers,
+            signal: abortController.signal,
+          });
+          if (response.status === 304) {
+            return;
+          }
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+
+          const payload = asObject(await response.json());
+          const logs = typeof payload.logs === "string" ? payload.logs : "";
+          const nextEtag = response.headers.get("etag") || (typeof payload.etag === "string" ? payload.etag : "");
+          if (nextEtag) {
+            terminalLogEtagByRun.set(runId, nextEtag);
+          }
+          terminalLogCache.set(runId, logs);
+
+          if (sequence !== terminalPollSequence || runId !== activeTerminalRunId) {
+            return;
+          }
+          renderTerminalOutput(logs);
+        } catch (error) {
+          if (error?.name === "AbortError") {
+            return;
+          }
+          nextDelayMs = TERMINAL_RETRY_DELAY_MS;
+          if (sequence !== terminalPollSequence || runId !== activeTerminalRunId) {
+            return;
+          }
+          if (!terminalLogCache.has(runId)) {
+            terminalOutputEl.textContent = `Unable to load logs for ${runId}: ${error?.message ?? "Unknown error"}`;
+          }
+        } finally {
+          if (terminalPollAbortController === abortController) {
+            terminalPollAbortController = null;
+          }
+          terminalPollInFlight = false;
+          if (runId === activeTerminalRunId) {
+            if (document.hidden) {
+              scheduleTerminalPoll(TERMINAL_HIDDEN_POLL_INTERVAL_MS);
+            } else {
+              scheduleTerminalPoll(nextDelayMs);
+            }
+          }
+        }
+      }
+
+      function deriveRunFailureDetail(entry) {
+        const parts = [];
+        const summary = typeof entry?.summary === "string" ? entry.summary.trim() : "";
+        if (summary.length > 0) {
+          parts.push(summary);
+        }
+
+        const errorMessages = Array.isArray(entry?.errorMessages) ? entry.errorMessages : [];
+        for (const message of errorMessages.slice(0, 3)) {
+          if (typeof message !== "string") {
+            continue;
+          }
+          const normalized = message.trim();
+          if (!normalized || parts.includes(normalized)) {
+            continue;
+          }
+          parts.push(normalized);
+        }
+
+        const blockedReason = typeof entry?.blockedReason === "string" ? entry.blockedReason.trim() : "";
+        if (blockedReason && !parts.includes(blockedReason)) {
+          parts.push(blockedReason);
+        }
+
+        if (parts.length === 0) {
+          return "";
+        }
+        return parts.join(" | ");
+      }
+
+      function setTerminalHealthBanner(message) {
+        const normalized = String(message ?? "").trim();
+        if (!normalized) {
+          terminalHealthBannerEl.textContent = "";
+          terminalHealthBannerEl.classList.add("hidden");
+          return;
+        }
+        terminalHealthBannerEl.textContent = normalized;
+        terminalHealthBannerEl.classList.remove("hidden");
+      }
+
+      function renderTerminalHealth(entries) {
+        const latestOrchestrator = entries.find((entry) => String(entry?.role ?? "").toUpperCase() === "ORCHESTRATOR");
+        const orchestratorRunning = entries.some(
+          (entry) =>
+            String(entry?.role ?? "").toUpperCase() === "ORCHESTRATOR" &&
+            String(entry?.status ?? "").toUpperCase() === "RUNNING",
+        );
+
+        if (orchestratorRunning || !latestOrchestrator) {
+          setTerminalHealthBanner("");
+          return;
+        }
+
+        const latestStatus = String(latestOrchestrator?.status ?? "").toUpperCase();
+        if (latestStatus !== "FAILED") {
+          setTerminalHealthBanner("");
+          return;
+        }
+
+        const detail = deriveRunFailureDetail(latestOrchestrator) || "No detailed error message was captured.";
+        const atTime = formatTime(latestOrchestrator.timestamp || latestOrchestrator.receivedAt);
+        setTerminalHealthBanner(
+          `Orchestrator loop is not running. Last run failed at ${atTime}. ${detail} Restart Runner Loop after resolving this error.`,
+        );
+      }
+
+      function renderRunner(entries) {
         runnerCountEl.textContent = `${entries.length} Run${entries.length === 1 ? "" : "s"}`;
 
         if (entries.length === 0) {
@@ -631,6 +1026,7 @@
           .map((entry) => {
             const normalizedStatus = String(entry.status ?? "").toLowerCase();
             const showBlocked = normalizedStatus === "failed" || normalizedStatus === "blocked";
+            const failureDetail = deriveRunFailureDetail(entry);
             return `
               <article class="relative rounded-xl border border-zinc-800 bg-black p-4 shadow-md shadow-white/5">
                 <div class="absolute left-0 top-5 h-4 w-1 rounded-r-full ${showBlocked ? "bg-zinc-500" : "bg-white/70"}"></div>
@@ -648,8 +1044,8 @@
                     : ""
                 }
                 ${
-                  showBlocked && entry.blockedReason
-                    ? `<p class="mt-3 rounded-lg border border-zinc-700 bg-zinc-900/80 px-3 py-2 text-xs text-zinc-300">Blocked reason: ${escapeHtml(entry.blockedReason)}</p>`
+                  showBlocked && failureDetail
+                    ? `<p class="mt-3 rounded-lg border border-zinc-700 bg-zinc-900/80 px-3 py-2 text-xs text-zinc-300">${escapeHtml(failureDetail)}</p>`
                     : ""
                 }
                 ${
@@ -1201,6 +1597,7 @@
           const payload = asObject(await response.json());
           const orchestrator = asObject(payload?.orchestrator);
           const runner = asObject(payload?.runner);
+          const runnerEntries = buildRunnerEntries(runner);
 
           const ownerHeader = response.headers.get("x-target-owner") ?? "";
           const repoHeader = response.headers.get("x-target-repo") ?? "";
@@ -1208,7 +1605,9 @@
           targetRepoEl.textContent = deriveTargetFromData(orchestrator, runner, ownerHeader, repoHeader);
           orchestratorSprintEl.textContent = deriveSprint(orchestrator);
           renderOrchestrator(orchestrator);
-          renderRunner(runner);
+          renderRunner(runnerEntries);
+          syncTerminalRuns(runnerEntries);
+          renderTerminalHealth(runnerEntries);
           computeAnimationActivity(orchestrator, runner);
           lastRefreshEl.textContent = formatTime(new Date().toISOString());
           clearError();
@@ -1231,6 +1630,16 @@
       kickoffFormEl.addEventListener("submit", submitKickoff);
       kickoffStartLoopButtonEl.addEventListener("click", startKickoffLoop);
       kickoffStartRunnerLoopButtonEl.addEventListener("click", startRunnerLoop);
+      terminalTabsEl.addEventListener("click", (event) => {
+        if (!(event.target instanceof Element)) {
+          return;
+        }
+        const button = event.target.closest("button[data-run-id]");
+        if (!button) {
+          return;
+        }
+        setActiveTerminalRun(button.getAttribute("data-run-id"));
+      });
       window.addEventListener("keydown", (event) => {
         if (event.key === "Escape" && isSettingsOpen) {
           setSettingsOpen(false);
@@ -1243,11 +1652,22 @@
       loadConfig();
       loadStatus();
       setInterval(loadStatus, POLL_INTERVAL_MS);
+      scheduleTerminalPoll(250);
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) {
+          abortTerminalPollRequest();
+          scheduleTerminalPoll(TERMINAL_HIDDEN_POLL_INTERVAL_MS);
+        } else {
+          restartTerminalPollNow();
+        }
+      });
 
       window.addEventListener("beforeunload", () => {
         if (animationFrameId) {
           window.cancelAnimationFrame(animationFrameId);
         }
+        abortTerminalPollRequest();
+        clearTerminalPollTimer();
       });
     </script>
   </body>

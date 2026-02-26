@@ -13,6 +13,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 import selectors
+from uuid import uuid4
 
 from .codex_worker import CodexWorkerError, generate_json_with_codex_mcp, run_intent_with_codex_mcp
 from .config import load_config
@@ -1906,6 +1907,135 @@ def _log_stderr(obj: Dict[str, Any]) -> None:
     sys.stderr.flush()
 
 
+class _RunTranscriptWriter:
+    def __init__(self, *, repo_root: str, run_id: str):
+        self._lock = threading.Lock()
+        self._handle: Optional[Any] = None
+        if not isinstance(repo_root, str) or not repo_root.strip():
+            return
+        if not isinstance(run_id, str) or not run_id.strip():
+            return
+        transcript_path = Path(repo_root).resolve() / f".run-transcript.{run_id.strip()}.log"
+        try:
+            transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            self._handle = transcript_path.open("w", encoding="utf8", buffering=1)
+        except OSError:
+            self._handle = None
+
+    def _write(self, text: str) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        if not isinstance(text, str) or text == "":
+            return
+        with self._lock:
+            try:
+                handle.write(text)
+                handle.flush()
+            except Exception:
+                # Transcript rendering must never interrupt orchestration.
+                pass
+
+    def _append_section(self, *, title: str, content: str) -> None:
+        normalized_content = str(content or "").strip()
+        if not normalized_content:
+            return
+        normalized_title = str(title or "").strip()
+        if not normalized_title:
+            normalized_title = "SYSTEM OBSERVATION"
+        self._write(f"\n========== {normalized_title} ==========\n{normalized_content}\n")
+
+    def append_message_to_agent(self, content: str) -> None:
+        self._append_section(title="MESSAGE TO AGENT", content=content)
+
+    def append_agent_thinking(self, content: str) -> None:
+        self._append_section(title="AGENT THINKING", content=content)
+
+    def append_system_observation(self, content: str) -> None:
+        self._append_section(title="SYSTEM OBSERVATION", content=content)
+
+    def close(self) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return
+        with self._lock:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _format_orchestrator_poll_summary(summary: Dict[str, Any]) -> str:
+    sprint = str(summary.get("sprint") or "").strip() or "Unknown"
+    poll_count = _safe_int(summary.get("poll_count"), 0)
+    status_counts = summary.get("status_counts") if isinstance(summary.get("status_counts"), dict) else {}
+    intents_emitted = summary.get("intents_emitted") if isinstance(summary.get("intents_emitted"), dict) else {}
+    skipped = summary.get("skipped") if isinstance(summary.get("skipped"), dict) else {}
+    needs_attention = summary.get("needs_attention") if isinstance(summary.get("needs_attention"), dict) else {}
+
+    backlog = _safe_int(status_counts.get("Backlog"), 0)
+    ready = _safe_int(status_counts.get("Ready"), 0)
+    in_progress = _safe_int(status_counts.get("In Progress"), 0)
+    in_review = _safe_int(status_counts.get("In Review"), 0)
+    needs_human = _safe_int(status_counts.get("Needs Human Approval"), 0)
+    blocked = _safe_int(status_counts.get("Blocked"), 0)
+    done = _safe_int(status_counts.get("Done"), 0)
+
+    executor_dispatches = _safe_int(intents_emitted.get("EXECUTOR"), 0)
+    reviewer_dispatches = _safe_int(intents_emitted.get("REVIEWER"), 0)
+    total_dispatches = _safe_int(intents_emitted.get("total"), executor_dispatches + reviewer_dispatches)
+    stalled_items = needs_attention.get("stalled_in_progress") if isinstance(needs_attention, dict) else []
+    churn_items = needs_attention.get("in_review_churn") if isinstance(needs_attention, dict) else []
+    stalled_in_progress = len(stalled_items) if isinstance(stalled_items, list) else 0
+    in_review_churn = len(churn_items) if isinstance(churn_items, list) else 0
+
+    lines = [
+        f"Poll #{poll_count} for sprint {sprint}.",
+        (
+            "Board status: "
+            f"Backlog={backlog}, Ready={ready}, In Progress={in_progress}, In Review={in_review}, "
+            f"Needs Human Approval={needs_human}, Blocked={blocked}, Done={done}"
+        ),
+        f"Dispatch decisions: Executor={executor_dispatches}, Reviewer={reviewer_dispatches}, Total={total_dispatches}",
+        (
+            "Skipped: "
+            f"not_in_scope={_safe_int(skipped.get('not_in_scope'), 0)}, "
+            f"dedupe_same_status={_safe_int(skipped.get('dedupe_same_status'), 0)}, "
+            f"concurrency_limit={_safe_int(skipped.get('concurrency_limit'), 0)}"
+        ),
+        f"Attention flags: stalled_in_progress={stalled_in_progress}, in_review_churn={in_review_churn}",
+    ]
+
+    if total_dispatches == 0:
+        lines.append("No new agent dispatches this poll.")
+    if bool(summary.get("completed")):
+        lines.append("Sprint completion condition reached: no active or backlog items remain.")
+
+    return "\n".join(lines)
+
+
+def _format_orchestrator_intent_observation(intent: RunIntent) -> str:
+    issue_number = intent.body.get("issue_number")
+    if isinstance(issue_number, int) and issue_number > 0:
+        return (
+            f"Dispatched {intent.role} run {intent.run_id} for issue #{issue_number}. "
+            f"Endpoint: {intent.endpoint}"
+        )
+    return f"Dispatched {intent.role} run {intent.run_id}. Endpoint: {intent.endpoint}"
+
+
 def _spawn_orchestrator(cmd: str, *, env: dict[str, str]) -> subprocess.Popen[str]:
     return subprocess.Popen(
         cmd,
@@ -2332,7 +2462,41 @@ def main(argv: Optional[list[str]] = None) -> int:
         _log_stderr({"type": "HARD_STOP", "reason": "preflight_fail", "payload": preflight})
         return 2
 
+    ledger: Optional[RunLedger] = None
+    if not config.dry_run:
+        ledger = RunLedger(config.ledger_path)
+
     if args.kickoff:
+        kickoff_run_id = f"kickoff-{uuid4()}"
+        if ledger:
+            ledger.upsert(
+                LedgerEntry(
+                    run_id=kickoff_run_id,
+                    role="ORCHESTRATOR",
+                    intent_hash=f"kickoff:{config.orchestrator_sprint}",
+                    received_at=_utc_now_iso(),
+                    status="queued",
+                    result=None,
+                )
+            )
+            ledger.mark_running(kickoff_run_id)
+
+        def _mark_kickoff_result(*, status: str, summary: str, errors: Optional[List[Dict[str, Any]]] = None, details: Optional[Dict[str, Any]] = None) -> None:
+            if not ledger:
+                return
+            payload: Dict[str, Any] = {
+                "run_id": kickoff_run_id,
+                "role": "ORCHESTRATOR",
+                "status": status,
+                "summary": summary,
+                "urls": {},
+                "errors": errors or [],
+                "completed_at": _utc_now_iso(),
+            }
+            if details:
+                payload["details"] = details
+            ledger.mark_result(kickoff_run_id, status="succeeded" if status == "succeeded" else "failed", result=payload)
+
         try:
             sprint = config.orchestrator_sprint
             goal_text = _read_goal_text(goal=args.goal, goal_file=args.goal_file)
@@ -2352,6 +2516,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 sandbox="read-only",
                 approval_policy="never",
                 tools_call_timeout_s=config.codex_tools_call_timeout_s,
+                run_id=kickoff_run_id,
+                repo_root=repo_root,
             )
             kickoff_plan = validate_kickoff_plan(kickoff_raw, sprint=sprint, ready_limit=ready_limit)
             draft = kickoff_plan_to_plan_apply_draft(kickoff_plan)
@@ -2377,7 +2543,23 @@ def main(argv: Optional[list[str]] = None) -> int:
                     details={"code": exc.code, "status_code": exc.status_code, "payload": exc.payload},
                 ) from None
             _log_stderr({"type": "KICKOFF_RESULT", **apply_result})
+            _mark_kickoff_result(
+                status="succeeded",
+                summary="Kickoff planning completed.",
+                details={
+                    "sprint": sprint,
+                    "ready_limit": ready_limit,
+                    "apply_status": apply_result.get("status"),
+                    "promoted_count": len(apply_result.get("promoted") or []),
+                },
+            )
         except SanitizationRegenHandoffRequestedError as exc:
+            _mark_kickoff_result(
+                status="failed",
+                summary=str(exc),
+                errors=[{"code": "sanitization_regen_handoff_requested", "message": str(exc)}],
+                details={"request_path": exc.request_path},
+            )
             _log_stderr(
                 {
                     "type": "HARD_STOP",
@@ -2389,6 +2571,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             return 6
         except SanitizationRegenExhaustedError as exc:
+            _mark_kickoff_result(
+                status="failed",
+                summary=str(exc),
+                errors=[{"code": "sanitization_regen_exhausted", "message": str(exc)}],
+            )
             _log_stderr(
                 {
                     "type": "HARD_STOP",
@@ -2399,9 +2586,20 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             return 5
         except MalformedSprintDataError as exc:
+            _mark_kickoff_result(
+                status="failed",
+                summary=str(exc),
+                errors=[{"code": "malformed_item_data", "message": str(exc)}],
+            )
             _log_stderr({"type": "HARD_STOP", "reason": "malformed_item_data", "error": str(exc)})
             return 3
         except (KickoffError, CodexWorkerError) as exc:
+            _mark_kickoff_result(
+                status="failed",
+                summary=str(exc),
+                errors=[{"code": getattr(exc, "code", "kickoff_failed"), "message": str(exc)}],
+                details=getattr(exc, "details", {}),
+            )
             _log_stderr({"type": "HARD_STOP", "reason": "kickoff_failed", "code": getattr(exc, "code", "kickoff_failed"), "details": getattr(exc, "details", {}), "error": str(exc)})
             return 2
 
@@ -2415,10 +2613,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         except CodexWorkerError as exc:
             _log_stderr({"type": "HARD_STOP", "reason": "codex_mcp_missing", "code": exc.code, "details": exc.details})
             return 2
-
-    ledger: Optional[RunLedger] = None
-    if not config.dry_run:
-        ledger = RunLedger(config.ledger_path)
 
     runner = Runner(
         backend=backend,
@@ -2481,6 +2675,65 @@ def main(argv: Optional[list[str]] = None) -> int:
             _log_stderr({"type": "HARD_STOP", "reason": "sprint_plan_invalid", "error": str(exc), "path": config.sprint_plan_path})
             return 2
 
+    orchestrator_loop_run_id = f"orchestrator-loop-{uuid4()}"
+    orchestrator_poll_summaries_seen = 0
+    orchestrator_dispatches_seen = 0
+    orchestrator_transcript = _RunTranscriptWriter(repo_root=repo_root, run_id=orchestrator_loop_run_id)
+    orchestrator_poll_interval_ms = _safe_int(orchestrator_env.get("ORCHESTRATOR_POLL_INTERVAL_MS"), 15000)
+    if orchestrator_poll_interval_ms <= 0:
+        orchestrator_poll_interval_ms = 15000
+
+    if ledger:
+        ledger.upsert(
+            LedgerEntry(
+                run_id=orchestrator_loop_run_id,
+                role="ORCHESTRATOR",
+                intent_hash=f"orchestrator-loop:{config.orchestrator_sprint}",
+                received_at=_utc_now_iso(),
+                status="queued",
+                result=None,
+            )
+        )
+        ledger.mark_running(orchestrator_loop_run_id)
+
+    def _mark_orchestrator_loop_result(
+        *,
+        status: str,
+        summary: str,
+        errors: Optional[List[Dict[str, Any]]] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not ledger:
+            return
+        result_payload: Dict[str, Any] = {
+            "run_id": orchestrator_loop_run_id,
+            "role": "ORCHESTRATOR",
+            "status": status,
+            "summary": summary,
+            "urls": {},
+            "errors": errors or [],
+            "completed_at": _utc_now_iso(),
+            "poll_summaries_seen": orchestrator_poll_summaries_seen,
+            "dispatches_seen": orchestrator_dispatches_seen,
+        }
+        if details:
+            result_payload["details"] = details
+        ledger.mark_result(
+            orchestrator_loop_run_id,
+            status="succeeded" if status == "succeeded" else "failed",
+            result=result_payload,
+        )
+
+    orchestrator_transcript.append_message_to_agent(
+        (
+            "Role: ORCHESTRATOR\n"
+            f"Mode: {'once' if config.once else 'loop'}\n"
+            f"Sprint: {config.orchestrator_sprint}\n"
+            f"Polling interval: {int(orchestrator_poll_interval_ms / 1000)}s\n"
+            "Goal: Monitor sprint board status, choose eligible work, and dispatch EXECUTOR/REVIEWER runs."
+        )
+    )
+
     proc = _spawn_orchestrator(orchestrator_cmd, env=orchestrator_env)
     assert proc.stdout is not None
     assert proc.stderr is not None
@@ -2529,24 +2782,55 @@ def main(argv: Optional[list[str]] = None) -> int:
                     sys.stderr.write(line)
                     sys.stderr.flush()
 
-                    if not config.autopromote:
-                        continue
+                    payload: Optional[Dict[str, Any]] = None
                     try:
-                        payload = parse_json_line(stripped)
+                        parsed = parse_json_line(stripped)
+                        if isinstance(parsed, dict):
+                            payload = parsed
                     except IntentError:
+                        payload = None
+
+                    if payload is None:
+                        # Preserve plain errors while suppressing raw schema noise in UI.
+                        if not stripped.startswith("{"):
+                            lowered = stripped.lower()
+                            if "fetch failed" in lowered:
+                                orchestrator_transcript.append_system_observation(
+                                    "Network request failed while orchestrator was polling GitHub/backend (fetch failed)."
+                                )
+                            else:
+                                orchestrator_transcript.append_system_observation(stripped[:2000])
                         continue
-                    if payload.get("type") == "DISPATCH_SUMMARY":
+
+                    payload_type = str(payload.get("type") or "").strip().upper()
+                    if payload_type == "DISPATCH_SUMMARY":
+                        orchestrator_poll_summaries_seen += 1
+                        intents_emitted_payload = payload.get("intents_emitted")
+                        if not isinstance(intents_emitted_payload, dict):
+                            intents_emitted_payload = {}
+                        dispatch_total = _safe_int(intents_emitted_payload.get("total"), 0)
+                        if dispatch_total > 0:
+                            orchestrator_dispatches_seen += dispatch_total
+                        orchestrator_transcript.append_agent_thinking(_format_orchestrator_poll_summary(payload))
+
                         try:
-                            _maybe_autopromote_ready(
-                                summary=payload,
-                                sprint_plan=sprint_plan,
-                                backend=backend,
-                                dry_run=config.dry_run,
-                                ready_target=config.runner_ready_buffer,
-                                sanitization_regen_attempts=config.orchestrator_sanitization_regen_attempts,
-                                orchestrator_state_path=config.orchestrator_state_path,
-                            )
+                            if config.autopromote:
+                                _maybe_autopromote_ready(
+                                    summary=payload,
+                                    sprint_plan=sprint_plan,
+                                    backend=backend,
+                                    dry_run=config.dry_run,
+                                    ready_target=config.runner_ready_buffer,
+                                    sanitization_regen_attempts=config.orchestrator_sanitization_regen_attempts,
+                                    orchestrator_state_path=config.orchestrator_state_path,
+                                )
                         except SanitizationRegenHandoffRequestedError as exc:
+                            _mark_orchestrator_loop_result(
+                                status="failed",
+                                summary=str(exc),
+                                errors=[{"code": "sanitization_regen_handoff_requested", "message": str(exc)}],
+                                details={"request_path": exc.request_path},
+                            )
                             _log_stderr(
                                 {
                                     "type": "HARD_STOP",
@@ -2558,6 +2842,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                             )
                             return 6
                         except SanitizationRegenExhaustedError as exc:
+                            _mark_orchestrator_loop_result(
+                                status="failed",
+                                summary=str(exc),
+                                errors=[{"code": "sanitization_regen_exhausted", "message": str(exc)}],
+                            )
                             _log_stderr(
                                 {
                                     "type": "HARD_STOP",
@@ -2568,10 +2857,36 @@ def main(argv: Optional[list[str]] = None) -> int:
                             )
                             return 5
                         except MalformedSprintDataError as exc:
+                            _mark_orchestrator_loop_result(
+                                status="failed",
+                                summary=str(exc),
+                                errors=[{"code": "malformed_item_data", "message": str(exc)}],
+                            )
                             _log_stderr({"type": "HARD_STOP", "reason": "malformed_item_data", "error": str(exc)})
                             return 3
-                        if not config.dry_run:
+                        if config.autopromote and not config.dry_run:
                             runner.handle_dispatch_summary(summary=payload)
+                    elif payload_type == "END_OF_SPRINT_SUMMARY":
+                        awaiting_humans = str(payload.get("awaiting_humans") or "").strip()
+                        if awaiting_humans:
+                            orchestrator_transcript.append_agent_thinking(awaiting_humans)
+                    elif payload_type == "ORCHESTRATOR_CYCLE_TRANSIENT_ERROR":
+                        retry_in_ms = _safe_int(payload.get("retry_in_ms"), 0)
+                        retry_in_s = int(retry_in_ms / 1000) if retry_in_ms > 0 else 0
+                        orchestrator_transcript.append_system_observation(
+                            (
+                                f"Transient orchestrator cycle error: {str(payload.get('error') or 'Unknown error')}\n"
+                                f"Retry in: {retry_in_s}s\n"
+                                "Action: monitor this terminal; if retries continue for several polls, verify backend/network connectivity."
+                            )
+                        )
+                    elif payload_type == "ORCHESTRATOR_STATE_RESET_INVALID_JSON":
+                        orchestrator_transcript.append_system_observation(
+                            (
+                                "Detected invalid orchestrator state JSON and reset state file.\n"
+                                f"Path: {str(payload.get('path') or '')}"
+                            )
+                        )
                     continue
 
                 try:
@@ -2590,6 +2905,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "intent_hash": intent.intent_hash,
                     }
                 )
+                orchestrator_transcript.append_system_observation(_format_orchestrator_intent_observation(intent))
 
                 if ledger and ledger.get(intent.run_id) and ledger.get(intent.run_id).get("status") == "succeeded":
                     _log_stderr({"type": "LEDGER_SKIP", "run_id": intent.run_id, "reason": "already_succeeded"})
@@ -2617,16 +2933,43 @@ def main(argv: Optional[list[str]] = None) -> int:
             proc.terminate()
         except Exception:
             pass
+        orchestrator_transcript.close()
 
     if runner.should_stop():
+        orchestrator_transcript.append_system_observation(
+            (
+                f"Runner hard-stopped the loop.\nReason: {runner.stop_reason()}\n"
+                "Action: inspect this terminal and restart the runner loop after fixing the underlying issue."
+            )
+        )
+        _mark_orchestrator_loop_result(
+            status="failed",
+            summary=runner.stop_reason(),
+            errors=[{"code": "runner_hard_stop", "message": runner.stop_reason()}],
+        )
         _log_stderr({"type": "HARD_STOP", "reason": runner.stop_reason()})
         return 2
 
     rc = proc.wait(timeout=5)
     if rc != 0:
+        orchestrator_transcript.append_system_observation(
+            (
+                f"Orchestrator process exited with code {rc}.\n"
+                "Action: review the latest error details above, then restart Runner Loop from the UI."
+            )
+        )
+        _mark_orchestrator_loop_result(
+            status="failed",
+            summary=f"orchestrator exited with code {rc}",
+            errors=[{"code": "orchestrator_nonzero_exit", "message": f"exit code {rc}"}],
+        )
         _log_stderr({"type": "HARD_STOP", "reason": "orchestrator_nonzero_exit", "exit_code": rc})
         return rc if rc in (2, 3, 4) else 2
 
+    _mark_orchestrator_loop_result(
+        status="succeeded",
+        summary="orchestrator loop finished cleanly",
+    )
     return 0
 
 

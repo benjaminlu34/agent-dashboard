@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from pathlib import Path
+import re
 import shlex
 import subprocess
 import threading
@@ -30,6 +32,65 @@ class WorkerResult:
 
 
 _MCP_PROTOCOL_VERSION = "2024-11-05"
+
+
+class _TranscriptWriter:
+    def __init__(self, *, repo_root: Optional[str], run_id: str):
+        self._lock = threading.Lock()
+        self._handle: Optional[Any] = None
+        if not isinstance(repo_root, str) or not repo_root.strip():
+            return
+        if not isinstance(run_id, str) or not run_id.strip():
+            return
+        log_path = Path(repo_root).resolve() / f".run-transcript.{run_id.strip()}.log"
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._handle = log_path.open("w", encoding="utf8", buffering=1)
+        except OSError:
+            self._handle = None
+
+    def _write(self, text: str) -> None:
+        if not isinstance(text, str) or text == "":
+            return
+        handle = self._handle
+        if handle is None:
+            return
+        with self._lock:
+            try:
+                handle.write(text)
+                handle.flush()
+            except Exception:
+                # Transcript logging must never crash worker execution.
+                pass
+
+    def append_message_to_agent(self, prompt_text: str) -> None:
+        content = str(prompt_text or "").strip()
+        self._write(f"\n========== MESSAGE TO AGENT ==========\n{content}\n")
+
+    def append_agent_thinking(self, llm_text_content: str) -> None:
+        content = str(llm_text_content or "").strip()
+        self._write(f"\n========== AGENT THINKING ==========\n{content}\n")
+
+    def append_system_observation(self, content: str) -> None:
+        normalized_content = str(content or "").strip()
+        if not normalized_content:
+            return
+        self._write("\n========== SYSTEM OBSERVATION ==========\n" f"{normalized_content}\n")
+
+    def append_tool_executed(self, tool_name: str) -> None:
+        normalized_tool_name = str(tool_name or "").strip() or "unknown"
+        self.append_system_observation(f"Tool '{normalized_tool_name}' executed.")
+
+    def close(self) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return
+        with self._lock:
+            try:
+                handle.close()
+            except Exception:
+                pass
 
 
 class _JsonRpcClient:
@@ -102,10 +163,10 @@ class _JsonRpcClient:
         if not ready:
             return None
 
-        line = self._proc.stdout.readline()
-        if line == "":
+        raw_line = self._proc.stdout.readline()
+        if raw_line == "":
             return None
-        line = line.strip()
+        line = raw_line.strip()
         if not line:
             return None
         try:
@@ -131,10 +192,176 @@ def _spawn_codex_mcp_server(*, codex_bin: str, codex_mcp_args: str) -> subproces
         argv,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=None,  # inherit for visibility; avoids pipe deadlocks
+        stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
     )
+
+
+_STDERR_ERROR_HINT_RE = re.compile(r"(error|failed|exception|traceback|timeout|refused|unreachable)", re.IGNORECASE)
+_STDERR_COMMAND_HINT_RE = re.compile(
+    r"^(?:\$|command:|running command:|run command:)\s*(.+)$",
+    re.IGNORECASE,
+)
+
+
+def _clip_text(value: Any, *, max_chars: int = 400) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def _extract_exec_commands_from_payload(payload: Any) -> list[str]:
+    commands: list[str] = []
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            recipient_name = node.get("recipient_name")
+            parameters = node.get("parameters")
+            cmd = node.get("cmd")
+
+            if (
+                isinstance(recipient_name, str)
+                and recipient_name in ("functions.exec_command", "exec_command")
+                and isinstance(parameters, dict)
+                and isinstance(parameters.get("cmd"), str)
+                and parameters.get("cmd").strip()
+            ):
+                commands.append(parameters.get("cmd").strip())
+
+            if isinstance(cmd, str) and cmd.strip():
+                tool_name = str(node.get("tool") or node.get("name") or "").strip().lower()
+                if tool_name in ("exec_command", "functions.exec_command", "shell", "command"):
+                    commands.append(cmd.strip())
+
+            for key in ("tool_uses", "steps", "actions"):
+                value = node.get(key)
+                if isinstance(value, list):
+                    for entry in value:
+                        visit(entry)
+
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    visit(value)
+        elif isinstance(node, list):
+            for entry in node:
+                visit(entry)
+
+    visit(payload)
+
+    # Preserve order while deduping.
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for command in commands:
+        if command in seen:
+            continue
+        seen.add(command)
+        deduped.append(command)
+    return deduped
+
+
+def _extract_error_message_from_payload(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+
+    candidates: list[str] = []
+
+    def append_text(value: Any) -> None:
+        if isinstance(value, str) and value.strip():
+            candidates.append(value.strip())
+        elif isinstance(value, dict):
+            for key in ("message", "error", "code", "detail"):
+                if isinstance(value.get(key), str) and value.get(key).strip():
+                    candidates.append(value.get(key).strip())
+        elif isinstance(value, list):
+            for entry in value:
+                append_text(entry)
+
+    for key in ("error", "message", "msg", "details", "exception"):
+        append_text(payload.get(key))
+
+    for candidate in candidates:
+        if _STDERR_ERROR_HINT_RE.search(candidate):
+            return _clip_text(candidate, max_chars=600)
+    return ""
+
+
+def _extract_transcript_observations_from_stderr_line(line: str) -> list[str]:
+    stripped = str(line or "").strip()
+    if not stripped:
+        return []
+
+    observations: list[str] = []
+
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        payload = None
+
+    if isinstance(payload, dict):
+        method = payload.get("method")
+        if isinstance(method, str) and method in {"initialize", "tools/list", "shutdown", "notifications/initialized", "exit"}:
+            return []
+
+        for command in _extract_exec_commands_from_payload(payload):
+            observations.append(f"Command: {_clip_text(command, max_chars=600)}")
+
+        error_message = _extract_error_message_from_payload(payload)
+        if error_message:
+            observations.append(f"Worker error detail: {error_message}")
+        return observations
+
+    command_match = _STDERR_COMMAND_HINT_RE.match(stripped)
+    if command_match:
+        command = command_match.group(1).strip()
+        if command:
+            observations.append(f"Command: {_clip_text(command, max_chars=600)}")
+            return observations
+
+    if _STDERR_ERROR_HINT_RE.search(stripped):
+        observations.append(f"Worker stderr: {_clip_text(stripped, max_chars=600)}")
+    return observations
+
+
+class _CodexStderrMonitor:
+    def __init__(self, *, proc: subprocess.Popen[str], transcript_writer: _TranscriptWriter):
+        self._proc = proc
+        self._transcript_writer = transcript_writer
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._last_observation = ""
+
+    def start(self) -> None:
+        stderr = self._proc.stderr
+        if stderr is None:
+            return
+        self._thread = threading.Thread(target=self._run, name="codex-stderr-monitor", daemon=True)
+        self._thread.start()
+
+    def stop(self, *, timeout_s: float = 1.0) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is None:
+            return
+        thread.join(timeout=timeout_s)
+
+    def _run(self) -> None:
+        stderr = self._proc.stderr
+        if stderr is None:
+            return
+        while not self._stop_event.is_set():
+            try:
+                raw_line = stderr.readline()
+            except Exception:
+                return
+            if raw_line == "":
+                return
+            for observation in _extract_transcript_observations_from_stderr_line(raw_line):
+                if observation == self._last_observation:
+                    continue
+                self._last_observation = observation
+                self._transcript_writer.append_system_observation(observation)
 
 
 def _extract_worker_result(*, content: str, expected_run_id: str, expected_role: str) -> WorkerResult:
@@ -227,6 +454,54 @@ def _extract_codex_text_from_tool_result(tool_result: dict[str, Any]) -> str:
             return joined
 
     raise CodexWorkerError("codex tool returned no text content", code="worker_invalid_output", details={"result": tool_result})
+
+
+def _to_transcript_thinking_text(content: str) -> str:
+    raw = str(content or "").strip()
+    if not raw:
+        return ""
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+
+    if not isinstance(parsed, dict):
+        return raw
+
+    lines: list[str] = []
+    summary = parsed.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        lines.append(summary.strip())
+
+    status = parsed.get("status")
+    if isinstance(status, str) and status.strip():
+        lines.append(f"Status: {status.strip()}")
+
+    outcome = parsed.get("outcome")
+    if isinstance(outcome, str) and outcome.strip():
+        lines.append(f"Outcome: {outcome.strip()}")
+
+    urls = parsed.get("urls")
+    if isinstance(urls, dict) and len(urls) > 0:
+        lines.append("Linked URLs:")
+        for key in sorted(urls.keys()):
+            value = urls.get(key)
+            if isinstance(value, str) and value.strip():
+                lines.append(f"- {key}: {value.strip()}")
+
+    errors = parsed.get("errors")
+    if isinstance(errors, list) and len(errors) > 0:
+        lines.append("Errors:")
+        for entry in errors:
+            if isinstance(entry, dict):
+                message = entry.get("message") or entry.get("error") or entry.get("code")
+                if isinstance(message, str) and message.strip():
+                    lines.append(f"- {message.strip()}")
+                    continue
+            lines.append(f"- {str(entry)}")
+
+    return "\n".join(lines) if len(lines) > 0 else raw
 
 
 def _extract_thread_id_from_tool_result(tool_result: dict[str, Any]) -> str:
@@ -337,6 +612,7 @@ def run_intent_with_codex_mcp(
     role_bundle: Dict[str, Any],
     intent: Dict[str, Any],
     tools_call_timeout_s: float = 600.0,
+    repo_root: Optional[str] = None,
 ) -> WorkerResult:
     """Execute one intent by spawning `codex mcp-server` and calling the `codex` tool via MCP (stdio).
 
@@ -350,9 +626,17 @@ def run_intent_with_codex_mcp(
     if not expected_run_id:
         raise CodexWorkerError("intent run_id is required", code="worker_invalid_intent")
 
+    resolved_repo_root = repo_root
+    if not isinstance(resolved_repo_root, str) or not resolved_repo_root.strip():
+        resolved_repo_root = str(Path(__file__).resolve().parents[2])
+
+    transcript_writer = _TranscriptWriter(repo_root=resolved_repo_root, run_id=expected_run_id)
     proc = _spawn_codex_mcp_server(codex_bin=codex_bin, codex_mcp_args=codex_mcp_args)
     client = _JsonRpcClient(proc)
+    stderr_monitor = _CodexStderrMonitor(proc=proc, transcript_writer=transcript_writer)
+    stderr_monitor.start()
     try:
+        transcript_writer.append_system_observation("Initializing Codex MCP session.")
         init = client.call(
             "initialize",
             {
@@ -383,6 +667,8 @@ def run_intent_with_codex_mcp(
             raise CodexWorkerError("backend_base_url is required", code="worker_invalid_intent")
 
         prompt = _build_worker_prompt(role_bundle=role_bundle, intent=intent, backend_base_url=backend_base_url.strip())
+        transcript_writer.append_message_to_agent(prompt)
+        transcript_writer.append_system_observation("Dispatching task to agent.")
         bundle_instructions = _bundle_to_base_instructions(role_bundle)
         tool_result = client.call(
             "tools/call",
@@ -406,13 +692,17 @@ def run_intent_with_codex_mcp(
             },
             timeout_s=tools_call_timeout_s,
         )
+        transcript_writer.append_tool_executed("codex")
+        transcript_writer.append_system_observation("Agent response received.")
 
         thread_id = _extract_thread_id_from_tool_result(tool_result)
         text = _extract_codex_text_from_tool_result(tool_result)
+        transcript_writer.append_agent_thinking(_to_transcript_thinking_text(text))
         try:
             return _extract_worker_result(content=text, expected_run_id=expected_run_id, expected_role=expected_role)
         except CodexWorkerError:
             # One strict re-ask to remove ambiguity about output shape.
+            transcript_writer.append_system_observation("Initial agent response was not valid JSON; requesting strict JSON replay.")
             tool_result_2 = client.call(
                 "tools/call",
                 {
@@ -427,9 +717,21 @@ def run_intent_with_codex_mcp(
                 },
                 timeout_s=180.0,
             )
+            transcript_writer.append_tool_executed("codex-reply")
+            transcript_writer.append_system_observation("Received strict JSON replay from agent.")
             text2 = _extract_codex_text_from_tool_result(tool_result_2)
+            transcript_writer.append_agent_thinking(_to_transcript_thinking_text(text2))
             return _extract_worker_result(content=text2, expected_run_id=expected_run_id, expected_role=expected_role)
+    except Exception as exc:
+        if isinstance(exc, CodexWorkerError):
+            transcript_writer.append_system_observation(
+                f"Worker failure ({exc.code}): {_clip_text(exc, max_chars=700)}"
+            )
+        else:
+            transcript_writer.append_system_observation(f"Worker failure: {_clip_text(exc, max_chars=700)}")
+        raise
     finally:
+        stderr_monitor.stop(timeout_s=0.5)
         try:
             client.call("shutdown", {}, timeout_s=5.0)
             client.notify("exit", {})
@@ -439,6 +741,11 @@ def run_intent_with_codex_mcp(
             proc.terminate()
         except Exception:
             pass
+        try:
+            proc.wait(timeout=2.0)
+        except Exception:
+            pass
+        transcript_writer.close()
 
 
 def generate_json_with_codex_mcp(
@@ -451,6 +758,8 @@ def generate_json_with_codex_mcp(
     sandbox: str = "read-only",
     approval_policy: str = "never",
     tools_call_timeout_s: float = 600.0,
+    run_id: Optional[str] = None,
+    repo_root: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Spawn `codex mcp-server` and ask Codex to output a single JSON object (no prose)."""
     if not isinstance(prompt, str) or not prompt.strip():
@@ -458,9 +767,13 @@ def generate_json_with_codex_mcp(
     if not isinstance(developer_instructions, str) or not developer_instructions.strip():
         raise CodexWorkerError("developer_instructions is required", code="codex_invalid_prompt")
 
+    transcript_writer = _TranscriptWriter(repo_root=repo_root, run_id=str(run_id or "").strip())
     proc = _spawn_codex_mcp_server(codex_bin=codex_bin, codex_mcp_args=codex_mcp_args)
     client = _JsonRpcClient(proc)
+    stderr_monitor = _CodexStderrMonitor(proc=proc, transcript_writer=transcript_writer)
+    stderr_monitor.start()
     try:
+        transcript_writer.append_system_observation("Initializing Codex MCP session.")
         init = client.call(
             "initialize",
             {
@@ -488,6 +801,8 @@ def generate_json_with_codex_mcp(
             raise CodexWorkerError("codex tool not available on mcp server", code="mcp_missing_codex_tool")
 
         bundle_instructions = _bundle_to_base_instructions(role_bundle)
+        transcript_writer.append_message_to_agent(prompt)
+        transcript_writer.append_system_observation("Dispatching task to agent.")
         tool_result = client.call(
             "tools/call",
             {
@@ -503,12 +818,16 @@ def generate_json_with_codex_mcp(
             },
             timeout_s=tools_call_timeout_s,
         )
+        transcript_writer.append_tool_executed("codex")
+        transcript_writer.append_system_observation("Agent response received.")
 
         thread_id = _extract_thread_id_from_tool_result(tool_result)
         text = _extract_codex_text_from_tool_result(tool_result)
+        transcript_writer.append_agent_thinking(_to_transcript_thinking_text(text))
         try:
             parsed = json.loads(text.strip())
         except json.JSONDecodeError:
+            transcript_writer.append_system_observation("Initial agent response was not valid JSON; requesting strict JSON replay.")
             tool_result_2 = client.call(
                 "tools/call",
                 {
@@ -520,7 +839,10 @@ def generate_json_with_codex_mcp(
                 },
                 timeout_s=180.0,
             )
+            transcript_writer.append_tool_executed("codex-reply")
+            transcript_writer.append_system_observation("Received strict JSON replay from agent.")
             text2 = _extract_codex_text_from_tool_result(tool_result_2)
+            transcript_writer.append_agent_thinking(_to_transcript_thinking_text(text2))
             try:
                 parsed = json.loads(text2.strip())
             except json.JSONDecodeError as exc:
@@ -534,7 +856,16 @@ def generate_json_with_codex_mcp(
             raise CodexWorkerError("codex kickoff output must be a JSON object", code="worker_invalid_output")
 
         return parsed
+    except Exception as exc:
+        if isinstance(exc, CodexWorkerError):
+            transcript_writer.append_system_observation(
+                f"Worker failure ({exc.code}): {_clip_text(exc, max_chars=700)}"
+            )
+        else:
+            transcript_writer.append_system_observation(f"Worker failure: {_clip_text(exc, max_chars=700)}")
+        raise
     finally:
+        stderr_monitor.stop(timeout_s=0.5)
         try:
             client.call("shutdown", {}, timeout_s=5.0)
             client.notify("exit", {})
@@ -544,3 +875,8 @@ def generate_json_with_codex_mcp(
             proc.terminate()
         except Exception:
             pass
+        try:
+            proc.wait(timeout=2.0)
+        except Exception:
+            pass
+        transcript_writer.close()

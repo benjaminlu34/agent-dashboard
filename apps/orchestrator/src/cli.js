@@ -502,12 +502,20 @@ async function runCycle({
   }
 
   const useFixtureItems = hasNonEmptyString(env.ORCHESTRATOR_ITEMS_FILE);
-  const githubClient = useFixtureItems
-    ? null
-    : await createGitHubPlanApplyClient({
+  let githubClient = null;
+  if (!useFixtureItems) {
+    try {
+      githubClient = await createGitHubPlanApplyClient({
         repoRoot,
         projectIdentity: buildClientIdentity(targetIdentity),
       });
+    } catch (error) {
+      if (isLikelyNetworkFetchError(error)) {
+        throw toTransientNetworkError(error, "failed to initialize GitHub project client");
+      }
+      throw error;
+    }
+  }
 
   const projectItems = await readProjectItems({ githubClient, env });
   return buildRunPlan({
