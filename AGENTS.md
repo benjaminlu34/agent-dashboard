@@ -48,7 +48,7 @@
 ## Runner Contracts
 - DO NOT relax intent parsing strictness in `apps/runner/intents.py`; unknown fields and role/run_id mismatches must fail closed.
 - DO NOT widen per-role endpoint allowlists without policy and contract updates.
-- DO NOT change worker sandbox mapping: `EXECUTOR` is `workspace-write`, `REVIEWER` is `read-only`.
+- DO NOT remove worker backend endpoint reachability; runner worker roles currently use `danger-full-access`.
 - DO NOT replace MCP stdio JSON-RPC flow with ad hoc protocols; runner is contractually MCP-based.
 - DO NOT remove required Codex MCP server checks for `github` and `github_projects`.
 - DO NOT accept reviewer results without explicit `outcome` (`PASS|FAIL|INCOMPLETE`).
