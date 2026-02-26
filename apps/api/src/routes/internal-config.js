@@ -69,9 +69,6 @@ async function withRepoConfigWriteLock(repoRoot, fn) {
     return await fn();
   } finally {
     unlock();
-    if (mutex.isIdle()) {
-      REPO_CONFIG_MUTEXES.delete(key);
-    }
   }
 }
 
