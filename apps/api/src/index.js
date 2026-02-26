@@ -12,6 +12,7 @@ import { registerInternalExecutorClaimReadyItemRoute } from "./routes/internal-e
 import { registerInternalReviewerResolveLinkedPrRoute } from "./routes/internal-reviewer-resolve-linked-pr.js";
 import { registerInternalStatusRoute } from "./routes/internal-status.js";
 import { registerInternalMetadataRoute } from "./routes/internal-metadata.js";
+import { registerInternalConfigRoute } from "./routes/internal-config.js";
 
 const MODULE_DIRNAME = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../");
@@ -35,6 +36,7 @@ export async function buildApp({ repoRoot = DEFAULT_REPO_ROOT, logger = true } =
       RUNNER_LEDGER_PATH: process.env.RUNNER_LEDGER_PATH,
     },
   });
+  await registerInternalConfigRoute(app, routeOptions);
 
   await app.register(fastifyStatic, {
     root: resolve(repoRoot, "apps/web/public"),
