@@ -1,3 +1,4 @@
+import dns from "node:dns";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,6 +8,8 @@ import { loadAgentContextBundle } from "../../api/src/internal/agent-context-loa
 import { createGitHubPlanApplyClient } from "../../api/src/internal/github-plan-apply-client.js";
 import { resolveTargetIdentity, TargetIdentityError } from "../../api/src/internal/target-identity.js";
 import { buildRunPlan } from "./intents.js";
+
+dns.setDefaultResultOrder("ipv4first");
 
 const MODULE_DIRNAME = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../");
@@ -192,6 +195,46 @@ function parseArgs(argv) {
     }
   }
   return { runMode };
+}
+
+async function readDotEnv(cwd) {
+  const envPath = resolve(cwd, ".env");
+  let raw;
+  try {
+    raw = await readFile(envPath, "utf8");
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return {};
+    }
+    throw error;
+  }
+
+  const parsed = {};
+  const linePattern = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/;
+  for (const line of raw.split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+
+    const match = line.match(linePattern);
+    if (!match) {
+      continue;
+    }
+
+    const key = match[1];
+    let value = match[2].trim();
+    if (
+      value.length >= 2 &&
+      ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
+    ) {
+      value = value.slice(1, -1);
+    }
+
+    parsed[key] = value;
+  }
+
+  return parsed;
 }
 
 function sleep(ms) {
@@ -566,14 +609,21 @@ export async function runOrchestratorCli({
 } = {}) {
   const { runMode } = parseArgs(argv);
   const resolvedRepoRoot = resolve(repoRoot);
-  const maxExecutors = parsePositiveIntEnv("ORCHESTRATOR_MAX_EXECUTORS", DEFAULT_MAX_EXECUTORS, env);
-  const maxReviewers = parsePositiveIntEnv("ORCHESTRATOR_MAX_REVIEWERS", DEFAULT_MAX_REVIEWERS, env);
-  const pollIntervalMs = parsePositiveIntEnv("ORCHESTRATOR_POLL_INTERVAL_MS", DEFAULT_POLL_INTERVAL_MS, env);
-  const stallMinutes = parsePositiveIntEnv("ORCHESTRATOR_STALL_MINUTES", DEFAULT_STALL_MINUTES, env);
-  const reviewChurnPolls = parsePositiveIntEnv("ORCHESTRATOR_REVIEW_CHURN_POLLS", DEFAULT_REVIEW_CHURN_POLLS, env);
-  const sprint = resolveSprint(env);
+  const liveEnv = await readDotEnv(resolvedRepoRoot);
+  const mergedEnv = { ...env, ...liveEnv };
+  const resolvedBackendBaseUrl = hasNonEmptyString(mergedEnv.ORCHESTRATOR_BACKEND_BASE_URL)
+    ? mergedEnv.ORCHESTRATOR_BACKEND_BASE_URL.trim()
+    : backendBaseUrl;
+  const maxExecutors = parsePositiveIntEnv("ORCHESTRATOR_MAX_EXECUTORS", DEFAULT_MAX_EXECUTORS, mergedEnv);
+  const maxReviewers = parsePositiveIntEnv("ORCHESTRATOR_MAX_REVIEWERS", DEFAULT_MAX_REVIEWERS, mergedEnv);
+  const pollIntervalMs = parsePositiveIntEnv("ORCHESTRATOR_POLL_INTERVAL_MS", DEFAULT_POLL_INTERVAL_MS, mergedEnv);
+  const stallMinutes = parsePositiveIntEnv("ORCHESTRATOR_STALL_MINUTES", DEFAULT_STALL_MINUTES, mergedEnv);
+  const reviewChurnPolls = parsePositiveIntEnv("ORCHESTRATOR_REVIEW_CHURN_POLLS", DEFAULT_REVIEW_CHURN_POLLS, mergedEnv);
+  const sprint = resolveSprint(mergedEnv);
   const defaultStatePath = await resolveDefaultStatePath({ cwd: resolvedRepoRoot });
-  const rawStatePath = hasNonEmptyString(env.ORCHESTRATOR_STATE_PATH) ? env.ORCHESTRATOR_STATE_PATH.trim() : defaultStatePath;
+  const rawStatePath = hasNonEmptyString(mergedEnv.ORCHESTRATOR_STATE_PATH)
+    ? mergedEnv.ORCHESTRATOR_STATE_PATH.trim()
+    : defaultStatePath;
   const statePath = resolve(resolvedRepoRoot, rawStatePath);
 
   do {
@@ -582,14 +632,14 @@ export async function runOrchestratorCli({
     try {
       cycleResult = await runCycle({
         repoRoot: resolvedRepoRoot,
-        backendBaseUrl,
+        backendBaseUrl: resolvedBackendBaseUrl,
         maxExecutors,
         maxReviewers,
         sprint,
         stallMinutes,
         reviewChurnPolls,
         previousState: currentState,
-        env,
+        env: mergedEnv,
       });
     } catch (error) {
       if (runMode === "loop" && (error?.code === "transient_network_error" || error?.code === "transient_retries_exhausted")) {

@@ -159,6 +159,29 @@ def load_config(
 ) -> RunnerConfig:
     resolved_env = dict(os.environ) if env is None else dict(env)
     resolved_cwd = Path(cwd).resolve() if cwd is not None else Path.cwd()
+    dotenv_path = resolved_cwd / ".env"
+    try:
+        dotenv_raw = dotenv_path.read_text(encoding="utf8")
+    except FileNotFoundError:
+        dotenv_raw = ""
+
+    line_pattern = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$")
+    for line in dotenv_raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = line_pattern.match(line)
+        if match is None:
+            continue
+        key = match.group(1)
+        value = match.group(2).strip()
+        if len(value) >= 2 and (
+            (value.startswith('"') and value.endswith('"'))
+            or (value.startswith("'") and value.endswith("'"))
+        ):
+            value = value[1:-1]
+        resolved_env[key] = value
+
     default_ledger_path, default_orchestrator_state_path = _resolve_repo_scoped_state_defaults(resolved_cwd)
 
     backend_base_url = resolved_env.get("BACKEND_BASE_URL", DEFAULT_BACKEND_BASE_URL).strip() or DEFAULT_BACKEND_BASE_URL
