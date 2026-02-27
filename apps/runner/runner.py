@@ -10,7 +10,7 @@ import threading
 import time
 from datetime import datetime, timezone
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from pathlib import Path
 import selectors
 from uuid import uuid4
@@ -966,6 +966,8 @@ class Runner:
         self._in_flight_lock = threading.Lock()
         self._in_flight_cond = threading.Condition(self._in_flight_lock)
         self._in_flight_by_issue: Dict[int, Dict[str, str]] = {}
+        self._timed_out_runs_lock = threading.Lock()
+        self._timed_out_runs: Set[str] = set()
 
     def reconcile_startup_state(self, *, sprint: str) -> Dict[str, Any]:
         try:
@@ -1174,14 +1176,34 @@ class Runner:
                 self._in_flight_cond.wait(timeout=0.5)
                 waited_s += 0.5
 
-    def _release_issue_slot(self, *, issue_number: int, run_id: str) -> None:
+    def _release_issue_slot(self, *, issue_number: int, run_id: str) -> bool:
         if issue_number <= 0 or not run_id:
-            return
+            return False
         with self._in_flight_cond:
             current = self._in_flight_by_issue.get(issue_number)
             if isinstance(current, dict) and current.get("run_id") == run_id:
                 del self._in_flight_by_issue[issue_number]
                 self._in_flight_cond.notify_all()
+                return True
+        return False
+
+    def _mark_run_timed_out(self, *, run_id: str) -> None:
+        if not run_id:
+            return
+        with self._timed_out_runs_lock:
+            self._timed_out_runs.add(run_id)
+
+    def _clear_run_timed_out(self, *, run_id: str) -> None:
+        if not run_id:
+            return
+        with self._timed_out_runs_lock:
+            self._timed_out_runs.discard(run_id)
+
+    def _is_run_timed_out(self, *, run_id: str) -> bool:
+        if not run_id:
+            return False
+        with self._timed_out_runs_lock:
+            return run_id in self._timed_out_runs
 
     def _read_orchestrator_state(self) -> Dict[str, Any]:
         try:
@@ -1369,6 +1391,35 @@ class Runner:
         }
         return self._backend.post_json("/internal/project-item/update-field", body=body)
 
+    def _transition_stalled_in_progress_to_blocked(
+        self,
+        *,
+        issue_number: int,
+        project_item_id: str,
+        run_id: str,
+        stuck_minutes: int,
+        status_since_at: str,
+    ) -> Dict[str, Any]:
+        body = {
+            "role": "ORCHESTRATOR",
+            "project_item_id": project_item_id,
+            "field": "Status",
+            "value": "Blocked",
+            "issue_number": issue_number,
+            "failure_classification": "ITEM_STOP",
+            "failure_message": (
+                "Detected stale In Progress state without an active executor run; "
+                f"stuck for {stuck_minutes} minutes since {status_since_at or 'unknown'}."
+            ),
+            "suggested_next_steps": [
+                "Inspect runner logs and linked execution artifacts for this issue.",
+                "Requeue work by moving item to Ready after triage.",
+            ],
+            "run_id": run_id,
+            "stuck_minutes": stuck_minutes,
+        }
+        return self._backend.post_json("/internal/project-item/update-field", body=body)
+
     def _recover_passed_in_review_items(self, *, summary: Dict[str, Any]) -> None:
         processed_items = summary.get("processed_items")
         if not isinstance(processed_items, list):
@@ -1529,6 +1580,75 @@ class Runner:
                         "in_review_polls": in_review_polls,
                         "error": str(exc),
                         "status": "failed",
+                    }
+                )
+
+    def _handle_stalled_in_progress(self, *, summary: Dict[str, Any]) -> None:
+        needs_attention = summary.get("needs_attention")
+        if not isinstance(needs_attention, dict):
+            return
+        stalled_entries = needs_attention.get("stalled_in_progress")
+        if not isinstance(stalled_entries, list):
+            return
+
+        for entry in stalled_entries:
+            if not isinstance(entry, dict):
+                continue
+            issue_number = entry.get("issue_number")
+            project_item_id = entry.get("project_item_id")
+            stuck_minutes = entry.get("stuck_minutes")
+            status_since_at = str(entry.get("status_since_at") or "").strip()
+            if not isinstance(issue_number, int) or issue_number <= 0:
+                continue
+            if not isinstance(project_item_id, str) or not project_item_id.strip():
+                continue
+            if not isinstance(stuck_minutes, int) or stuck_minutes <= 0:
+                continue
+
+            state_item = self._resolve_project_state_item(project_item_id)
+            if not isinstance(state_item, dict):
+                continue
+            if state_item.get("last_seen_status") != "In Progress":
+                continue
+
+            run_id = str(state_item.get("last_run_id") or "").strip()
+            if self._ledger and run_id:
+                ledger_entry = self._ledger.get(run_id)
+                if isinstance(ledger_entry, dict):
+                    ledger_status = str(ledger_entry.get("status") or "").strip().lower()
+                    if ledger_status == "running":
+                        continue
+
+            try:
+                payload = self._transition_stalled_in_progress_to_blocked(
+                    issue_number=issue_number,
+                    project_item_id=project_item_id,
+                    run_id=run_id,
+                    stuck_minutes=stuck_minutes,
+                    status_since_at=status_since_at,
+                )
+                _log_stderr(
+                    {
+                        "type": "STALLED_IN_PROGRESS_BLOCKED",
+                        "issue_number": issue_number,
+                        "project_item_id": project_item_id,
+                        "run_id": run_id,
+                        "stuck_minutes": stuck_minutes,
+                        "status_since_at": status_since_at,
+                        "backend_payload": payload,
+                    }
+                )
+            except Exception as exc:
+                _log_stderr(
+                    {
+                        "type": "STALLED_IN_PROGRESS_BLOCKED",
+                        "issue_number": issue_number,
+                        "project_item_id": project_item_id,
+                        "run_id": run_id,
+                        "stuck_minutes": stuck_minutes,
+                        "status_since_at": status_since_at,
+                        "status": "failed",
+                        "error": str(exc),
                     }
                 )
 
@@ -1785,6 +1905,8 @@ class Runner:
                     "error_code": "watchdog_timeout",
                 },
             )
+            self._mark_run_timed_out(run_id=run_id)
+            slot_released = self._release_issue_slot(issue_number=issue_number, run_id=run_id)
             run_role = str(ledger_entry.get("role") or "").strip().upper()
             _log_stderr(
                 {
@@ -1795,6 +1917,7 @@ class Runner:
                     "project_item_id": project_item_id,
                     "elapsed_s": elapsed_seconds,
                     "timeout_s": self._watchdog_timeout_s,
+                    "slot_released": slot_released,
                 }
             )
             if run_role == "REVIEWER":
@@ -1836,6 +1959,7 @@ class Runner:
             ("recover_passed_in_review_items", self._recover_passed_in_review_items),
             ("recover_lost_in_review_reviewer_dispatches", self._recover_lost_in_review_reviewer_dispatches),
             ("handle_review_stall", self._handle_review_stall),
+            ("handle_stalled_in_progress", self._handle_stalled_in_progress),
             ("handle_blocked_retries", self._handle_blocked_retries),
             ("handle_in_review_cycle_caps", self._handle_in_review_cycle_caps),
             ("handle_running_watchdog", self._handle_running_watchdog),
@@ -2105,7 +2229,28 @@ class Runner:
                 tools_call_timeout_s=self._codex_tools_call_timeout_s,
                 transcript_event_sink=_intent_transcript_sink,
             )
+            if self._is_run_timed_out(run_id=intent.run_id):
+                _log_stderr(
+                    {
+                        "type": "WORKER_RESULT_IGNORED",
+                        "role": intent.role,
+                        "run_id": intent.run_id,
+                        "reason": "run_timed_out_by_watchdog",
+                    }
+                )
+                return
         except Exception as exc:
+            if self._is_run_timed_out(run_id=intent.run_id):
+                _log_stderr(
+                    {
+                        "type": "WORKER_RESULT_IGNORED",
+                        "role": intent.role,
+                        "run_id": intent.run_id,
+                        "reason": "run_timed_out_by_watchdog",
+                        "source": "worker_exception",
+                    }
+                )
+                return
             heartbeat_stop.set()
             failure_classification = classify_failure(exc)
             error_code = exc.code if isinstance(exc, (CodexWorkerError, HttpError, IntentError)) else "unknown_error"
@@ -2324,6 +2469,7 @@ class Runner:
                 )
             raise
         finally:
+            self._clear_run_timed_out(run_id=intent.run_id)
             release_issue_slot_once()
 
 
