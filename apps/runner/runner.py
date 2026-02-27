@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -21,6 +22,71 @@ from .http_client import BackendClient, HttpError
 from .intents import IntentError, RunIntent, parse_intent, parse_json_line
 from .ledger import LedgerEntry, RunLedger
 from .kickoff import KickoffError, kickoff_plan_to_plan_apply_draft, validate_kickoff_plan
+
+_stderr_lock = threading.Lock()
+
+_active_runner: Optional["Runner"] = None
+_active_orchestrator_proc: Optional[subprocess.Popen[str]] = None
+_signal_exit_in_progress = False
+
+
+def _set_active_runner(runner: Optional["Runner"]) -> None:
+    global _active_runner
+    _active_runner = runner
+
+
+def _set_active_orchestrator_proc(proc: Optional[subprocess.Popen[str]]) -> None:
+    global _active_orchestrator_proc
+    _active_orchestrator_proc = proc
+
+
+def _terminate_orchestrator_proc() -> None:
+    proc = _active_orchestrator_proc
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def _handle_shutdown_signal(signum: int, frame: Any) -> None:
+    # Signal handlers should be fast and defensive: set runner hard stop, stop child proc,
+    # then exit so the interpreter can unwind finally blocks and exit cleanly.
+    global _signal_exit_in_progress
+    if _signal_exit_in_progress:
+        _terminate_orchestrator_proc()
+        raise SystemExit(128 + int(signum))
+
+    _signal_exit_in_progress = True
+    runner = _active_runner
+    if runner is not None:
+        try:
+            try:
+                signal_name = signal.Signals(signum).name
+            except Exception:
+                signal_name = str(signum)
+            runner.hard_stop(f"signal:{signal_name}")
+        except Exception:
+            pass
+
+    _terminate_orchestrator_proc()
+    raise SystemExit(128 + int(signum))
+
+
+def _register_global_signal_handlers() -> None:
+    try:
+        signal.signal(signal.SIGINT, _handle_shutdown_signal)
+        signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    except Exception:
+        # Signal registration fails when runner is imported off the main thread.
+        pass
+
+
+_register_global_signal_handlers()
 
 
 def _utc_now_iso() -> str:
@@ -2474,8 +2540,9 @@ class Runner:
 
 
 def _log_stderr(obj: Dict[str, Any]) -> None:
-    sys.stderr.write(json.dumps(obj, separators=(",", ":"), ensure_ascii=True) + "\n")
-    sys.stderr.flush()
+    with _stderr_lock:
+        sys.stderr.write(json.dumps(obj, separators=(",", ":"), ensure_ascii=True) + "\n")
+        sys.stderr.flush()
 
 
 _TRANSCRIPT_EVENT_QUEUE_MAX = 1024
@@ -2686,15 +2753,29 @@ def _format_orchestrator_intent_observation(intent: RunIntent) -> str:
 
 
 def _spawn_orchestrator(cmd: str, *, env: dict[str, str]) -> subprocess.Popen[str]:
-    return subprocess.Popen(
-        cmd,
-        shell=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-        bufsize=1,
-    )
+    proc: Optional[subprocess.Popen[str]] = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            bufsize=1,
+        )
+        _set_active_orchestrator_proc(proc)
+        return proc
+    except BaseException:
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            except Exception:
+                pass
+        raise
 
 
 def _assert_codex_github_mcp_available(*, codex_bin: str) -> None:
@@ -3286,6 +3367,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         blocked_retry_minutes=config.blocked_retry_minutes,
         watchdog_timeout_s=config.watchdog_timeout_s,
     )
+    _set_active_runner(runner)
 
     try:
         runner.reconcile_startup_state(sprint=config.orchestrator_sprint)
@@ -3412,6 +3494,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     proc = _spawn_orchestrator(orchestrator_cmd, env=orchestrator_env)
+    _set_active_orchestrator_proc(proc)
     assert proc.stdout is not None
     assert proc.stderr is not None
 
@@ -3608,8 +3691,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             pass
         try:
             proc.terminate()
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
         except Exception:
             pass
+        _set_active_orchestrator_proc(None)
         orchestrator_transcript.close()
 
     if runner.should_stop():

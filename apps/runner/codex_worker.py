@@ -355,6 +355,9 @@ def _extract_worker_result(*, content: str, expected_run_id: str, expected_role:
     raw = content.strip()
     if "RUNNER_RESULT_JSON:" in raw:
         raw = raw.split("RUNNER_RESULT_JSON:", 1)[1].strip()
+    # Strip markdown fences like ```json ... ```
+    raw = re.sub(r"^```(?:json)?\s*\n?", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\n?```\s*$", "", raw).strip()
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -726,10 +729,9 @@ def run_intent_with_codex_mcp(
             pass
         try:
             proc.terminate()
-        except Exception:
-            pass
-        try:
             proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
         except Exception:
             pass
         transcript_writer.close()
@@ -816,8 +818,12 @@ def generate_json_with_codex_mcp(
         thread_id = _extract_thread_id_from_tool_result(tool_result)
         text = _extract_codex_text_from_tool_result(tool_result)
         transcript_writer.append_agent_thinking(_to_transcript_thinking_text(text))
+        raw = text.strip()
+        # Strip markdown fences like ```json ... ```
+        raw = re.sub(r"^```(?:json)?\s*\n?", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\n?```\s*$", "", raw).strip()
         try:
-            parsed = json.loads(text.strip())
+            parsed = json.loads(raw)
         except json.JSONDecodeError:
             transcript_writer.append_system_observation("Initial agent response was not valid JSON; requesting strict JSON replay.")
             tool_result_2 = client.call(
@@ -835,8 +841,12 @@ def generate_json_with_codex_mcp(
             transcript_writer.append_system_observation("Received strict JSON replay from agent.")
             text2 = _extract_codex_text_from_tool_result(tool_result_2)
             transcript_writer.append_agent_thinking(_to_transcript_thinking_text(text2))
+            raw = text2.strip()
+            # Strip markdown fences like ```json ... ```
+            raw = re.sub(r"^```(?:json)?\s*\n?", "", raw, flags=re.IGNORECASE)
+            raw = re.sub(r"\n?```\s*$", "", raw).strip()
             try:
-                parsed = json.loads(text2.strip())
+                parsed = json.loads(raw)
             except json.JSONDecodeError as exc:
                 raise CodexWorkerError(
                     "codex output was not valid JSON",
@@ -865,10 +875,9 @@ def generate_json_with_codex_mcp(
             pass
         try:
             proc.terminate()
-        except Exception:
-            pass
-        try:
             proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
         except Exception:
             pass
         transcript_writer.close()
