@@ -54,6 +54,12 @@ class BackendClient:
     def get_agent_context(self, role: str) -> Dict[str, Any]:
         return self.get_json("/internal/agent-context", params={"role": role})
 
+    def get_project_items_metadata(self, *, role: str, sprint: Optional[str] = None, timeout_s: Optional[float] = None) -> Dict[str, Any]:
+        params: Dict[str, str] = {"role": role}
+        if isinstance(sprint, str) and sprint.strip():
+            params["sprint"] = sprint.strip()
+        return self.get_json("/internal/metadata/project-items", params=params, timeout_s=timeout_s)
+
 
 def _build_url(base_url: str, path: str, params: Optional[dict[str, str]]) -> str:
     url = f"{base_url}{path}"

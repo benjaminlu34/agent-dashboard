@@ -143,6 +143,71 @@ def _load_json_file(path: str) -> Optional[Dict[str, Any]]:
     return value
 
 
+def _empty_orchestrator_state() -> Dict[str, Any]:
+    return {
+        "poll_count": 0,
+        "items": {},
+        "sprint_plan": {},
+        "ownership_index": {},
+    }
+
+
+def _load_orchestrator_state_for_reconciliation(path: str) -> Dict[str, Any]:
+    state_path = Path(path)
+    try:
+        raw = state_path.read_text(encoding="utf8")
+    except FileNotFoundError:
+        return _empty_orchestrator_state()
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        backup_path = f"{path}.corrupt-{int(time.time() * 1000)}"
+        backup_created = False
+        try:
+            state_path.rename(backup_path)
+            backup_created = True
+        except Exception:
+            backup_created = False
+        _log_stderr(
+            {
+                "type": "ORCHESTRATOR_STATE_RESET_INVALID_JSON",
+                "path": path,
+                "backup_path": backup_path if backup_created else "",
+                "error": "state file contains invalid JSON",
+            }
+        )
+        return _empty_orchestrator_state()
+
+    if not isinstance(parsed, dict):
+        backup_path = f"{path}.corrupt-{int(time.time() * 1000)}"
+        backup_created = False
+        try:
+            state_path.rename(backup_path)
+            backup_created = True
+        except Exception:
+            backup_created = False
+        _log_stderr(
+            {
+                "type": "ORCHESTRATOR_STATE_RESET_INVALID_JSON",
+                "path": path,
+                "backup_path": backup_path if backup_created else "",
+                "error": "state file must be a JSON object",
+            }
+        )
+        return _empty_orchestrator_state()
+
+    items = parsed.get("items")
+    sprint_plan = parsed.get("sprint_plan")
+    ownership_index = parsed.get("ownership_index")
+    return {
+        "poll_count": parsed.get("poll_count") if isinstance(parsed.get("poll_count"), int) and parsed.get("poll_count") >= 0 else 0,
+        "items": items if isinstance(items, dict) else {},
+        "sprint_plan": sprint_plan if isinstance(sprint_plan, dict) else {},
+        "ownership_index": ownership_index if isinstance(ownership_index, dict) else {},
+    }
+
+
 def _priority_rank(priority: str) -> int:
     return {"P0": 0, "P1": 1, "P2": 2}.get(priority, 99)
 
@@ -902,6 +967,162 @@ class Runner:
         self._in_flight_cond = threading.Condition(self._in_flight_lock)
         self._in_flight_by_issue: Dict[int, Dict[str, str]] = {}
 
+    def reconcile_startup_state(self, *, sprint: str) -> Dict[str, Any]:
+        try:
+            payload = self._backend.get_project_items_metadata(role="ORCHESTRATOR", sprint=sprint)
+        except Exception as exc:
+            result = {
+                "status": "SKIPPED",
+                "reason": "remote_fetch_failed",
+                "error": str(exc),
+            }
+            _log_stderr({"type": "STARTUP_RECONCILED", **result})
+            return result
+
+        remote_items = payload.get("items")
+        if not isinstance(remote_items, list):
+            result = {
+                "status": "SKIPPED",
+                "reason": "invalid_payload",
+                "error": "metadata payload missing items list",
+            }
+            _log_stderr({"type": "STARTUP_RECONCILED", **result})
+            return result
+
+        synced_at = _normalize_iso(payload.get("as_of")) or _utc_now_iso()
+        local_state = _load_orchestrator_state_for_reconciliation(self._orchestrator_state_path)
+        local_items = local_state.get("items") if isinstance(local_state.get("items"), dict) else {}
+        local_item_count = len(local_items)
+        poll_count = local_state.get("poll_count") if isinstance(local_state.get("poll_count"), int) and local_state.get("poll_count") >= 0 else 0
+        next_items: Dict[str, Dict[str, Any]] = {}
+
+        dropped_remote = 0
+        preserved_epoch_count = 0
+        carried_review_state_count = 0
+        reset_dispatch_count = 0
+
+        for raw_item in remote_items:
+            if not isinstance(raw_item, dict):
+                dropped_remote += 1
+                continue
+            project_item_id = str(raw_item.get("project_item_id") or "").strip()
+            issue_number = raw_item.get("issue_number")
+            status = str(raw_item.get("status") or "").strip()
+            if not project_item_id or not isinstance(issue_number, int) or issue_number <= 0 or not status:
+                dropped_remote += 1
+                continue
+
+            issue_title = str(raw_item.get("issue_title") or "").strip()
+            issue_url = str(raw_item.get("issue_url") or "").strip()
+            item_sprint = str(raw_item.get("sprint") or "").strip() or sprint
+            existing = local_items.get(project_item_id)
+            previous = existing if isinstance(existing, dict) else {}
+
+            same_issue = previous.get("last_seen_issue_number") == issue_number
+            same_status_epoch = same_issue and previous.get("last_seen_status") == status
+            if same_status_epoch:
+                preserved_epoch_count += 1
+
+            status_since_at = _normalize_iso(previous.get("status_since_at")) if same_status_epoch else ""
+            if not status_since_at:
+                status_since_at = synced_at
+            status_since_poll = (
+                previous.get("status_since_poll")
+                if same_status_epoch and isinstance(previous.get("status_since_poll"), int) and previous.get("status_since_poll") >= 0
+                else poll_count
+            )
+            last_activity_at = _normalize_iso(previous.get("last_activity_at")) if same_status_epoch else ""
+            if not last_activity_at:
+                last_activity_at = status_since_at
+            last_activity_indicator = str(previous.get("last_activity_indicator") or "").strip() if same_status_epoch else ""
+            if not last_activity_indicator:
+                last_activity_indicator = "status_unchanged" if same_status_epoch else "startup_rehydrated"
+
+            review_cycle_count = 0
+            last_reviewer_outcome = ""
+            last_reviewer_feedback_at = ""
+            last_executor_response_at = ""
+            in_review_origin = ""
+            if status == "In Review" and same_status_epoch:
+                cycle_value = previous.get("review_cycle_count")
+                review_cycle_count = cycle_value if isinstance(cycle_value, int) and cycle_value >= 0 else 0
+                outcome = str(previous.get("last_reviewer_outcome") or "").strip().upper()
+                if outcome in ("PASS", "FAIL", "INCOMPLETE"):
+                    last_reviewer_outcome = outcome
+                last_reviewer_feedback_at = _normalize_iso(previous.get("last_reviewer_feedback_at"))
+                last_executor_response_at = _normalize_iso(previous.get("last_executor_response_at"))
+                in_review_origin = str(previous.get("in_review_origin") or "").strip()
+                if review_cycle_count > 0 or last_reviewer_outcome or last_reviewer_feedback_at or last_executor_response_at:
+                    carried_review_state_count += 1
+            elif status == "In Review" and previous.get("last_seen_status") == "Needs Human Approval":
+                in_review_origin = "needs_human_approval"
+
+            last_run_id = str(previous.get("last_run_id") or "").strip() if same_issue else ""
+            had_dispatch_state = (
+                isNonEmptyString(previous.get("last_dispatched_role"))
+                or isNonEmptyString(previous.get("last_dispatched_status"))
+                or isNonEmptyString(previous.get("last_dispatched_at"))
+                or (
+                    isinstance(previous.get("last_dispatched_poll"), int)
+                    and previous.get("last_dispatched_poll") > 0
+                )
+            )
+            if had_dispatch_state:
+                reset_dispatch_count += 1
+
+            next_items[project_item_id] = {
+                "last_seen_status": status,
+                "last_seen_sprint": item_sprint,
+                "last_seen_issue_number": issue_number,
+                "last_seen_issue_title": issue_title,
+                "last_seen_issue_url": issue_url,
+                "last_seen_at": synced_at,
+                "status_since_at": status_since_at,
+                "status_since_poll": status_since_poll,
+                "last_activity_at": last_activity_at,
+                "last_activity_indicator": last_activity_indicator,
+                "last_dispatched_role": "",
+                "last_dispatched_status": "",
+                "last_dispatched_at": "",
+                "last_dispatched_poll": 0,
+                "last_run_id": last_run_id,
+                "reviewer_dispatches_for_current_status": 0,
+                "review_cycle_count": review_cycle_count,
+                "last_reviewer_outcome": last_reviewer_outcome,
+                "last_reviewer_feedback_at": last_reviewer_feedback_at,
+                "last_executor_response_at": last_executor_response_at,
+                "in_review_origin": in_review_origin if status == "In Review" else "",
+            }
+
+        next_state = {
+            "poll_count": poll_count,
+            "items": next_items,
+            "sprint_plan": local_state.get("sprint_plan") if isinstance(local_state.get("sprint_plan"), dict) else {},
+            "ownership_index": local_state.get("ownership_index") if isinstance(local_state.get("ownership_index"), dict) else {},
+        }
+        pruned_items = len([project_item_id for project_item_id in local_items.keys() if project_item_id not in next_items])
+        changed = local_state != next_state
+
+        result = {
+            "status": "APPLIED",
+            "sprint": sprint,
+            "dry_run": self._dry_run,
+            "remote_items": len(next_items),
+            "dropped_remote_items": dropped_remote,
+            "local_items_before": local_item_count,
+            "pruned_local_items": pruned_items,
+            "preserved_status_epochs": preserved_epoch_count,
+            "carried_review_state": carried_review_state_count,
+            "reset_dispatch_state": reset_dispatch_count,
+            "state_changed": changed,
+            "as_of": synced_at,
+        }
+
+        if changed and not self._dry_run:
+            _atomic_write_json(self._orchestrator_state_path, next_state)
+        _log_stderr({"type": "STARTUP_RECONCILED", **result})
+        return result
+
     def _resolve_issue_number_for_intent(self, intent: RunIntent) -> int:
         issue_number = intent.body.get("issue_number")
         if isinstance(issue_number, int) and issue_number > 0:
@@ -1242,6 +1463,86 @@ class Runner:
                     }
                 )
 
+    def _recover_lost_in_review_reviewer_dispatches(self, *, summary: Dict[str, Any]) -> None:
+        if not self._ledger:
+            return
+        processed_items = summary.get("processed_items")
+        if not isinstance(processed_items, list):
+            return
+        poll_count_value = summary.get("poll_count")
+        current_poll = poll_count_value if isinstance(poll_count_value, int) and poll_count_value >= 0 else None
+        now_iso = _utc_now_iso()
+
+        for item in processed_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("status") != "In Review":
+                continue
+            issue_number = item.get("issue_number")
+            project_item_id = item.get("project_item_id")
+            if not isinstance(issue_number, int) or issue_number <= 0:
+                continue
+            if not isinstance(project_item_id, str) or not project_item_id.strip():
+                continue
+            state_item = self._resolve_project_state_item(project_item_id)
+            if not isinstance(state_item, dict):
+                continue
+            if state_item.get("last_dispatched_role") != "REVIEWER":
+                continue
+            if state_item.get("last_dispatched_status") != "In Review":
+                continue
+            if isNonEmptyString(state_item.get("last_reviewer_outcome")):
+                continue
+            last_dispatched_poll_value = state_item.get("last_dispatched_poll")
+            last_dispatched_poll = (
+                last_dispatched_poll_value if isinstance(last_dispatched_poll_value, int) and last_dispatched_poll_value >= 0 else 0
+            )
+            # Do not recover within the same orchestrator poll epoch that emitted this dispatch.
+            if current_poll is not None and last_dispatched_poll >= current_poll:
+                continue
+            stale_run_id = str(state_item.get("last_run_id") or "").strip()
+            if not stale_run_id:
+                continue
+
+            elapsed_seconds = _seconds_since(state_item.get("last_dispatched_at"), now_iso=now_iso)
+
+            ledger_entry = self._ledger.get(stale_run_id)
+            if isinstance(ledger_entry, dict):
+                ledger_status = str(ledger_entry.get("status") or "").strip().lower()
+                if ledger_status == "running":
+                    continue
+                result = ledger_entry.get("result")
+                reviewer_outcome = ""
+                if isinstance(result, dict):
+                    outcome_value = result.get("reviewer_outcome")
+                    if isNonEmptyString(outcome_value):
+                        reviewer_outcome = str(outcome_value).strip().upper()
+                if reviewer_outcome in ("PASS", "FAIL", "INCOMPLETE"):
+                    continue
+                recovery_reason = f"ledger_status_{ledger_status or 'unknown'}_without_outcome"
+            else:
+                recovery_reason = "ledger_entry_missing"
+
+            self._update_orchestrator_state_item(
+                project_item_id,
+                {
+                    "last_dispatched_role": "",
+                    "last_dispatched_status": "",
+                    "last_dispatched_at": "",
+                    "last_dispatched_poll": 0,
+                },
+            )
+            _log_stderr(
+                {
+                    "type": "REVIEW_DISPATCH_RECOVERED",
+                    "issue_number": issue_number,
+                    "project_item_id": project_item_id,
+                    "stale_run_id": stale_run_id,
+                    "elapsed_s": elapsed_seconds,
+                    "reason": recovery_reason,
+                }
+            )
+
     def _handle_blocked_retries(self, *, summary: Dict[str, Any]) -> None:
         processed_items = summary.get("processed_items")
         if not isinstance(processed_items, list):
@@ -1432,6 +1733,7 @@ class Runner:
             )
 
     def handle_dispatch_summary(self, *, summary: Dict[str, Any]) -> None:
+        self._recover_lost_in_review_reviewer_dispatches(summary=summary)
         self._handle_review_stall(summary=summary)
         self._handle_blocked_retries(summary=summary)
         self._handle_in_review_cycle_caps(summary=summary)
@@ -2725,6 +3027,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         blocked_retry_minutes=config.blocked_retry_minutes,
         watchdog_timeout_s=config.watchdog_timeout_s,
     )
+
+    try:
+        runner.reconcile_startup_state(sprint=config.orchestrator_sprint)
+    except Exception as exc:
+        _log_stderr(
+            {
+                "type": "STARTUP_RECONCILED",
+                "status": "SKIPPED",
+                "reason": "unexpected_error",
+                "error": str(exc),
+            }
+        )
 
     # Spawn worker threads.
     workers: list[threading.Thread] = []

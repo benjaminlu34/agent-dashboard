@@ -62,6 +62,7 @@ test("registerInternalMetadataRoute registers issue and pr endpoints", async () 
 
   assert.equal(typeof app.routes.get("/internal/metadata/issue"), "function");
   assert.equal(typeof app.routes.get("/internal/metadata/pr"), "function");
+  assert.equal(typeof app.routes.get("/internal/metadata/project-items"), "function");
 });
 
 test("GET /internal/metadata/issue returns sanitized issue payload", async () => {
@@ -278,4 +279,144 @@ test("GET /internal/metadata/issue returns structured 404 for missing issue", as
     owner_login: "benjaminlu34",
     repo_name: "agent-dashboard",
   });
+});
+
+test("GET /internal/metadata/project-items returns sanitized filtered project items", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-metadata-project-items-"));
+  await writeBundleFiles(repoRoot);
+
+  const captured = { projectIdentity: null };
+  const app = buildApp();
+  await registerInternalMetadataRoute(app, {
+    repoRoot,
+    env: { GITHUB_TOKEN: "token" },
+    preflightHandler: async () => ({ status: "PASS" }),
+    githubClientFactory: async ({ projectIdentity }) => {
+      captured.projectIdentity = projectIdentity;
+      return {
+        async listProjectItems() {
+          return [
+            {
+              project_item_id: "PVTI_2",
+              issue_number: 2,
+              issue_title: "Implement API",
+              issue_url: "https://github.com/benjaminlu34/agent-dashboard/issues/2",
+              fields: { Status: "In Review", Sprint: "M1" },
+            },
+            {
+              project_item_id: "PVTI_1",
+              issue_number: 1,
+              issue_title: "Goal issue",
+              issue_url: "https://github.com/benjaminlu34/agent-dashboard/issues/1",
+              fields: { Status: "Backlog", Sprint: "M1" },
+            },
+            {
+              project_item_id: "PVTI_3",
+              issue_number: 3,
+              issue_title: "Out of sprint",
+              issue_url: "https://github.com/benjaminlu34/agent-dashboard/issues/3",
+              fields: { Status: "Ready", Sprint: "M2" },
+            },
+          ];
+        },
+      };
+    },
+  });
+
+  const handler = app.routes.get("/internal/metadata/project-items");
+  const reply = buildReply();
+  const result = await handler(
+    {
+      query: {
+        role: "ORCHESTRATOR",
+        sprint: "M1",
+      },
+    },
+    reply,
+  );
+
+  assert.equal(reply.statusCode, 200);
+  assert.deepEqual(captured.projectIdentity, {
+    owner_login: "benjaminlu34",
+    owner_type: "user",
+    project_name: "Codex Task Board",
+    repository_name: "agent-dashboard",
+  });
+  assert.equal(result.role, "ORCHESTRATOR");
+  assert.equal(result.sprint, "M1");
+  assert.equal(typeof result.as_of, "string");
+  assert.deepEqual(result.items, [
+    {
+      project_item_id: "PVTI_1",
+      issue_number: 1,
+      issue_title: "Goal issue",
+      issue_url: "https://github.com/benjaminlu34/agent-dashboard/issues/1",
+      status: "Backlog",
+      sprint: "M1",
+    },
+    {
+      project_item_id: "PVTI_2",
+      issue_number: 2,
+      issue_title: "Implement API",
+      issue_url: "https://github.com/benjaminlu34/agent-dashboard/issues/2",
+      status: "In Review",
+      sprint: "M1",
+    },
+  ]);
+});
+
+test("GET /internal/metadata/project-items enforces ORCHESTRATOR role and preflight", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-metadata-project-items-role-"));
+  await writeBundleFiles(repoRoot);
+
+  const app = buildApp();
+  await registerInternalMetadataRoute(app, {
+    repoRoot,
+    env: { GITHUB_TOKEN: "token" },
+    preflightHandler: async () => ({ status: "FAIL", errors: [{ code: "preflight_failed" }] }),
+    githubClientFactory: async () => {
+      throw new Error("should not be called");
+    },
+  });
+
+  const handler = app.routes.get("/internal/metadata/project-items");
+
+  const missingRoleReply = buildReply();
+  const missingRoleResult = await handler({ query: {} }, missingRoleReply);
+  assert.equal(missingRoleReply.statusCode, 400);
+  assert.match(missingRoleResult.error, /role/);
+
+  const wrongRoleReply = buildReply();
+  const wrongRoleResult = await handler({ query: { role: "reviewer" } }, wrongRoleReply);
+  assert.equal(wrongRoleReply.statusCode, 400);
+  assert.match(wrongRoleResult.error, /ORCHESTRATOR/);
+
+  const preflightReply = buildReply();
+  const preflightResult = await handler({ query: { role: "ORCHESTRATOR" } }, preflightReply);
+  assert.equal(preflightReply.statusCode, 409);
+  assert.equal(preflightResult.status, "FAIL");
+});
+
+test("GET /internal/metadata/project-items fails closed when github client returns non-array", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-metadata-project-items-invalid-"));
+  await writeBundleFiles(repoRoot);
+
+  const app = buildApp();
+  await registerInternalMetadataRoute(app, {
+    repoRoot,
+    env: { GITHUB_TOKEN: "token" },
+    preflightHandler: async () => ({ status: "PASS" }),
+    githubClientFactory: async () => ({
+      async listProjectItems() {
+        return { unexpected: true };
+      },
+    }),
+  });
+
+  const handler = app.routes.get("/internal/metadata/project-items");
+  const reply = buildReply();
+  const result = await handler({ query: { role: "ORCHESTRATOR", sprint: "M1" } }, reply);
+
+  assert.equal(reply.statusCode, 502);
+  assert.equal(result.error, "github project items response is invalid");
 });

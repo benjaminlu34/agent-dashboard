@@ -105,6 +105,7 @@ Worker sandbox policy:
 
 - Maintains a Ready buffer by auto-promoting Backlog tasks when `RUNNER_AUTOPROMOTE` is enabled.
 - Applies dependency-graph sanitization before promotion and can request external regeneration when cycles remain (`{ORCHESTRATOR_STATE_PATH}.regen-request.json`).
+- Rehydrates local orchestrator state from remote GitHub Project metadata on startup before dispatching loop intents.
 - Retries retryable Blocked items after `BLOCKED_RETRY_MINUTES` based on ledger classification.
 - Escalates long-running In Review stalls after `REVIEW_STALL_POLLS` and bounded reviewer retries.
 - Blocks items that exceed the review cycle cap (5 cycles).
@@ -121,6 +122,8 @@ Do not move it back to `Ready`. This keeps one-PR linkage intact and causes orch
 
 Runner emits structured stderr events for resiliency workflows:
 - `REVIEW_OUTCOME` (`PASS` | `FAIL` | `INCOMPLETE`)
+- `STARTUP_RECONCILED` (startup state rehydration/skip result)
+- `REVIEW_DISPATCH_RECOVERED` (stale/missing reviewer run ledger entry repaired to allow re-dispatch)
 - `REVIEW_STALL_DETECTED`
 - `REVIEW_STALL_ESCALATED`
 - `BLOCKED_RETRY`

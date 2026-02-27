@@ -509,6 +509,94 @@ class RunnerReviewAndStallTests(unittest.TestCase):
         self.assertEqual(len(update_calls), 1)
         self.assertEqual(update_calls[0][1]["value"], "Needs Human Approval")
 
+    def test_stale_reviewer_dispatch_without_ledger_entry_is_recovered(self) -> None:
+        backend = _BackendStub()
+        ledger = _LedgerStub({})
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = f"{tmp_dir}/orchestrator-state.json"
+            Path(state_path).write_text(
+                json.dumps(
+                    {
+                        "poll_count": 120,
+                        "items": {
+                            "PVTI_4": {
+                                "last_seen_issue_number": 4,
+                                "last_seen_status": "In Review",
+                                "reviewer_dispatches_for_current_status": 1,
+                                "last_run_id": "review-run-lost",
+                                "last_dispatched_role": "REVIEWER",
+                                "last_dispatched_status": "In Review",
+                                "last_dispatched_at": "2026-02-08T00:00:00.000Z",
+                                "last_dispatched_poll": 105,
+                                "last_reviewer_outcome": "",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runner = _build_runner(backend=backend, state_path=state_path, ledger=ledger, review_stall_polls=50)
+            summary = {
+                "poll_count": 121,
+                "processed_items": [{"issue_number": 4, "project_item_id": "PVTI_4", "status": "In Review"}],
+            }
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                runner.handle_dispatch_summary(summary=summary)
+
+            state_after_recovery = json.loads(Path(state_path).read_text(encoding="utf-8"))
+
+        state_item = state_after_recovery["items"]["PVTI_4"]
+        self.assertEqual(state_item["last_dispatched_role"], "")
+        self.assertEqual(state_item["last_dispatched_status"], "")
+        self.assertEqual(state_item["last_dispatched_at"], "")
+        self.assertEqual(state_item["last_dispatched_poll"], 0)
+        self.assertEqual(state_item["last_run_id"], "review-run-lost")
+        self.assertIn('"type":"REVIEW_DISPATCH_RECOVERED"', stderr.getvalue())
+
+    def test_stale_reviewer_dispatch_is_not_recovered_in_same_poll_epoch(self) -> None:
+        backend = _BackendStub()
+        ledger = _LedgerStub({})
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = f"{tmp_dir}/orchestrator-state.json"
+            Path(state_path).write_text(
+                json.dumps(
+                    {
+                        "poll_count": 200,
+                        "items": {
+                            "PVTI_7": {
+                                "last_seen_issue_number": 7,
+                                "last_seen_status": "In Review",
+                                "reviewer_dispatches_for_current_status": 1,
+                                "last_run_id": "review-run-same-poll",
+                                "last_dispatched_role": "REVIEWER",
+                                "last_dispatched_status": "In Review",
+                                "last_dispatched_at": "2026-02-08T00:00:00.000Z",
+                                "last_dispatched_poll": 200,
+                                "last_reviewer_outcome": "",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runner = _build_runner(backend=backend, state_path=state_path, ledger=ledger, review_stall_polls=50)
+            summary = {
+                "poll_count": 200,
+                "processed_items": [{"issue_number": 7, "project_item_id": "PVTI_7", "status": "In Review"}],
+            }
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                runner.handle_dispatch_summary(summary=summary)
+
+            state_after = json.loads(Path(state_path).read_text(encoding="utf-8"))
+
+        state_item = state_after["items"]["PVTI_7"]
+        self.assertEqual(state_item["last_dispatched_role"], "REVIEWER")
+        self.assertEqual(state_item["last_dispatched_status"], "In Review")
+        self.assertEqual(state_item["last_dispatched_poll"], 200)
+        self.assertNotIn('"type":"REVIEW_DISPATCH_RECOVERED"', stderr.getvalue())
+
     def test_blocked_retry_triggers_after_cooldown_for_retryable_failure(self) -> None:
         backend = _BackendStub()
         ledger = _LedgerStub(

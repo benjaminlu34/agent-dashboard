@@ -21,6 +21,11 @@ class _BackendStub:
     def get_agent_context(self, role: str):
         raise AssertionError(f"unexpected get_agent_context call for role={role}")
 
+    def get_project_items_metadata(self, *, role: str, sprint: str):
+        _ = role
+        _ = sprint
+        return {"role": "ORCHESTRATOR", "sprint": "M1", "as_of": "2026-02-27T00:00:00Z", "items": []}
+
 
 class _ProcStub:
     def __init__(self) -> None:
@@ -197,6 +202,11 @@ class RunnerCliModeTests(unittest.TestCase):
                 def get_agent_context(self, role: str):
                     self.last_role = role
                     return {"role": role, "files": []}
+
+                def get_project_items_metadata(self, *, role: str, sprint: str):
+                    _ = role
+                    _ = sprint
+                    return {"role": "ORCHESTRATOR", "sprint": "M1", "as_of": "2026-02-27T00:00:00Z", "items": []}
 
             with patch("apps.runner.runner.load_config", return_value=config):
                 with patch("apps.runner.runner.BackendClient", _KickoffBackendStub):

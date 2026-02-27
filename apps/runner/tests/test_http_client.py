@@ -18,3 +18,14 @@ class HttpClientTimeoutTests(unittest.TestCase):
         reason = str(error.payload.get("reason", ""))
         self.assertIn("timed out", reason.lower())
 
+    def test_get_project_items_metadata_calls_metadata_endpoint_with_role_and_sprint(self) -> None:
+        client = BackendClient(base_url="http://localhost:4000", timeout_s=1.0)
+        with patch("apps.runner.http_client.BackendClient.get_json", return_value={"items": []}) as mock_get_json:
+            payload = client.get_project_items_metadata(role="ORCHESTRATOR", sprint="M1")
+
+        self.assertEqual(payload, {"items": []})
+        mock_get_json.assert_called_once_with(
+            "/internal/metadata/project-items",
+            params={"role": "ORCHESTRATOR", "sprint": "M1"},
+            timeout_s=None,
+        )
