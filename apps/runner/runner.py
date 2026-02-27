@@ -1047,7 +1047,9 @@ class Runner:
                 cycle_value = previous.get("review_cycle_count")
                 review_cycle_count = cycle_value if isinstance(cycle_value, int) and cycle_value >= 0 else 0
                 outcome = str(previous.get("last_reviewer_outcome") or "").strip().upper()
-                if outcome in ("PASS", "FAIL", "INCOMPLETE"):
+                # A persisted PASS while the remote item is still In Review is contradictory
+                # state (handoff did not complete). Fail closed and let recovery re-drive it.
+                if outcome in ("FAIL", "INCOMPLETE"):
                     last_reviewer_outcome = outcome
                 last_reviewer_feedback_at = _normalize_iso(previous.get("last_reviewer_feedback_at"))
                 last_executor_response_at = _normalize_iso(previous.get("last_executor_response_at"))
@@ -1366,6 +1368,73 @@ class Runner:
             "review_cycle_count": review_cycle_count,
         }
         return self._backend.post_json("/internal/project-item/update-field", body=body)
+
+    def _recover_passed_in_review_items(self, *, summary: Dict[str, Any]) -> None:
+        processed_items = summary.get("processed_items")
+        if not isinstance(processed_items, list):
+            return
+
+        for item in processed_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("status") != "In Review":
+                continue
+            issue_number = item.get("issue_number")
+            project_item_id = item.get("project_item_id")
+            if not isinstance(issue_number, int) or issue_number <= 0:
+                continue
+            if not isinstance(project_item_id, str) or not project_item_id.strip():
+                continue
+            state_item = self._resolve_project_state_item(project_item_id)
+            if not isinstance(state_item, dict):
+                continue
+            reviewer_outcome = str(state_item.get("last_reviewer_outcome") or "").strip().upper()
+            if reviewer_outcome != "PASS":
+                continue
+
+            run_id = str(state_item.get("last_run_id") or "").strip()
+            try:
+                linkage = self._resolve_reviewer_pr_linkage(issue_number=issue_number)
+                pr_url = linkage.get("pr_url")
+                if not isinstance(pr_url, str) or not pr_url.strip():
+                    raise HttpError("review linkage missing pr_url", code="backend_invalid_payload", payload=linkage)
+                linkage_project_item_id = linkage.get("project_item_id")
+                if linkage_project_item_id != project_item_id:
+                    raise HttpError(
+                        "review linkage project_item_id mismatch",
+                        code="backend_invalid_payload",
+                        payload={
+                            "expected_project_item_id": project_item_id,
+                            "actual_project_item_id": linkage_project_item_id,
+                        },
+                    )
+                payload = self._transition_reviewer_pass_to_needs_human_approval(
+                    run_id=run_id,
+                    issue_number=issue_number,
+                    project_item_id=project_item_id,
+                    pr_url=pr_url.strip(),
+                    reason="Recovered stale reviewer PASS outcome while item remained In Review.",
+                )
+                _log_stderr(
+                    {
+                        "type": "REVIEW_PASS_RECOVERED",
+                        "issue_number": issue_number,
+                        "project_item_id": project_item_id,
+                        "run_id": run_id,
+                        "backend_payload": payload,
+                    }
+                )
+            except Exception as exc:
+                _log_stderr(
+                    {
+                        "type": "REVIEW_PASS_RECOVERED",
+                        "issue_number": issue_number,
+                        "project_item_id": project_item_id,
+                        "run_id": run_id,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
 
     def _handle_review_stall(self, *, summary: Dict[str, Any]) -> None:
         needs_attention = summary.get("needs_attention")
@@ -1716,28 +1785,72 @@ class Runner:
                     "error_code": "watchdog_timeout",
                 },
             )
+            run_role = str(ledger_entry.get("role") or "").strip().upper()
             _log_stderr(
                 {
                     "type": "WORKER_WATCHDOG_TIMEOUT",
                     "run_id": run_id,
+                    "role": run_role,
                     "issue_number": issue_number,
                     "project_item_id": project_item_id,
                     "elapsed_s": elapsed_seconds,
                     "timeout_s": self._watchdog_timeout_s,
                 }
             )
-            self._transition_executor_failure_to_blocked(
-                run_id=run_id,
-                failure_classification="HARD_STOP",
-                failure_message=message,
-            )
+            if run_role == "REVIEWER":
+                # Reviewer watchdog timeouts can leave In Review items in a stale dedupe state.
+                # Record a fresh INCOMPLETE outcome and clear dispatch markers to force re-dispatch.
+                self._record_reviewer_outcome_state(
+                    issue_number=issue_number,
+                    outcome="INCOMPLETE",
+                    recorded_at=now_iso,
+                )
+                self._update_orchestrator_state_item(
+                    project_item_id,
+                    {
+                        "last_dispatched_role": "",
+                        "last_dispatched_status": "",
+                        "last_dispatched_at": "",
+                        "last_dispatched_poll": 0,
+                    },
+                )
+                _log_stderr(
+                    {
+                        "type": "WORKER_WATCHDOG_TIMEOUT_RECOVERY",
+                        "run_id": run_id,
+                        "role": "REVIEWER",
+                        "issue_number": issue_number,
+                        "project_item_id": project_item_id,
+                        "action": "mark_incomplete_and_clear_dispatch",
+                    }
+                )
+            else:
+                self._transition_executor_failure_to_blocked(
+                    run_id=run_id,
+                    failure_classification="HARD_STOP",
+                    failure_message=message,
+                )
 
     def handle_dispatch_summary(self, *, summary: Dict[str, Any]) -> None:
-        self._recover_lost_in_review_reviewer_dispatches(summary=summary)
-        self._handle_review_stall(summary=summary)
-        self._handle_blocked_retries(summary=summary)
-        self._handle_in_review_cycle_caps(summary=summary)
-        self._handle_running_watchdog(summary=summary)
+        handlers = [
+            ("recover_passed_in_review_items", self._recover_passed_in_review_items),
+            ("recover_lost_in_review_reviewer_dispatches", self._recover_lost_in_review_reviewer_dispatches),
+            ("handle_review_stall", self._handle_review_stall),
+            ("handle_blocked_retries", self._handle_blocked_retries),
+            ("handle_in_review_cycle_caps", self._handle_in_review_cycle_caps),
+            ("handle_running_watchdog", self._handle_running_watchdog),
+        ]
+        for handler_name, handler in handlers:
+            try:
+                handler(summary=summary)
+            except Exception as exc:
+                _log_stderr(
+                    {
+                        "type": "DISPATCH_SUMMARY_HANDLER_FAILED",
+                        "handler": handler_name,
+                        "error": str(exc),
+                    }
+                )
 
     def hard_stop(self, reason: str) -> None:
         self._hard_stop_reason = reason
@@ -3282,7 +3395,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                             )
                             _log_stderr({"type": "HARD_STOP", "reason": "malformed_item_data", "error": str(exc)})
                             return 3
-                        if config.autopromote and not config.dry_run:
+                        if not config.dry_run:
                             runner.handle_dispatch_summary(summary=payload)
                     elif payload_type == "END_OF_SPRINT_SUMMARY":
                         awaiting_humans = str(payload.get("awaiting_humans") or "").strip()

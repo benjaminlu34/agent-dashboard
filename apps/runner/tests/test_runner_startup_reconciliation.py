@@ -180,3 +180,65 @@ class RunnerStartupReconciliationTests(unittest.TestCase):
             self.assertEqual(result["status"], "SKIPPED")
             self.assertEqual(result["reason"], "remote_fetch_failed")
             self.assertIn("fetch failed", result["error"])
+
+    def test_reconcile_startup_state_drops_stale_pass_for_in_review_item(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = f"{tmp_dir}/orchestrator-state.json"
+            Path(state_path).write_text(
+                json.dumps(
+                    {
+                        "poll_count": 25,
+                        "items": {
+                            "PVTI_2": {
+                                "last_seen_status": "In Review",
+                                "last_seen_sprint": "M1",
+                                "last_seen_issue_number": 2,
+                                "last_seen_issue_title": "Old title",
+                                "last_seen_issue_url": "https://github.com/example/repo/issues/2",
+                                "last_seen_at": "2026-02-27T01:00:00Z",
+                                "status_since_at": "2026-02-27T00:50:00Z",
+                                "status_since_poll": 20,
+                                "last_activity_at": "2026-02-27T01:00:00Z",
+                                "last_activity_indicator": "status_unchanged",
+                                "last_dispatched_role": "REVIEWER",
+                                "last_dispatched_status": "In Review",
+                                "last_dispatched_at": "2026-02-27T01:00:00Z",
+                                "last_dispatched_poll": 21,
+                                "last_run_id": "review-pass-run",
+                                "reviewer_dispatches_for_current_status": 1,
+                                "review_cycle_count": 0,
+                                "last_reviewer_outcome": "PASS",
+                                "last_reviewer_feedback_at": "2026-02-27T01:00:30Z",
+                                "last_executor_response_at": "",
+                                "in_review_origin": "",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            backend = _BackendStub(
+                {
+                    "role": "ORCHESTRATOR",
+                    "sprint": "M1",
+                    "as_of": "2026-02-27T01:05:00Z",
+                    "items": [
+                        {
+                            "project_item_id": "PVTI_2",
+                            "issue_number": 2,
+                            "issue_title": "Fresh title",
+                            "issue_url": "https://github.com/example/repo/issues/2",
+                            "status": "In Review",
+                            "sprint": "M1",
+                        }
+                    ],
+                }
+            )
+            runner = _build_runner(backend=backend, state_path=state_path, dry_run=False)
+            result = runner.reconcile_startup_state(sprint="M1")
+
+            self.assertEqual(result["status"], "APPLIED")
+            state_after = json.loads(Path(state_path).read_text(encoding="utf-8"))
+            item = state_after["items"]["PVTI_2"]
+            self.assertEqual(item["last_seen_status"], "In Review")
+            self.assertEqual(item["last_reviewer_outcome"], "")
