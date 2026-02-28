@@ -75,6 +75,67 @@ def _build_runner(
 
 
 class RunnerReviewAndStallTests(unittest.TestCase):
+    def test_dispatch_summary_handler_errors_are_isolated(self) -> None:
+        backend = _BackendStub()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            runner = _build_runner(backend=backend, state_path=f"{tmp_dir}/orchestrator-state.json", ledger=None)
+            summary = {"processed_items": []}
+
+            with patch.object(runner, "_recover_passed_in_review_items", return_value=None) as pass_recovery_mock:
+                with patch.object(runner, "_recover_lost_in_review_reviewer_dispatches", side_effect=RuntimeError("boom")):
+                    with patch.object(runner, "_handle_review_stall", return_value=None) as review_stall_mock:
+                        with patch.object(runner, "_handle_stalled_in_progress", return_value=None) as stalled_in_progress_mock:
+                            with patch.object(runner, "_handle_blocked_retries", return_value=None) as blocked_retry_mock:
+                                with patch.object(runner, "_handle_in_review_cycle_caps", return_value=None) as cycle_caps_mock:
+                                    with patch.object(runner, "_handle_running_watchdog", return_value=None) as watchdog_mock:
+                                        stderr = io.StringIO()
+                                        with contextlib.redirect_stderr(stderr):
+                                            runner.handle_dispatch_summary(summary=summary)
+
+            self.assertEqual(pass_recovery_mock.call_count, 1)
+            self.assertEqual(review_stall_mock.call_count, 1)
+            self.assertEqual(stalled_in_progress_mock.call_count, 1)
+            self.assertEqual(blocked_retry_mock.call_count, 1)
+            self.assertEqual(cycle_caps_mock.call_count, 1)
+            self.assertEqual(watchdog_mock.call_count, 1)
+            self.assertIn('"type":"DISPATCH_SUMMARY_HANDLER_FAILED"', stderr.getvalue())
+            self.assertIn('"handler":"recover_lost_in_review_reviewer_dispatches"', stderr.getvalue())
+
+    def test_stale_in_review_pass_is_recovered_to_needs_human_approval(self) -> None:
+        backend = _BackendStub()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = f"{tmp_dir}/orchestrator-state.json"
+            Path(state_path).write_text(
+                json.dumps(
+                    {
+                        "poll_count": 142,
+                        "items": {
+                            "PVTI_2": {
+                                "last_seen_issue_number": 2,
+                                "last_seen_status": "In Review",
+                                "last_reviewer_outcome": "PASS",
+                                "last_reviewer_feedback_at": "2026-02-27T02:00:00.000Z",
+                                "last_run_id": "review-pass-run",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runner = _build_runner(backend=backend, state_path=state_path, ledger=None)
+            summary = {
+                "processed_items": [{"issue_number": 2, "project_item_id": "PVTI_2", "status": "In Review"}],
+                "needs_attention": {"stalled_in_progress": [], "in_review_churn": []},
+            }
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                runner.handle_dispatch_summary(summary=summary)
+
+        update_calls = [call for call in backend.calls if call[0] == "/internal/project-item/update-field"]
+        self.assertEqual(len(update_calls), 1)
+        self.assertEqual(update_calls[0][1]["value"], "Needs Human Approval")
+        self.assertIn('"type":"REVIEW_PASS_RECOVERED"', stderr.getvalue())
+
     def test_executor_and_reviewer_same_issue_are_serialized_by_in_flight_gate(self) -> None:
         backend = _BackendStub()
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -509,6 +570,200 @@ class RunnerReviewAndStallTests(unittest.TestCase):
         self.assertEqual(len(update_calls), 1)
         self.assertEqual(update_calls[0][1]["value"], "Needs Human Approval")
 
+    def test_stale_reviewer_dispatch_without_ledger_entry_is_recovered(self) -> None:
+        backend = _BackendStub()
+        ledger = _LedgerStub({})
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = f"{tmp_dir}/orchestrator-state.json"
+            Path(state_path).write_text(
+                json.dumps(
+                    {
+                        "poll_count": 120,
+                        "items": {
+                            "PVTI_4": {
+                                "last_seen_issue_number": 4,
+                                "last_seen_status": "In Review",
+                                "reviewer_dispatches_for_current_status": 1,
+                                "last_run_id": "review-run-lost",
+                                "last_dispatched_role": "REVIEWER",
+                                "last_dispatched_status": "In Review",
+                                "last_dispatched_at": "2026-02-08T00:00:00.000Z",
+                                "last_dispatched_poll": 105,
+                                "last_reviewer_outcome": "",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runner = _build_runner(backend=backend, state_path=state_path, ledger=ledger, review_stall_polls=50)
+            summary = {
+                "poll_count": 121,
+                "processed_items": [{"issue_number": 4, "project_item_id": "PVTI_4", "status": "In Review"}],
+            }
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                runner.handle_dispatch_summary(summary=summary)
+
+            state_after_recovery = json.loads(Path(state_path).read_text(encoding="utf-8"))
+
+        state_item = state_after_recovery["items"]["PVTI_4"]
+        self.assertEqual(state_item["last_dispatched_role"], "")
+        self.assertEqual(state_item["last_dispatched_status"], "")
+        self.assertEqual(state_item["last_dispatched_at"], "")
+        self.assertEqual(state_item["last_dispatched_poll"], 0)
+        self.assertEqual(state_item["last_run_id"], "review-run-lost")
+        self.assertIn('"type":"REVIEW_DISPATCH_RECOVERED"', stderr.getvalue())
+
+    def test_stale_reviewer_dispatch_is_not_recovered_in_same_poll_epoch(self) -> None:
+        backend = _BackendStub()
+        ledger = _LedgerStub({})
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = f"{tmp_dir}/orchestrator-state.json"
+            Path(state_path).write_text(
+                json.dumps(
+                    {
+                        "poll_count": 200,
+                        "items": {
+                            "PVTI_7": {
+                                "last_seen_issue_number": 7,
+                                "last_seen_status": "In Review",
+                                "reviewer_dispatches_for_current_status": 1,
+                                "last_run_id": "review-run-same-poll",
+                                "last_dispatched_role": "REVIEWER",
+                                "last_dispatched_status": "In Review",
+                                "last_dispatched_at": "2026-02-08T00:00:00.000Z",
+                                "last_dispatched_poll": 200,
+                                "last_reviewer_outcome": "",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runner = _build_runner(backend=backend, state_path=state_path, ledger=ledger, review_stall_polls=50)
+            summary = {
+                "poll_count": 200,
+                "processed_items": [{"issue_number": 7, "project_item_id": "PVTI_7", "status": "In Review"}],
+            }
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                runner.handle_dispatch_summary(summary=summary)
+
+            state_after = json.loads(Path(state_path).read_text(encoding="utf-8"))
+
+        state_item = state_after["items"]["PVTI_7"]
+        self.assertEqual(state_item["last_dispatched_role"], "REVIEWER")
+        self.assertEqual(state_item["last_dispatched_status"], "In Review")
+        self.assertEqual(state_item["last_dispatched_poll"], 200)
+        self.assertNotIn('"type":"REVIEW_DISPATCH_RECOVERED"', stderr.getvalue())
+
+    def test_stalled_in_progress_without_active_executor_is_blocked(self) -> None:
+        backend = _BackendStub()
+        ledger = _LedgerStub(
+            {
+                "run-stale": {
+                    "status": "failed",
+                    "result": {
+                        "failure_classification": "ITEM_STOP",
+                        "error_code": "worker_invalid_output",
+                    },
+                }
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = f"{tmp_dir}/orchestrator-state.json"
+            Path(state_path).write_text(
+                json.dumps(
+                    {
+                        "poll_count": 48,
+                        "items": {
+                            "PVTI_9": {
+                                "last_seen_issue_number": 9,
+                                "last_seen_status": "In Progress",
+                                "status_since_at": "2026-02-08T00:00:00.000Z",
+                                "last_run_id": "run-stale",
+                                "last_dispatched_role": "EXECUTOR",
+                                "last_dispatched_status": "In Progress",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runner = _build_runner(backend=backend, state_path=state_path, ledger=ledger)
+            summary = {
+                "needs_attention": {
+                    "stalled_in_progress": [
+                        {
+                            "issue_number": 9,
+                            "project_item_id": "PVTI_9",
+                            "stuck_minutes": 180,
+                            "status_since_at": "2026-02-08T00:00:00.000Z",
+                        }
+                    ],
+                    "in_review_churn": [],
+                },
+                "processed_items": [{"issue_number": 9, "project_item_id": "PVTI_9", "status": "In Progress"}],
+            }
+            runner.handle_dispatch_summary(summary=summary)
+
+        update_calls = [call for call in backend.calls if call[0] == "/internal/project-item/update-field"]
+        self.assertEqual(len(update_calls), 1)
+        self.assertEqual(update_calls[0][1]["value"], "Blocked")
+
+    def test_stalled_in_progress_with_active_executor_is_not_blocked(self) -> None:
+        backend = _BackendStub()
+        ledger = _LedgerStub(
+            {
+                "run-active": {
+                    "status": "running",
+                    "running_at": "2026-02-08T00:00:00.000Z",
+                    "received_at": "2026-02-08T00:00:00.000Z",
+                    "result": None,
+                }
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = f"{tmp_dir}/orchestrator-state.json"
+            Path(state_path).write_text(
+                json.dumps(
+                    {
+                        "poll_count": 48,
+                        "items": {
+                            "PVTI_11": {
+                                "last_seen_issue_number": 11,
+                                "last_seen_status": "In Progress",
+                                "status_since_at": "2026-02-08T00:00:00.000Z",
+                                "last_run_id": "run-active",
+                                "last_dispatched_role": "EXECUTOR",
+                                "last_dispatched_status": "In Progress",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runner = _build_runner(backend=backend, state_path=state_path, ledger=ledger, watchdog_timeout_s=10_000_000)
+            summary = {
+                "needs_attention": {
+                    "stalled_in_progress": [
+                        {
+                            "issue_number": 11,
+                            "project_item_id": "PVTI_11",
+                            "stuck_minutes": 180,
+                            "status_since_at": "2026-02-08T00:00:00.000Z",
+                        }
+                    ],
+                    "in_review_churn": [],
+                },
+                "processed_items": [{"issue_number": 11, "project_item_id": "PVTI_11", "status": "In Progress"}],
+            }
+            runner.handle_dispatch_summary(summary=summary)
+
+        update_calls = [call for call in backend.calls if call[0] == "/internal/project-item/update-field"]
+        self.assertEqual(update_calls, [])
+
     def test_blocked_retry_triggers_after_cooldown_for_retryable_failure(self) -> None:
         backend = _BackendStub()
         ledger = _LedgerStub(
@@ -689,3 +944,138 @@ class RunnerReviewAndStallTests(unittest.TestCase):
         update_calls = [call for call in backend.calls if call[0] == "/internal/project-item/update-field"]
         self.assertEqual(len(update_calls), 1)
         self.assertEqual(update_calls[0][1]["value"], "Blocked")
+
+    def test_watchdog_times_out_running_reviewer_in_review_and_recovers_dispatch_state(self) -> None:
+        backend = _BackendStub()
+        ledger = _LedgerStub(
+            {
+                "run-watchdog-reviewer": {
+                    "status": "running",
+                    "role": "REVIEWER",
+                    "running_at": "2026-02-08T00:00:00.000Z",
+                    "received_at": "2026-02-08T00:00:00.000Z",
+                    "result": None,
+                }
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = f"{tmp_dir}/orchestrator-state.json"
+            Path(state_path).write_text(
+                json.dumps(
+                    {
+                        "poll_count": 1,
+                        "items": {
+                            "PVTI_R": {
+                                "last_seen_issue_number": 62,
+                                "last_seen_status": "In Review",
+                                "last_run_id": "run-watchdog-reviewer",
+                                "last_dispatched_role": "REVIEWER",
+                                "last_dispatched_status": "In Review",
+                                "last_dispatched_at": "2026-02-08T00:10:00.000Z",
+                                "last_dispatched_poll": 1,
+                                "reviewer_dispatches_for_current_status": 1,
+                                "last_reviewer_outcome": "INCOMPLETE",
+                                "last_reviewer_feedback_at": "2026-02-08T00:10:00.000Z",
+                                "last_executor_response_at": "2026-02-08T00:20:00.000Z",
+                                "review_cycle_count": 1,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            runner = _build_runner(
+                backend=backend,
+                state_path=state_path,
+                ledger=ledger,
+                watchdog_timeout_s=1,
+            )
+            runner._reserve_issue_slot(  # pylint: disable=protected-access
+                issue_number=62,
+                run_id="run-watchdog-reviewer",
+                role="REVIEWER",
+            )
+            summary = {
+                "processed_items": [
+                    {"issue_number": 62, "project_item_id": "PVTI_R", "status": "In Review"},
+                ]
+            }
+            stderr = io.StringIO()
+            with patch("apps.runner.runner._utc_now_iso", return_value="2026-02-27T01:00:00Z"):
+                with contextlib.redirect_stderr(stderr):
+                    runner.handle_dispatch_summary(summary=summary)
+
+            logs = stderr.getvalue()
+            self.assertIn('"type":"WORKER_WATCHDOG_TIMEOUT"', logs)
+            self.assertIn('"type":"WORKER_WATCHDOG_TIMEOUT_RECOVERY"', logs)
+
+            state_after = json.loads(Path(state_path).read_text(encoding="utf-8"))
+            item = state_after["items"]["PVTI_R"]
+            self.assertEqual(item["last_dispatched_role"], "")
+            self.assertEqual(item["last_dispatched_status"], "")
+            self.assertEqual(item["last_dispatched_at"], "")
+            self.assertEqual(item["last_dispatched_poll"], 0)
+            self.assertEqual(item["last_reviewer_outcome"], "INCOMPLETE")
+            self.assertEqual(item["last_reviewer_feedback_at"], "2026-02-27T01:00:00Z")
+            self.assertGreaterEqual(item["review_cycle_count"], 2)
+            self.assertNotIn(62, runner._in_flight_by_issue)  # pylint: disable=protected-access
+
+        update_calls = [call for call in backend.calls if call[0] == "/internal/project-item/update-field"]
+        self.assertEqual(update_calls, [])
+
+    def test_timed_out_run_late_result_is_ignored(self) -> None:
+        backend = _BackendStub()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = f"{tmp_dir}/orchestrator-state.json"
+            Path(state_path).write_text(
+                json.dumps(
+                    {
+                        "poll_count": 1,
+                        "items": {
+                            "PVTI_2": {
+                                "last_seen_issue_number": 2,
+                                "last_seen_status": "In Review",
+                                "last_dispatched_role": "REVIEWER",
+                                "last_run_id": "late-timeout-run",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runner = _build_runner(backend=backend, state_path=state_path, ledger=None)
+            intent = parse_intent(
+                {
+                    "type": "RUN_INTENT",
+                    "role": "REVIEWER",
+                    "run_id": "late-timeout-run",
+                    "endpoint": "/internal/reviewer/resolve-linked-pr",
+                    "body": {
+                        "role": "REVIEWER",
+                        "run_id": "late-timeout-run",
+                        "issue_number": 2,
+                    },
+                }
+            )
+            runner._mark_run_timed_out(run_id="late-timeout-run")  # pylint: disable=protected-access
+            stderr = io.StringIO()
+            with patch(
+                "apps.runner.runner.run_intent_with_codex_mcp",
+                return_value=WorkerResult(
+                    run_id=intent.run_id,
+                    role="REVIEWER",
+                    status="succeeded",
+                    outcome="PASS",
+                    summary="Late success.",
+                    urls={},
+                    errors=[],
+                ),
+            ):
+                with contextlib.redirect_stderr(stderr):
+                    runner._handle_intent(intent)  # pylint: disable=protected-access
+
+        logs = stderr.getvalue()
+        self.assertIn('"type":"WORKER_RESULT_IGNORED"', logs)
+        update_calls = [call for call in backend.calls if call[0] == "/internal/project-item/update-field"]
+        self.assertEqual(update_calls, [])

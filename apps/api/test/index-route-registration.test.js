@@ -64,6 +64,12 @@ test("buildApp registers routes and GET /internal/agent-context returns 200 for 
   });
   assert.equal(metadataRouteResponse.statusCode, 400);
   assert.match(metadataRouteResponse.json().error, /issue_number/);
+  const projectItemsMetadataResponse = await app.inject({
+    method: "GET",
+    url: "/internal/metadata/project-items",
+  });
+  assert.equal(projectItemsMetadataResponse.statusCode, 400);
+  assert.match(projectItemsMetadataResponse.json().error, /role/);
   const configResponse = await app.inject({
     method: "GET",
     url: "/internal/config",

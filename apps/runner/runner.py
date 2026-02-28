@@ -4,15 +4,17 @@ import argparse
 import copy
 import json
 import queue
+import signal
 import subprocess
 import sys
 import threading
 import time
 from datetime import datetime, timezone
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from pathlib import Path
 import selectors
+from uuid import uuid4
 
 from .codex_worker import CodexWorkerError, generate_json_with_codex_mcp, run_intent_with_codex_mcp
 from .config import load_config
@@ -20,6 +22,84 @@ from .http_client import BackendClient, HttpError
 from .intents import IntentError, RunIntent, parse_intent, parse_json_line
 from .ledger import LedgerEntry, RunLedger
 from .kickoff import KickoffError, kickoff_plan_to_plan_apply_draft, validate_kickoff_plan
+
+_stderr_lock = threading.Lock()
+
+_active_runner: Optional["Runner"] = None
+_active_orchestrator_proc: Optional[subprocess.Popen[str]] = None
+_signal_exit_in_progress = False
+
+
+def _set_active_runner(runner: Optional["Runner"]) -> None:
+    global _active_runner
+    _active_runner = runner
+
+
+def _set_active_orchestrator_proc(proc: Optional[subprocess.Popen[str]]) -> None:
+    global _active_orchestrator_proc
+    _active_orchestrator_proc = proc
+
+
+def _close_popen_pipes(proc: Any) -> None:
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(proc, name, None)
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+def _terminate_orchestrator_proc() -> None:
+    proc = _active_orchestrator_proc
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    except Exception:
+        pass
+    _close_popen_pipes(proc)
+    _set_active_orchestrator_proc(None)
+
+
+def _handle_shutdown_signal(signum: int, frame: Any) -> None:
+    # Signal handlers should be fast and defensive: set runner hard stop, stop child proc,
+    # then exit so the interpreter can unwind finally blocks and exit cleanly.
+    global _signal_exit_in_progress
+    if _signal_exit_in_progress:
+        _terminate_orchestrator_proc()
+        raise SystemExit(128 + int(signum))
+
+    _signal_exit_in_progress = True
+    runner = _active_runner
+    if runner is not None:
+        try:
+            try:
+                signal_name = signal.Signals(signum).name
+            except Exception:
+                signal_name = str(signum)
+            runner.hard_stop(f"signal:{signal_name}")
+        except Exception:
+            pass
+
+    _terminate_orchestrator_proc()
+    raise SystemExit(128 + int(signum))
+
+
+def _register_global_signal_handlers() -> None:
+    try:
+        signal.signal(signal.SIGINT, _handle_shutdown_signal)
+        signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    except Exception:
+        # Signal registration fails when runner is imported off the main thread.
+        pass
+
+
+_register_global_signal_handlers()
 
 
 def _utc_now_iso() -> str:
@@ -140,6 +220,71 @@ def _load_json_file(path: str) -> Optional[Dict[str, Any]]:
     if not isinstance(value, dict):
         raise ValueError(f"{path} must contain a JSON object")
     return value
+
+
+def _empty_orchestrator_state() -> Dict[str, Any]:
+    return {
+        "poll_count": 0,
+        "items": {},
+        "sprint_plan": {},
+        "ownership_index": {},
+    }
+
+
+def _load_orchestrator_state_for_reconciliation(path: str) -> Dict[str, Any]:
+    state_path = Path(path)
+    try:
+        raw = state_path.read_text(encoding="utf8")
+    except FileNotFoundError:
+        return _empty_orchestrator_state()
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        backup_path = f"{path}.corrupt-{int(time.time() * 1000)}"
+        backup_created = False
+        try:
+            state_path.rename(backup_path)
+            backup_created = True
+        except Exception:
+            backup_created = False
+        _log_stderr(
+            {
+                "type": "ORCHESTRATOR_STATE_RESET_INVALID_JSON",
+                "path": path,
+                "backup_path": backup_path if backup_created else "",
+                "error": "state file contains invalid JSON",
+            }
+        )
+        return _empty_orchestrator_state()
+
+    if not isinstance(parsed, dict):
+        backup_path = f"{path}.corrupt-{int(time.time() * 1000)}"
+        backup_created = False
+        try:
+            state_path.rename(backup_path)
+            backup_created = True
+        except Exception:
+            backup_created = False
+        _log_stderr(
+            {
+                "type": "ORCHESTRATOR_STATE_RESET_INVALID_JSON",
+                "path": path,
+                "backup_path": backup_path if backup_created else "",
+                "error": "state file must be a JSON object",
+            }
+        )
+        return _empty_orchestrator_state()
+
+    items = parsed.get("items")
+    sprint_plan = parsed.get("sprint_plan")
+    ownership_index = parsed.get("ownership_index")
+    return {
+        "poll_count": parsed.get("poll_count") if isinstance(parsed.get("poll_count"), int) and parsed.get("poll_count") >= 0 else 0,
+        "items": items if isinstance(items, dict) else {},
+        "sprint_plan": sprint_plan if isinstance(sprint_plan, dict) else {},
+        "ownership_index": ownership_index if isinstance(ownership_index, dict) else {},
+    }
 
 
 def _priority_rank(priority: str) -> int:
@@ -900,6 +1045,166 @@ class Runner:
         self._in_flight_lock = threading.Lock()
         self._in_flight_cond = threading.Condition(self._in_flight_lock)
         self._in_flight_by_issue: Dict[int, Dict[str, str]] = {}
+        self._timed_out_runs_lock = threading.Lock()
+        self._timed_out_runs: Set[str] = set()
+
+    def reconcile_startup_state(self, *, sprint: str) -> Dict[str, Any]:
+        try:
+            payload = self._backend.get_project_items_metadata(role="ORCHESTRATOR", sprint=sprint)
+        except Exception as exc:
+            result = {
+                "status": "SKIPPED",
+                "reason": "remote_fetch_failed",
+                "error": str(exc),
+            }
+            _log_stderr({"type": "STARTUP_RECONCILED", **result})
+            return result
+
+        remote_items = payload.get("items")
+        if not isinstance(remote_items, list):
+            result = {
+                "status": "SKIPPED",
+                "reason": "invalid_payload",
+                "error": "metadata payload missing items list",
+            }
+            _log_stderr({"type": "STARTUP_RECONCILED", **result})
+            return result
+
+        synced_at = _normalize_iso(payload.get("as_of")) or _utc_now_iso()
+        local_state = _load_orchestrator_state_for_reconciliation(self._orchestrator_state_path)
+        local_items = local_state.get("items") if isinstance(local_state.get("items"), dict) else {}
+        local_item_count = len(local_items)
+        poll_count = local_state.get("poll_count") if isinstance(local_state.get("poll_count"), int) and local_state.get("poll_count") >= 0 else 0
+        next_items: Dict[str, Dict[str, Any]] = {}
+
+        dropped_remote = 0
+        preserved_epoch_count = 0
+        carried_review_state_count = 0
+        reset_dispatch_count = 0
+
+        for raw_item in remote_items:
+            if not isinstance(raw_item, dict):
+                dropped_remote += 1
+                continue
+            project_item_id = str(raw_item.get("project_item_id") or "").strip()
+            issue_number = raw_item.get("issue_number")
+            status = str(raw_item.get("status") or "").strip()
+            if not project_item_id or not isinstance(issue_number, int) or issue_number <= 0 or not status:
+                dropped_remote += 1
+                continue
+
+            issue_title = str(raw_item.get("issue_title") or "").strip()
+            issue_url = str(raw_item.get("issue_url") or "").strip()
+            item_sprint = str(raw_item.get("sprint") or "").strip() or sprint
+            existing = local_items.get(project_item_id)
+            previous = existing if isinstance(existing, dict) else {}
+
+            same_issue = previous.get("last_seen_issue_number") == issue_number
+            same_status_epoch = same_issue and previous.get("last_seen_status") == status
+            if same_status_epoch:
+                preserved_epoch_count += 1
+
+            status_since_at = _normalize_iso(previous.get("status_since_at")) if same_status_epoch else ""
+            if not status_since_at:
+                status_since_at = synced_at
+            status_since_poll = (
+                previous.get("status_since_poll")
+                if same_status_epoch and isinstance(previous.get("status_since_poll"), int) and previous.get("status_since_poll") >= 0
+                else poll_count
+            )
+            last_activity_at = _normalize_iso(previous.get("last_activity_at")) if same_status_epoch else ""
+            if not last_activity_at:
+                last_activity_at = status_since_at
+            last_activity_indicator = str(previous.get("last_activity_indicator") or "").strip() if same_status_epoch else ""
+            if not last_activity_indicator:
+                last_activity_indicator = "status_unchanged" if same_status_epoch else "startup_rehydrated"
+
+            review_cycle_count = 0
+            last_reviewer_outcome = ""
+            last_reviewer_feedback_at = ""
+            last_executor_response_at = ""
+            in_review_origin = ""
+            if status == "In Review" and same_status_epoch:
+                cycle_value = previous.get("review_cycle_count")
+                review_cycle_count = cycle_value if isinstance(cycle_value, int) and cycle_value >= 0 else 0
+                outcome = str(previous.get("last_reviewer_outcome") or "").strip().upper()
+                # A persisted PASS while the remote item is still In Review is contradictory
+                # state (handoff did not complete). Fail closed and let recovery re-drive it.
+                if outcome in ("FAIL", "INCOMPLETE"):
+                    last_reviewer_outcome = outcome
+                last_reviewer_feedback_at = _normalize_iso(previous.get("last_reviewer_feedback_at"))
+                last_executor_response_at = _normalize_iso(previous.get("last_executor_response_at"))
+                in_review_origin = str(previous.get("in_review_origin") or "").strip()
+                if review_cycle_count > 0 or last_reviewer_outcome or last_reviewer_feedback_at or last_executor_response_at:
+                    carried_review_state_count += 1
+            elif status == "In Review" and previous.get("last_seen_status") == "Needs Human Approval":
+                in_review_origin = "needs_human_approval"
+
+            last_run_id = str(previous.get("last_run_id") or "").strip() if same_issue else ""
+            had_dispatch_state = (
+                isNonEmptyString(previous.get("last_dispatched_role"))
+                or isNonEmptyString(previous.get("last_dispatched_status"))
+                or isNonEmptyString(previous.get("last_dispatched_at"))
+                or (
+                    isinstance(previous.get("last_dispatched_poll"), int)
+                    and previous.get("last_dispatched_poll") > 0
+                )
+            )
+            if had_dispatch_state:
+                reset_dispatch_count += 1
+
+            next_items[project_item_id] = {
+                "last_seen_status": status,
+                "last_seen_sprint": item_sprint,
+                "last_seen_issue_number": issue_number,
+                "last_seen_issue_title": issue_title,
+                "last_seen_issue_url": issue_url,
+                "last_seen_at": synced_at,
+                "status_since_at": status_since_at,
+                "status_since_poll": status_since_poll,
+                "last_activity_at": last_activity_at,
+                "last_activity_indicator": last_activity_indicator,
+                "last_dispatched_role": "",
+                "last_dispatched_status": "",
+                "last_dispatched_at": "",
+                "last_dispatched_poll": 0,
+                "last_run_id": last_run_id,
+                "reviewer_dispatches_for_current_status": 0,
+                "review_cycle_count": review_cycle_count,
+                "last_reviewer_outcome": last_reviewer_outcome,
+                "last_reviewer_feedback_at": last_reviewer_feedback_at,
+                "last_executor_response_at": last_executor_response_at,
+                "in_review_origin": in_review_origin if status == "In Review" else "",
+            }
+
+        next_state = {
+            "poll_count": poll_count,
+            "items": next_items,
+            "sprint_plan": local_state.get("sprint_plan") if isinstance(local_state.get("sprint_plan"), dict) else {},
+            "ownership_index": local_state.get("ownership_index") if isinstance(local_state.get("ownership_index"), dict) else {},
+        }
+        pruned_items = len([project_item_id for project_item_id in local_items.keys() if project_item_id not in next_items])
+        changed = local_state != next_state
+
+        result = {
+            "status": "APPLIED",
+            "sprint": sprint,
+            "dry_run": self._dry_run,
+            "remote_items": len(next_items),
+            "dropped_remote_items": dropped_remote,
+            "local_items_before": local_item_count,
+            "pruned_local_items": pruned_items,
+            "preserved_status_epochs": preserved_epoch_count,
+            "carried_review_state": carried_review_state_count,
+            "reset_dispatch_state": reset_dispatch_count,
+            "state_changed": changed,
+            "as_of": synced_at,
+        }
+
+        if changed and not self._dry_run:
+            _atomic_write_json(self._orchestrator_state_path, next_state)
+        _log_stderr({"type": "STARTUP_RECONCILED", **result})
+        return result
 
     def _resolve_issue_number_for_intent(self, intent: RunIntent) -> int:
         issue_number = intent.body.get("issue_number")
@@ -950,14 +1255,34 @@ class Runner:
                 self._in_flight_cond.wait(timeout=0.5)
                 waited_s += 0.5
 
-    def _release_issue_slot(self, *, issue_number: int, run_id: str) -> None:
+    def _release_issue_slot(self, *, issue_number: int, run_id: str) -> bool:
         if issue_number <= 0 or not run_id:
-            return
+            return False
         with self._in_flight_cond:
             current = self._in_flight_by_issue.get(issue_number)
             if isinstance(current, dict) and current.get("run_id") == run_id:
                 del self._in_flight_by_issue[issue_number]
                 self._in_flight_cond.notify_all()
+                return True
+        return False
+
+    def _mark_run_timed_out(self, *, run_id: str) -> None:
+        if not run_id:
+            return
+        with self._timed_out_runs_lock:
+            self._timed_out_runs.add(run_id)
+
+    def _clear_run_timed_out(self, *, run_id: str) -> None:
+        if not run_id:
+            return
+        with self._timed_out_runs_lock:
+            self._timed_out_runs.discard(run_id)
+
+    def _is_run_timed_out(self, *, run_id: str) -> bool:
+        if not run_id:
+            return False
+        with self._timed_out_runs_lock:
+            return run_id in self._timed_out_runs
 
     def _read_orchestrator_state(self) -> Dict[str, Any]:
         try:
@@ -1145,6 +1470,102 @@ class Runner:
         }
         return self._backend.post_json("/internal/project-item/update-field", body=body)
 
+    def _transition_stalled_in_progress_to_blocked(
+        self,
+        *,
+        issue_number: int,
+        project_item_id: str,
+        run_id: str,
+        stuck_minutes: int,
+        status_since_at: str,
+    ) -> Dict[str, Any]:
+        body = {
+            "role": "ORCHESTRATOR",
+            "project_item_id": project_item_id,
+            "field": "Status",
+            "value": "Blocked",
+            "issue_number": issue_number,
+            "failure_classification": "ITEM_STOP",
+            "failure_message": (
+                "Detected stale In Progress state without an active executor run; "
+                f"stuck for {stuck_minutes} minutes since {status_since_at or 'unknown'}."
+            ),
+            "suggested_next_steps": [
+                "Inspect runner logs and linked execution artifacts for this issue.",
+                "Requeue work by moving item to Ready after triage.",
+            ],
+            "run_id": run_id,
+            "stuck_minutes": stuck_minutes,
+        }
+        return self._backend.post_json("/internal/project-item/update-field", body=body)
+
+    def _recover_passed_in_review_items(self, *, summary: Dict[str, Any]) -> None:
+        processed_items = summary.get("processed_items")
+        if not isinstance(processed_items, list):
+            return
+
+        for item in processed_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("status") != "In Review":
+                continue
+            issue_number = item.get("issue_number")
+            project_item_id = item.get("project_item_id")
+            if not isinstance(issue_number, int) or issue_number <= 0:
+                continue
+            if not isinstance(project_item_id, str) or not project_item_id.strip():
+                continue
+            state_item = self._resolve_project_state_item(project_item_id)
+            if not isinstance(state_item, dict):
+                continue
+            reviewer_outcome = str(state_item.get("last_reviewer_outcome") or "").strip().upper()
+            if reviewer_outcome != "PASS":
+                continue
+
+            run_id = str(state_item.get("last_run_id") or "").strip()
+            try:
+                linkage = self._resolve_reviewer_pr_linkage(issue_number=issue_number)
+                pr_url = linkage.get("pr_url")
+                if not isinstance(pr_url, str) or not pr_url.strip():
+                    raise HttpError("review linkage missing pr_url", code="backend_invalid_payload", payload=linkage)
+                linkage_project_item_id = linkage.get("project_item_id")
+                if linkage_project_item_id != project_item_id:
+                    raise HttpError(
+                        "review linkage project_item_id mismatch",
+                        code="backend_invalid_payload",
+                        payload={
+                            "expected_project_item_id": project_item_id,
+                            "actual_project_item_id": linkage_project_item_id,
+                        },
+                    )
+                payload = self._transition_reviewer_pass_to_needs_human_approval(
+                    run_id=run_id,
+                    issue_number=issue_number,
+                    project_item_id=project_item_id,
+                    pr_url=pr_url.strip(),
+                    reason="Recovered stale reviewer PASS outcome while item remained In Review.",
+                )
+                _log_stderr(
+                    {
+                        "type": "REVIEW_PASS_RECOVERED",
+                        "issue_number": issue_number,
+                        "project_item_id": project_item_id,
+                        "run_id": run_id,
+                        "backend_payload": payload,
+                    }
+                )
+            except Exception as exc:
+                _log_stderr(
+                    {
+                        "type": "REVIEW_PASS_RECOVERED",
+                        "issue_number": issue_number,
+                        "project_item_id": project_item_id,
+                        "run_id": run_id,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
+
     def _handle_review_stall(self, *, summary: Dict[str, Any]) -> None:
         needs_attention = summary.get("needs_attention")
         if not isinstance(needs_attention, dict):
@@ -1240,6 +1661,155 @@ class Runner:
                         "status": "failed",
                     }
                 )
+
+    def _handle_stalled_in_progress(self, *, summary: Dict[str, Any]) -> None:
+        needs_attention = summary.get("needs_attention")
+        if not isinstance(needs_attention, dict):
+            return
+        stalled_entries = needs_attention.get("stalled_in_progress")
+        if not isinstance(stalled_entries, list):
+            return
+
+        for entry in stalled_entries:
+            if not isinstance(entry, dict):
+                continue
+            issue_number = entry.get("issue_number")
+            project_item_id = entry.get("project_item_id")
+            stuck_minutes = entry.get("stuck_minutes")
+            status_since_at = str(entry.get("status_since_at") or "").strip()
+            if not isinstance(issue_number, int) or issue_number <= 0:
+                continue
+            if not isinstance(project_item_id, str) or not project_item_id.strip():
+                continue
+            if not isinstance(stuck_minutes, int) or stuck_minutes <= 0:
+                continue
+
+            state_item = self._resolve_project_state_item(project_item_id)
+            if not isinstance(state_item, dict):
+                continue
+            if state_item.get("last_seen_status") != "In Progress":
+                continue
+
+            run_id = str(state_item.get("last_run_id") or "").strip()
+            if self._ledger and run_id:
+                ledger_entry = self._ledger.get(run_id)
+                if isinstance(ledger_entry, dict):
+                    ledger_status = str(ledger_entry.get("status") or "").strip().lower()
+                    if ledger_status == "running":
+                        continue
+
+            try:
+                payload = self._transition_stalled_in_progress_to_blocked(
+                    issue_number=issue_number,
+                    project_item_id=project_item_id,
+                    run_id=run_id,
+                    stuck_minutes=stuck_minutes,
+                    status_since_at=status_since_at,
+                )
+                _log_stderr(
+                    {
+                        "type": "STALLED_IN_PROGRESS_BLOCKED",
+                        "issue_number": issue_number,
+                        "project_item_id": project_item_id,
+                        "run_id": run_id,
+                        "stuck_minutes": stuck_minutes,
+                        "status_since_at": status_since_at,
+                        "backend_payload": payload,
+                    }
+                )
+            except Exception as exc:
+                _log_stderr(
+                    {
+                        "type": "STALLED_IN_PROGRESS_BLOCKED",
+                        "issue_number": issue_number,
+                        "project_item_id": project_item_id,
+                        "run_id": run_id,
+                        "stuck_minutes": stuck_minutes,
+                        "status_since_at": status_since_at,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
+
+    def _recover_lost_in_review_reviewer_dispatches(self, *, summary: Dict[str, Any]) -> None:
+        if not self._ledger:
+            return
+        processed_items = summary.get("processed_items")
+        if not isinstance(processed_items, list):
+            return
+        poll_count_value = summary.get("poll_count")
+        current_poll = poll_count_value if isinstance(poll_count_value, int) and poll_count_value >= 0 else None
+        now_iso = _utc_now_iso()
+
+        for item in processed_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("status") != "In Review":
+                continue
+            issue_number = item.get("issue_number")
+            project_item_id = item.get("project_item_id")
+            if not isinstance(issue_number, int) or issue_number <= 0:
+                continue
+            if not isinstance(project_item_id, str) or not project_item_id.strip():
+                continue
+            state_item = self._resolve_project_state_item(project_item_id)
+            if not isinstance(state_item, dict):
+                continue
+            if state_item.get("last_dispatched_role") != "REVIEWER":
+                continue
+            if state_item.get("last_dispatched_status") != "In Review":
+                continue
+            if isNonEmptyString(state_item.get("last_reviewer_outcome")):
+                continue
+            last_dispatched_poll_value = state_item.get("last_dispatched_poll")
+            last_dispatched_poll = (
+                last_dispatched_poll_value if isinstance(last_dispatched_poll_value, int) and last_dispatched_poll_value >= 0 else 0
+            )
+            # Do not recover within the same orchestrator poll epoch that emitted this dispatch.
+            if current_poll is not None and last_dispatched_poll >= current_poll:
+                continue
+            stale_run_id = str(state_item.get("last_run_id") or "").strip()
+            if not stale_run_id:
+                continue
+
+            elapsed_seconds = _seconds_since(state_item.get("last_dispatched_at"), now_iso=now_iso)
+
+            ledger_entry = self._ledger.get(stale_run_id)
+            if isinstance(ledger_entry, dict):
+                ledger_status = str(ledger_entry.get("status") or "").strip().lower()
+                if ledger_status == "running":
+                    continue
+                result = ledger_entry.get("result")
+                reviewer_outcome = ""
+                if isinstance(result, dict):
+                    outcome_value = result.get("reviewer_outcome")
+                    if isNonEmptyString(outcome_value):
+                        reviewer_outcome = str(outcome_value).strip().upper()
+                if reviewer_outcome in ("PASS", "FAIL", "INCOMPLETE"):
+                    continue
+                recovery_reason = f"ledger_status_{ledger_status or 'unknown'}_without_outcome"
+            else:
+                recovery_reason = "ledger_entry_missing"
+
+            self._update_orchestrator_state_item(
+                project_item_id,
+                {
+                    "last_dispatched_role": "",
+                    "last_dispatched_status": "",
+                    "last_dispatched_at": "",
+                    "last_dispatched_poll": 0,
+                },
+            )
+            _log_stderr(
+                {
+                    "type": "REVIEW_DISPATCH_RECOVERED",
+                    "issue_number": issue_number,
+                    "project_item_id": project_item_id,
+                    "stale_run_id": stale_run_id,
+                    "elapsed_s": elapsed_seconds,
+                    "reason": recovery_reason,
+                }
+            )
 
     def _handle_blocked_retries(self, *, summary: Dict[str, Any]) -> None:
         processed_items = summary.get("processed_items")
@@ -1414,27 +1984,76 @@ class Runner:
                     "error_code": "watchdog_timeout",
                 },
             )
+            self._mark_run_timed_out(run_id=run_id)
+            slot_released = self._release_issue_slot(issue_number=issue_number, run_id=run_id)
+            run_role = str(ledger_entry.get("role") or "").strip().upper()
             _log_stderr(
                 {
                     "type": "WORKER_WATCHDOG_TIMEOUT",
                     "run_id": run_id,
+                    "role": run_role,
                     "issue_number": issue_number,
                     "project_item_id": project_item_id,
                     "elapsed_s": elapsed_seconds,
                     "timeout_s": self._watchdog_timeout_s,
+                    "slot_released": slot_released,
                 }
             )
-            self._transition_executor_failure_to_blocked(
-                run_id=run_id,
-                failure_classification="HARD_STOP",
-                failure_message=message,
-            )
+            if run_role == "REVIEWER":
+                # Reviewer watchdog timeouts can leave In Review items in a stale dedupe state.
+                # Record a fresh INCOMPLETE outcome and clear dispatch markers to force re-dispatch.
+                self._record_reviewer_outcome_state(
+                    issue_number=issue_number,
+                    outcome="INCOMPLETE",
+                    recorded_at=now_iso,
+                )
+                self._update_orchestrator_state_item(
+                    project_item_id,
+                    {
+                        "last_dispatched_role": "",
+                        "last_dispatched_status": "",
+                        "last_dispatched_at": "",
+                        "last_dispatched_poll": 0,
+                    },
+                )
+                _log_stderr(
+                    {
+                        "type": "WORKER_WATCHDOG_TIMEOUT_RECOVERY",
+                        "run_id": run_id,
+                        "role": "REVIEWER",
+                        "issue_number": issue_number,
+                        "project_item_id": project_item_id,
+                        "action": "mark_incomplete_and_clear_dispatch",
+                    }
+                )
+            else:
+                self._transition_executor_failure_to_blocked(
+                    run_id=run_id,
+                    failure_classification="HARD_STOP",
+                    failure_message=message,
+                )
 
     def handle_dispatch_summary(self, *, summary: Dict[str, Any]) -> None:
-        self._handle_review_stall(summary=summary)
-        self._handle_blocked_retries(summary=summary)
-        self._handle_in_review_cycle_caps(summary=summary)
-        self._handle_running_watchdog(summary=summary)
+        handlers = [
+            ("recover_passed_in_review_items", self._recover_passed_in_review_items),
+            ("recover_lost_in_review_reviewer_dispatches", self._recover_lost_in_review_reviewer_dispatches),
+            ("handle_review_stall", self._handle_review_stall),
+            ("handle_stalled_in_progress", self._handle_stalled_in_progress),
+            ("handle_blocked_retries", self._handle_blocked_retries),
+            ("handle_in_review_cycle_caps", self._handle_in_review_cycle_caps),
+            ("handle_running_watchdog", self._handle_running_watchdog),
+        ]
+        for handler_name, handler in handlers:
+            try:
+                handler(summary=summary)
+            except Exception as exc:
+                _log_stderr(
+                    {
+                        "type": "DISPATCH_SUMMARY_HANDLER_FAILED",
+                        "handler": handler_name,
+                        "error": str(exc),
+                    }
+                )
 
     def hard_stop(self, reason: str) -> None:
         self._hard_stop_reason = reason
@@ -1670,6 +2289,15 @@ class Runner:
             # Bundle injection: fetch verbatim from backend.
             bundle = self._backend.get_agent_context(intent.role)
 
+            def _intent_transcript_sink(section: str, content: str) -> None:
+                _emit_live_transcript_event(
+                    backend=self._backend,
+                    run_id=intent.run_id,
+                    role=intent.role,
+                    section=section,
+                    content=content,
+                )
+
             # Execute via Codex MCP worker (Codex MCP server is spawned per intent).
             result = run_intent_with_codex_mcp(
                 codex_bin=self._codex_bin,
@@ -1678,8 +2306,30 @@ class Runner:
                 role_bundle=bundle,
                 intent=intent.raw,
                 tools_call_timeout_s=self._codex_tools_call_timeout_s,
+                transcript_event_sink=_intent_transcript_sink,
             )
+            if self._is_run_timed_out(run_id=intent.run_id):
+                _log_stderr(
+                    {
+                        "type": "WORKER_RESULT_IGNORED",
+                        "role": intent.role,
+                        "run_id": intent.run_id,
+                        "reason": "run_timed_out_by_watchdog",
+                    }
+                )
+                return
         except Exception as exc:
+            if self._is_run_timed_out(run_id=intent.run_id):
+                _log_stderr(
+                    {
+                        "type": "WORKER_RESULT_IGNORED",
+                        "role": intent.role,
+                        "run_id": intent.run_id,
+                        "reason": "run_timed_out_by_watchdog",
+                        "source": "worker_exception",
+                    }
+                )
+                return
             heartbeat_stop.set()
             failure_classification = classify_failure(exc)
             error_code = exc.code if isinstance(exc, (CodexWorkerError, HttpError, IntentError)) else "unknown_error"
@@ -1898,24 +2548,249 @@ class Runner:
                 )
             raise
         finally:
+            self._clear_run_timed_out(run_id=intent.run_id)
             release_issue_slot_once()
 
 
 def _log_stderr(obj: Dict[str, Any]) -> None:
-    sys.stderr.write(json.dumps(obj, separators=(",", ":"), ensure_ascii=True) + "\n")
-    sys.stderr.flush()
+    with _stderr_lock:
+        sys.stderr.write(json.dumps(obj, separators=(",", ":"), ensure_ascii=True) + "\n")
+        sys.stderr.flush()
+
+
+_TRANSCRIPT_EVENT_QUEUE_MAX = 1024
+_transcript_event_queue: "queue.Queue[Tuple[Any, Dict[str, str]]]" = queue.Queue(maxsize=_TRANSCRIPT_EVENT_QUEUE_MAX)
+_transcript_sender_started = False
+_transcript_sender_lock = threading.Lock()
+
+
+def _post_live_transcript_event(*, backend: Any, body: Dict[str, str]) -> None:
+    try:
+        if isinstance(backend, BackendClient):
+            timeout_s = max(0.75, min(backend.timeout_s, 2.0))
+            backend.post_json("/internal/logs/events", body=body, timeout_s=timeout_s)
+            return
+        post_json = getattr(backend, "post_json", None)
+        if callable(post_json):
+            post_json("/internal/logs/events", body=body)
+    except Exception:
+        # Live transcript streaming must never interrupt orchestrator/runner execution.
+        pass
+
+
+def _transcript_sender_worker() -> None:
+    while True:
+        try:
+            backend, body = _transcript_event_queue.get()
+        except Exception:
+            continue
+        try:
+            _post_live_transcript_event(backend=backend, body=body)
+        finally:
+            try:
+                _transcript_event_queue.task_done()
+            except Exception:
+                pass
+
+
+def _ensure_transcript_sender_started() -> None:
+    global _transcript_sender_started
+    if _transcript_sender_started:
+        return
+    with _transcript_sender_lock:
+        if _transcript_sender_started:
+            return
+        thread = threading.Thread(target=_transcript_sender_worker, daemon=True, name="transcript-sender")
+        thread.start()
+        _transcript_sender_started = True
+
+
+def _emit_live_transcript_event(
+    *,
+    backend: Any,
+    run_id: str,
+    role: str,
+    section: str,
+    content: str,
+) -> None:
+    normalized_run_id = str(run_id or "").strip()
+    normalized_role = str(role or "").strip().upper()
+    normalized_section = str(section or "").strip().upper()
+    normalized_content = str(content or "").strip()
+    if not normalized_run_id or not normalized_role or not normalized_section or not normalized_content:
+        return
+
+    if not callable(getattr(backend, "post_json", None)):
+        return
+
+    body = {
+        "run_id": normalized_run_id,
+        "role": normalized_role,
+        "section": normalized_section,
+        "content": normalized_content,
+    }
+
+    try:
+        _ensure_transcript_sender_started()
+        _transcript_event_queue.put_nowait((backend, body))
+    except queue.Full:
+        # Prefer newer transcript chunks over stale backlog to keep UI current.
+        try:
+            _transcript_event_queue.get_nowait()
+            _transcript_event_queue.task_done()
+        except Exception:
+            pass
+        try:
+            _transcript_event_queue.put_nowait((backend, body))
+        except Exception:
+            pass
+    except Exception:
+        # Live transcript streaming must never interrupt orchestrator/runner execution.
+        pass
+
+
+class _RunTranscriptWriter:
+    def __init__(self, *, repo_root: str, run_id: str, backend: Any = None, role: str = "ORCHESTRATOR"):
+        _ = repo_root
+        self._lock = threading.Lock()
+        self._backend = backend
+        self._run_id = str(run_id or "").strip()
+        self._role = str(role or "").strip().upper()
+
+    def _write(self, title: str, text: str) -> None:
+        if not isinstance(text, str) or text == "":
+            return
+        with self._lock:
+            try:
+                _emit_live_transcript_event(
+                    backend=self._backend,
+                    run_id=self._run_id,
+                    role=self._role,
+                    section=str(title or "").strip().upper() or "SYSTEM OBSERVATION",
+                    content=text,
+                )
+            except Exception:
+                # Transcript streaming must never interrupt orchestration.
+                pass
+
+    def _append_section(self, *, title: str, content: str) -> None:
+        normalized_content = str(content or "").strip()
+        if not normalized_content:
+            return
+        normalized_title = str(title or "").strip()
+        if not normalized_title:
+            normalized_title = "SYSTEM OBSERVATION"
+        self._write(normalized_title, normalized_content)
+
+    def append_message_to_agent(self, content: str) -> None:
+        self._append_section(title="MESSAGE TO AGENT", content=content)
+
+    def append_agent_thinking(self, content: str) -> None:
+        self._append_section(title="AGENT THINKING", content=content)
+
+    def append_system_observation(self, content: str) -> None:
+        self._append_section(title="SYSTEM OBSERVATION", content=content)
+
+    def close(self) -> None:
+        return None
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _format_orchestrator_poll_summary(summary: Dict[str, Any]) -> str:
+    sprint = str(summary.get("sprint") or "").strip() or "Unknown"
+    poll_count = _safe_int(summary.get("poll_count"), 0)
+    status_counts = summary.get("status_counts") if isinstance(summary.get("status_counts"), dict) else {}
+    intents_emitted = summary.get("intents_emitted") if isinstance(summary.get("intents_emitted"), dict) else {}
+    skipped = summary.get("skipped") if isinstance(summary.get("skipped"), dict) else {}
+    needs_attention = summary.get("needs_attention") if isinstance(summary.get("needs_attention"), dict) else {}
+
+    backlog = _safe_int(status_counts.get("Backlog"), 0)
+    ready = _safe_int(status_counts.get("Ready"), 0)
+    in_progress = _safe_int(status_counts.get("In Progress"), 0)
+    in_review = _safe_int(status_counts.get("In Review"), 0)
+    needs_human = _safe_int(status_counts.get("Needs Human Approval"), 0)
+    blocked = _safe_int(status_counts.get("Blocked"), 0)
+    done = _safe_int(status_counts.get("Done"), 0)
+
+    executor_dispatches = _safe_int(intents_emitted.get("EXECUTOR"), 0)
+    reviewer_dispatches = _safe_int(intents_emitted.get("REVIEWER"), 0)
+    total_dispatches = _safe_int(intents_emitted.get("total"), executor_dispatches + reviewer_dispatches)
+    stalled_items = needs_attention.get("stalled_in_progress") if isinstance(needs_attention, dict) else []
+    churn_items = needs_attention.get("in_review_churn") if isinstance(needs_attention, dict) else []
+    stalled_in_progress = len(stalled_items) if isinstance(stalled_items, list) else 0
+    in_review_churn = len(churn_items) if isinstance(churn_items, list) else 0
+
+    lines = [
+        f"Poll #{poll_count} for sprint {sprint}.",
+        (
+            "Board status: "
+            f"Backlog={backlog}, Ready={ready}, In Progress={in_progress}, In Review={in_review}, "
+            f"Needs Human Approval={needs_human}, Blocked={blocked}, Done={done}"
+        ),
+        f"Dispatch decisions: Executor={executor_dispatches}, Reviewer={reviewer_dispatches}, Total={total_dispatches}",
+        (
+            "Skipped: "
+            f"not_in_scope={_safe_int(skipped.get('not_in_scope'), 0)}, "
+            f"dedupe_same_status={_safe_int(skipped.get('dedupe_same_status'), 0)}, "
+            f"concurrency_limit={_safe_int(skipped.get('concurrency_limit'), 0)}"
+        ),
+        f"Attention flags: stalled_in_progress={stalled_in_progress}, in_review_churn={in_review_churn}",
+    ]
+
+    if total_dispatches == 0:
+        lines.append("No new agent dispatches this poll.")
+    if bool(summary.get("completed")):
+        lines.append("Sprint completion condition reached: no active or backlog items remain.")
+
+    return "\n".join(lines)
+
+
+def _format_orchestrator_intent_observation(intent: RunIntent) -> str:
+    issue_number = intent.body.get("issue_number")
+    if isinstance(issue_number, int) and issue_number > 0:
+        return (
+            f"Dispatched {intent.role} run {intent.run_id} for issue #{issue_number}. "
+            f"Endpoint: {intent.endpoint}"
+        )
+    return f"Dispatched {intent.role} run {intent.run_id}. Endpoint: {intent.endpoint}"
 
 
 def _spawn_orchestrator(cmd: str, *, env: dict[str, str]) -> subprocess.Popen[str]:
-    return subprocess.Popen(
-        cmd,
-        shell=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-        bufsize=1,
-    )
+    proc: Optional[subprocess.Popen[str]] = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            bufsize=1,
+        )
+        _set_active_orchestrator_proc(proc)
+        return proc
+    except BaseException:
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            except Exception:
+                pass
+            _close_popen_pipes(proc)
+        _set_active_orchestrator_proc(None)
+        raise
 
 
 def _assert_codex_github_mcp_available(*, codex_bin: str) -> None:
@@ -2332,7 +3207,41 @@ def main(argv: Optional[list[str]] = None) -> int:
         _log_stderr({"type": "HARD_STOP", "reason": "preflight_fail", "payload": preflight})
         return 2
 
+    ledger: Optional[RunLedger] = None
+    if not config.dry_run:
+        ledger = RunLedger(config.ledger_path)
+
     if args.kickoff:
+        kickoff_run_id = f"kickoff-{uuid4()}"
+        if ledger:
+            ledger.upsert(
+                LedgerEntry(
+                    run_id=kickoff_run_id,
+                    role="ORCHESTRATOR",
+                    intent_hash=f"kickoff:{config.orchestrator_sprint}",
+                    received_at=_utc_now_iso(),
+                    status="queued",
+                    result=None,
+                )
+            )
+            ledger.mark_running(kickoff_run_id)
+
+        def _mark_kickoff_result(*, status: str, summary: str, errors: Optional[List[Dict[str, Any]]] = None, details: Optional[Dict[str, Any]] = None) -> None:
+            if not ledger:
+                return
+            payload: Dict[str, Any] = {
+                "run_id": kickoff_run_id,
+                "role": "ORCHESTRATOR",
+                "status": status,
+                "summary": summary,
+                "urls": {},
+                "errors": errors or [],
+                "completed_at": _utc_now_iso(),
+            }
+            if details:
+                payload["details"] = details
+            ledger.mark_result(kickoff_run_id, status="succeeded" if status == "succeeded" else "failed", result=payload)
+
         try:
             sprint = config.orchestrator_sprint
             goal_text = _read_goal_text(goal=args.goal, goal_file=args.goal_file)
@@ -2343,6 +3252,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                 goal_text=goal_text,
                 ready_limit=ready_limit,
             )
+
+            def _kickoff_transcript_sink(section: str, content: str) -> None:
+                _emit_live_transcript_event(
+                    backend=backend,
+                    run_id=kickoff_run_id,
+                    role="ORCHESTRATOR",
+                    section=section,
+                    content=content,
+                )
+
             kickoff_raw = generate_json_with_codex_mcp(
                 codex_bin=config.codex_bin,
                 codex_mcp_args=config.codex_mcp_args,
@@ -2352,6 +3271,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                 sandbox="read-only",
                 approval_policy="never",
                 tools_call_timeout_s=config.codex_tools_call_timeout_s,
+                run_id=kickoff_run_id,
+                repo_root=repo_root,
+                transcript_event_sink=_kickoff_transcript_sink,
             )
             kickoff_plan = validate_kickoff_plan(kickoff_raw, sprint=sprint, ready_limit=ready_limit)
             draft = kickoff_plan_to_plan_apply_draft(kickoff_plan)
@@ -2377,7 +3299,23 @@ def main(argv: Optional[list[str]] = None) -> int:
                     details={"code": exc.code, "status_code": exc.status_code, "payload": exc.payload},
                 ) from None
             _log_stderr({"type": "KICKOFF_RESULT", **apply_result})
+            _mark_kickoff_result(
+                status="succeeded",
+                summary="Kickoff planning completed.",
+                details={
+                    "sprint": sprint,
+                    "ready_limit": ready_limit,
+                    "apply_status": apply_result.get("status"),
+                    "promoted_count": len(apply_result.get("promoted") or []),
+                },
+            )
         except SanitizationRegenHandoffRequestedError as exc:
+            _mark_kickoff_result(
+                status="failed",
+                summary=str(exc),
+                errors=[{"code": "sanitization_regen_handoff_requested", "message": str(exc)}],
+                details={"request_path": exc.request_path},
+            )
             _log_stderr(
                 {
                     "type": "HARD_STOP",
@@ -2389,6 +3327,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             return 6
         except SanitizationRegenExhaustedError as exc:
+            _mark_kickoff_result(
+                status="failed",
+                summary=str(exc),
+                errors=[{"code": "sanitization_regen_exhausted", "message": str(exc)}],
+            )
             _log_stderr(
                 {
                     "type": "HARD_STOP",
@@ -2399,9 +3342,20 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             return 5
         except MalformedSprintDataError as exc:
+            _mark_kickoff_result(
+                status="failed",
+                summary=str(exc),
+                errors=[{"code": "malformed_item_data", "message": str(exc)}],
+            )
             _log_stderr({"type": "HARD_STOP", "reason": "malformed_item_data", "error": str(exc)})
             return 3
         except (KickoffError, CodexWorkerError) as exc:
+            _mark_kickoff_result(
+                status="failed",
+                summary=str(exc),
+                errors=[{"code": getattr(exc, "code", "kickoff_failed"), "message": str(exc)}],
+                details=getattr(exc, "details", {}),
+            )
             _log_stderr({"type": "HARD_STOP", "reason": "kickoff_failed", "code": getattr(exc, "code", "kickoff_failed"), "details": getattr(exc, "details", {}), "error": str(exc)})
             return 2
 
@@ -2416,10 +3370,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             _log_stderr({"type": "HARD_STOP", "reason": "codex_mcp_missing", "code": exc.code, "details": exc.details})
             return 2
 
-    ledger: Optional[RunLedger] = None
-    if not config.dry_run:
-        ledger = RunLedger(config.ledger_path)
-
     runner = Runner(
         backend=backend,
         ledger=ledger,
@@ -2432,6 +3382,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         blocked_retry_minutes=config.blocked_retry_minutes,
         watchdog_timeout_s=config.watchdog_timeout_s,
     )
+    _set_active_runner(runner)
+
+    try:
+        runner.reconcile_startup_state(sprint=config.orchestrator_sprint)
+    except Exception as exc:
+        _log_stderr(
+            {
+                "type": "STARTUP_RECONCILED",
+                "status": "SKIPPED",
+                "reason": "unexpected_error",
+                "error": str(exc),
+            }
+        )
 
     # Spawn worker threads.
     workers: list[threading.Thread] = []
@@ -2481,7 +3444,72 @@ def main(argv: Optional[list[str]] = None) -> int:
             _log_stderr({"type": "HARD_STOP", "reason": "sprint_plan_invalid", "error": str(exc), "path": config.sprint_plan_path})
             return 2
 
+    orchestrator_loop_run_id = f"orchestrator-loop-{uuid4()}"
+    orchestrator_poll_summaries_seen = 0
+    orchestrator_dispatches_seen = 0
+    orchestrator_transcript = _RunTranscriptWriter(
+        repo_root=repo_root,
+        run_id=orchestrator_loop_run_id,
+        backend=backend,
+        role="ORCHESTRATOR",
+    )
+    orchestrator_poll_interval_ms = _safe_int(orchestrator_env.get("ORCHESTRATOR_POLL_INTERVAL_MS"), 15000)
+    if orchestrator_poll_interval_ms <= 0:
+        orchestrator_poll_interval_ms = 15000
+
+    if ledger:
+        ledger.upsert(
+            LedgerEntry(
+                run_id=orchestrator_loop_run_id,
+                role="ORCHESTRATOR",
+                intent_hash=f"orchestrator-loop:{config.orchestrator_sprint}",
+                received_at=_utc_now_iso(),
+                status="queued",
+                result=None,
+            )
+        )
+        ledger.mark_running(orchestrator_loop_run_id)
+
+    def _mark_orchestrator_loop_result(
+        *,
+        status: str,
+        summary: str,
+        errors: Optional[List[Dict[str, Any]]] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not ledger:
+            return
+        result_payload: Dict[str, Any] = {
+            "run_id": orchestrator_loop_run_id,
+            "role": "ORCHESTRATOR",
+            "status": status,
+            "summary": summary,
+            "urls": {},
+            "errors": errors or [],
+            "completed_at": _utc_now_iso(),
+            "poll_summaries_seen": orchestrator_poll_summaries_seen,
+            "dispatches_seen": orchestrator_dispatches_seen,
+        }
+        if details:
+            result_payload["details"] = details
+        ledger.mark_result(
+            orchestrator_loop_run_id,
+            status="succeeded" if status == "succeeded" else "failed",
+            result=result_payload,
+        )
+
+    orchestrator_transcript.append_message_to_agent(
+        (
+            "Role: ORCHESTRATOR\n"
+            f"Mode: {'once' if config.once else 'loop'}\n"
+            f"Sprint: {config.orchestrator_sprint}\n"
+            f"Polling interval: {int(orchestrator_poll_interval_ms / 1000)}s\n"
+            "Goal: Monitor sprint board status, choose eligible work, and dispatch EXECUTOR/REVIEWER runs."
+        )
+    )
+
     proc = _spawn_orchestrator(orchestrator_cmd, env=orchestrator_env)
+    _set_active_orchestrator_proc(proc)
     assert proc.stdout is not None
     assert proc.stderr is not None
 
@@ -2526,27 +3554,59 @@ def main(argv: Optional[list[str]] = None) -> int:
                     continue
 
                 if channel == "stderr":
-                    sys.stderr.write(line)
-                    sys.stderr.flush()
+                    with _stderr_lock:
+                        sys.stderr.write(line)
+                        sys.stderr.flush()
 
-                    if not config.autopromote:
-                        continue
+                    payload: Optional[Dict[str, Any]] = None
                     try:
-                        payload = parse_json_line(stripped)
+                        parsed = parse_json_line(stripped)
+                        if isinstance(parsed, dict):
+                            payload = parsed
                     except IntentError:
+                        payload = None
+
+                    if payload is None:
+                        # Preserve plain errors while suppressing raw schema noise in UI.
+                        if not stripped.startswith("{"):
+                            lowered = stripped.lower()
+                            if "fetch failed" in lowered:
+                                orchestrator_transcript.append_system_observation(
+                                    "Network request failed while orchestrator was polling GitHub/backend (fetch failed)."
+                                )
+                            else:
+                                orchestrator_transcript.append_system_observation(stripped[:2000])
                         continue
-                    if payload.get("type") == "DISPATCH_SUMMARY":
+
+                    payload_type = str(payload.get("type") or "").strip().upper()
+                    if payload_type == "DISPATCH_SUMMARY":
+                        orchestrator_poll_summaries_seen += 1
+                        intents_emitted_payload = payload.get("intents_emitted")
+                        if not isinstance(intents_emitted_payload, dict):
+                            intents_emitted_payload = {}
+                        dispatch_total = _safe_int(intents_emitted_payload.get("total"), 0)
+                        if dispatch_total > 0:
+                            orchestrator_dispatches_seen += dispatch_total
+                        orchestrator_transcript.append_agent_thinking(_format_orchestrator_poll_summary(payload))
+
                         try:
-                            _maybe_autopromote_ready(
-                                summary=payload,
-                                sprint_plan=sprint_plan,
-                                backend=backend,
-                                dry_run=config.dry_run,
-                                ready_target=config.runner_ready_buffer,
-                                sanitization_regen_attempts=config.orchestrator_sanitization_regen_attempts,
-                                orchestrator_state_path=config.orchestrator_state_path,
-                            )
+                            if config.autopromote:
+                                _maybe_autopromote_ready(
+                                    summary=payload,
+                                    sprint_plan=sprint_plan,
+                                    backend=backend,
+                                    dry_run=config.dry_run,
+                                    ready_target=config.runner_ready_buffer,
+                                    sanitization_regen_attempts=config.orchestrator_sanitization_regen_attempts,
+                                    orchestrator_state_path=config.orchestrator_state_path,
+                                )
                         except SanitizationRegenHandoffRequestedError as exc:
+                            _mark_orchestrator_loop_result(
+                                status="failed",
+                                summary=str(exc),
+                                errors=[{"code": "sanitization_regen_handoff_requested", "message": str(exc)}],
+                                details={"request_path": exc.request_path},
+                            )
                             _log_stderr(
                                 {
                                     "type": "HARD_STOP",
@@ -2558,6 +3618,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                             )
                             return 6
                         except SanitizationRegenExhaustedError as exc:
+                            _mark_orchestrator_loop_result(
+                                status="failed",
+                                summary=str(exc),
+                                errors=[{"code": "sanitization_regen_exhausted", "message": str(exc)}],
+                            )
                             _log_stderr(
                                 {
                                     "type": "HARD_STOP",
@@ -2568,10 +3633,36 @@ def main(argv: Optional[list[str]] = None) -> int:
                             )
                             return 5
                         except MalformedSprintDataError as exc:
+                            _mark_orchestrator_loop_result(
+                                status="failed",
+                                summary=str(exc),
+                                errors=[{"code": "malformed_item_data", "message": str(exc)}],
+                            )
                             _log_stderr({"type": "HARD_STOP", "reason": "malformed_item_data", "error": str(exc)})
                             return 3
                         if not config.dry_run:
                             runner.handle_dispatch_summary(summary=payload)
+                    elif payload_type == "END_OF_SPRINT_SUMMARY":
+                        awaiting_humans = str(payload.get("awaiting_humans") or "").strip()
+                        if awaiting_humans:
+                            orchestrator_transcript.append_agent_thinking(awaiting_humans)
+                    elif payload_type == "ORCHESTRATOR_CYCLE_TRANSIENT_ERROR":
+                        retry_in_ms = _safe_int(payload.get("retry_in_ms"), 0)
+                        retry_in_s = int(retry_in_ms / 1000) if retry_in_ms > 0 else 0
+                        orchestrator_transcript.append_system_observation(
+                            (
+                                f"Transient orchestrator cycle error: {str(payload.get('error') or 'Unknown error')}\n"
+                                f"Retry in: {retry_in_s}s\n"
+                                "Action: monitor this terminal; if retries continue for several polls, verify backend/network connectivity."
+                            )
+                        )
+                    elif payload_type == "ORCHESTRATOR_STATE_RESET_INVALID_JSON":
+                        orchestrator_transcript.append_system_observation(
+                            (
+                                "Detected invalid orchestrator state JSON and reset state file.\n"
+                                f"Path: {str(payload.get('path') or '')}"
+                            )
+                        )
                     continue
 
                 try:
@@ -2590,6 +3681,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "intent_hash": intent.intent_hash,
                     }
                 )
+                orchestrator_transcript.append_system_observation(_format_orchestrator_intent_observation(intent))
 
                 if ledger and ledger.get(intent.run_id) and ledger.get(intent.run_id).get("status") == "succeeded":
                     _log_stderr({"type": "LEDGER_SKIP", "run_id": intent.run_id, "reason": "already_succeeded"})
@@ -2615,18 +3707,50 @@ def main(argv: Optional[list[str]] = None) -> int:
             pass
         try:
             proc.terminate()
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
         except Exception:
             pass
+        _close_popen_pipes(proc)
+        _set_active_orchestrator_proc(None)
+        orchestrator_transcript.close()
 
     if runner.should_stop():
+        orchestrator_transcript.append_system_observation(
+            (
+                f"Runner hard-stopped the loop.\nReason: {runner.stop_reason()}\n"
+                "Action: inspect this terminal and restart the runner loop after fixing the underlying issue."
+            )
+        )
+        _mark_orchestrator_loop_result(
+            status="failed",
+            summary=runner.stop_reason(),
+            errors=[{"code": "runner_hard_stop", "message": runner.stop_reason()}],
+        )
         _log_stderr({"type": "HARD_STOP", "reason": runner.stop_reason()})
         return 2
 
     rc = proc.wait(timeout=5)
     if rc != 0:
+        orchestrator_transcript.append_system_observation(
+            (
+                f"Orchestrator process exited with code {rc}.\n"
+                "Action: review the latest error details above, then restart Runner Loop from the UI."
+            )
+        )
+        _mark_orchestrator_loop_result(
+            status="failed",
+            summary=f"orchestrator exited with code {rc}",
+            errors=[{"code": "orchestrator_nonzero_exit", "message": f"exit code {rc}"}],
+        )
         _log_stderr({"type": "HARD_STOP", "reason": "orchestrator_nonzero_exit", "exit_code": rc})
         return rc if rc in (2, 3, 4) else 2
 
+    _mark_orchestrator_loop_result(
+        status="succeeded",
+        summary="orchestrator loop finished cleanly",
+    )
     return 0
 
 
