@@ -22,6 +22,31 @@
         },
       };
     </script>
+    <style>
+      .mono-scrollbar {
+        scrollbar-width: thin;
+        scrollbar-color: #52525b #09090b;
+      }
+
+      .mono-scrollbar::-webkit-scrollbar {
+        width: 10px;
+        height: 10px;
+      }
+
+      .mono-scrollbar::-webkit-scrollbar-track {
+        background: #09090b;
+      }
+
+      .mono-scrollbar::-webkit-scrollbar-thumb {
+        background-color: #3f3f46;
+        border-radius: 9999px;
+        border: 2px solid #09090b;
+      }
+
+      .mono-scrollbar::-webkit-scrollbar-thumb:hover {
+        background-color: #52525b;
+      }
+    </style>
   </head>
   <body class="min-h-screen bg-zinc-950 text-zinc-100 antialiased">
     <canvas id="bg-canvas" class="fixed inset-0 z-0 pointer-events-none opacity-30"></canvas>
@@ -169,6 +194,23 @@
                   />
                 </label>
               </div>
+              <div class="rounded-xl border border-zinc-800 bg-black/60 p-3">
+                <p class="text-xs font-semibold uppercase tracking-[0.16em] text-zinc-300">Notifications</p>
+                <label class="mt-2 flex items-start gap-2">
+                  <input
+                    id="settings-sound-needs-human-approval"
+                    type="checkbox"
+                    class="mt-0.5 h-4 w-4 accent-zinc-200"
+                  />
+                  <span class="block">
+                    <span class="block text-xs font-semibold uppercase tracking-[0.16em] text-zinc-400">Needs Human Approval sound</span>
+                    <span class="mt-1 block text-xs text-zinc-500">
+                      Play a sound when a reviewer moves a task to <span class="font-semibold text-zinc-200">Needs Human Approval</span>.
+                      (Most browsers require one click/keypress to enable audio.)
+                    </span>
+                  </span>
+                </label>
+              </div>
               <div
                 id="settings-message"
                 class="hidden rounded-lg border px-3 py-2 text-sm"
@@ -197,117 +239,145 @@
 
         <div id="error-banner" class="mt-5 hidden rounded-xl border border-zinc-700 bg-zinc-900 px-4 py-3 text-sm font-medium text-zinc-200 shadow-md shadow-white/5"></div>
 
-        <section class="mt-7 rounded-2xl border border-zinc-800 bg-zinc-900 p-5 shadow-lg shadow-white/10 sm:p-6">
-          <div class="flex flex-wrap items-center justify-between gap-4">
-            <div>
-              <h2 class="text-xl font-semibold tracking-tight text-white">Initialize Sprint</h2>
-              <p class="mt-1 text-sm text-zinc-400">
-                Step 1 saves your high-level sprint goal to local kickoff state. Step 2 starts kickoff loop execution. If tasks already exist, you can start the runner loop directly without kickoff.
-              </p>
-            </div>
-          </div>
+        <section class="mt-7 rounded-2xl border border-zinc-800 bg-zinc-900 p-6 shadow-lg shadow-white/10">
+          <details id="kickoff-details" open class="group">
+            <summary class="flex cursor-pointer list-none flex-wrap items-center justify-between gap-4 marker:hidden">
+              <div>
+                <h2 class="text-xl font-semibold tracking-tight text-white">Sprint Configuration &amp; Kickoff</h2>
+                <p class="mt-1 text-sm text-zinc-400">
+                  Step 1 saves your high-level sprint goal. Step 2 starts kickoff execution. If tasks already exist, start the runner loop directly.
+                </p>
+              </div>
+              <div class="inline-flex items-center gap-2 rounded-full border border-zinc-800 bg-black px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-400">
+                <span class="group-open:hidden">Expand</span>
+                <span class="hidden group-open:inline">Collapse</span>
+                <svg class="h-4 w-4 transition-transform group-open:rotate-180" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </div>
+            </summary>
 
-          <form id="kickoff-form" class="mt-5">
-            <label for="kickoff-goal" class="mb-2 block text-xs font-semibold uppercase tracking-[0.16em] text-zinc-400">
-              Sprint Goal
-            </label>
-            <textarea
-              id="kickoff-goal"
-              name="goal"
-              rows="7"
-              placeholder="Example: Ship sprint kickoff validation hardening and add tests for claim lease expiration handling."
-              class="w-full rounded-xl border border-zinc-700 bg-black px-4 py-3 text-sm text-zinc-100 outline-none transition focus:border-zinc-500"
-            ></textarea>
-            <div class="mt-3 rounded-lg border border-zinc-800 bg-black px-3 py-2 text-xs text-zinc-400">
-              <p class="font-semibold uppercase tracking-[0.16em] text-zinc-300">Start Workflow</p>
-              <p class="mt-1">
-                Click <span class="font-semibold text-zinc-200">Start Kickoff Loop (Step 2)</span> to launch kickoff from the GUI. Manual fallback:
-                `python3 -m apps.runner --kickoff --sprint M1 --goal-file ./goal.txt --loop`
-              </p>
-              <p class="mt-1">
-                Resume existing tasks without kickoff: click <span class="font-semibold text-zinc-200">Start Runner Loop (No Kickoff)</span> or run
-                `python3 -m apps.runner --sprint M1 --loop`
-              </p>
-            </div>
-            <div class="mt-4 flex flex-wrap items-end gap-3">
-              <label class="block min-w-[110px]">
-                <span class="mb-1 block text-xs font-semibold uppercase tracking-[0.16em] text-zinc-400">Sprint</span>
-                <input
-                  id="kickoff-sprint"
-                  name="sprint"
-                  type="text"
-                  value="M1"
-                  placeholder="M1"
-                  autocomplete="off"
-                  class="w-full rounded-lg border border-zinc-700 bg-black px-3 py-2 text-sm text-white outline-none transition focus:border-zinc-500"
-                />
-              </label>
-              <button
-                id="kickoff-submit-button"
-                type="submit"
-                class="inline-flex items-center gap-2 rounded-lg border border-zinc-200 bg-white px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-zinc-950 transition hover:bg-zinc-200 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                <span
-                  id="kickoff-button-spinner"
-                  class="hidden h-3 w-3 animate-spin rounded-full border-2 border-zinc-900 border-r-transparent"
-                  aria-hidden="true"
-                ></span>
-                <span id="kickoff-button-label">Save Goal (Step 1)</span>
-              </button>
-              <button
-                id="kickoff-start-loop-button"
-                type="button"
-                class="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-black px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-zinc-200 transition hover:border-zinc-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                <span
-                  id="kickoff-start-loop-spinner"
-                  class="hidden h-3 w-3 animate-spin rounded-full border-2 border-zinc-200 border-r-transparent"
-                  aria-hidden="true"
-                ></span>
-                <span id="kickoff-start-loop-label">Start Kickoff Loop (Step 2)</span>
-              </button>
-              <button
-                id="kickoff-start-runner-loop-button"
-                type="button"
-                class="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-black px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-zinc-200 transition hover:border-zinc-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                <span
-                  id="kickoff-start-runner-loop-spinner"
-                  class="hidden h-3 w-3 animate-spin rounded-full border-2 border-zinc-200 border-r-transparent"
-                  aria-hidden="true"
-                ></span>
-                <span id="kickoff-start-runner-loop-label">Start Runner Loop (No Kickoff)</span>
-              </button>
-              <button
-                id="kickoff-stop-orchestrators-button"
-                type="button"
-                class="inline-flex items-center gap-2 rounded-lg border border-rose-400/40 bg-rose-500/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-rose-100 transition hover:border-rose-300 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                <span
-                  id="kickoff-stop-orchestrators-spinner"
-                  class="hidden h-3 w-3 animate-spin rounded-full border-2 border-rose-100 border-r-transparent"
-                  aria-hidden="true"
-                ></span>
-                <span id="kickoff-stop-orchestrators-label">Stop Orchestrators</span>
-              </button>
+            <form id="kickoff-form" class="mt-5">
               <label
-                class="flex items-center gap-2 self-center rounded-lg border border-zinc-800 bg-black px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-zinc-300"
+                for="kickoff-goal"
+                class="mb-2 block text-xs font-semibold uppercase tracking-[0.16em] text-zinc-400"
               >
-                <input id="kickoff-stop-force" type="checkbox" class="h-4 w-4 accent-zinc-200" />
-                Force
+                Sprint Goal
               </label>
-            </div>
-            <p
-              id="kickoff-message"
-              class="hidden mt-3 w-full rounded-lg border px-3 py-2 text-sm"
-              role="status"
-              aria-live="polite"
-            ></p>
-          </form>
+              <textarea
+                id="kickoff-goal"
+                name="goal"
+                rows="7"
+                placeholder="Example: Ship sprint kickoff validation hardening and add tests for claim lease expiration handling."
+                class="w-full rounded-xl border border-zinc-700 bg-black px-4 py-3 text-sm text-zinc-100 outline-none transition focus:border-zinc-500"
+              ></textarea>
+              <div class="mt-4 flex flex-wrap items-end gap-4">
+                <label class="block w-full sm:max-w-[200px]">
+                  <span class="mb-1 block text-xs font-semibold uppercase tracking-[0.16em] text-zinc-400">Sprint</span>
+                  <input
+                    id="kickoff-sprint"
+                    name="sprint"
+                    type="text"
+                    value="M1"
+                    placeholder="M1"
+                    autocomplete="off"
+                    class="w-full rounded-lg border border-zinc-700 bg-black px-3 py-2 text-sm text-white outline-none transition focus:border-zinc-500"
+                  />
+                </label>
+              </div>
+              <div class="mt-3 rounded-lg border border-zinc-800 bg-black px-3 py-2 text-xs text-zinc-400">
+                <p class="font-semibold uppercase tracking-[0.16em] text-zinc-300">Start Workflow</p>
+                <p class="mt-1">
+                  Click <span class="font-semibold text-zinc-200">Start Kickoff Loop (Step 2)</span> to launch kickoff from the GUI. Manual fallback:
+                  `python3 -m apps.runner --kickoff --sprint M1 --goal-file ./goal.txt --loop`
+                </p>
+                <p class="mt-1">
+                  Resume existing tasks without kickoff: click <span class="font-semibold text-zinc-200">Start Runner Loop (No Kickoff)</span> or run
+                  `python3 -m apps.runner --sprint M1 --loop`
+                </p>
+              </div>
+              <div class="mt-6 flex flex-col gap-5 lg:flex-row lg:items-end">
+                <div class="flex flex-col gap-4">
+                  <div class="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
+                    <button
+                      id="kickoff-submit-button"
+                      type="submit"
+                      class="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-zinc-200 bg-white px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-zinc-950 transition hover:bg-zinc-200 disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto"
+                    >
+                      <span
+                        id="kickoff-button-spinner"
+                        class="hidden h-3 w-3 animate-spin rounded-full border-2 border-zinc-900 border-r-transparent"
+                        aria-hidden="true"
+                      ></span>
+                      <span id="kickoff-button-label">Save Goal (Step 1)</span>
+                    </button>
+                    <button
+                      id="kickoff-start-loop-button"
+                      type="button"
+                      class="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-zinc-700 bg-black px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-zinc-200 transition hover:border-zinc-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto"
+                    >
+                      <span
+                        id="kickoff-start-loop-spinner"
+                        class="hidden h-3 w-3 animate-spin rounded-full border-2 border-zinc-200 border-r-transparent"
+                        aria-hidden="true"
+                      ></span>
+                      <span id="kickoff-start-loop-label">Start Kickoff Loop (Step 2)</span>
+                    </button>
+                  </div>
+
+                  <div class="flex flex-col gap-2">
+                    <span class="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Resume existing tasks:</span>
+                    <button
+                      id="kickoff-start-runner-loop-button"
+                      type="button"
+                      class="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-zinc-700 bg-black px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-zinc-200 transition hover:border-zinc-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto"
+                    >
+                      <span
+                        id="kickoff-start-runner-loop-spinner"
+                        class="hidden h-3 w-3 animate-spin rounded-full border-2 border-zinc-200 border-r-transparent"
+                        aria-hidden="true"
+                      ></span>
+                      <span id="kickoff-start-runner-loop-label">Start Runner Loop (No Kickoff)</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div class="rounded-xl border border-zinc-800 bg-black/40 p-3 lg:ml-auto">
+                  <p class="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Admin Controls</p>
+                  <div class="mt-2 flex flex-wrap items-center gap-3">
+                    <button
+                      id="kickoff-stop-orchestrators-button"
+                      type="button"
+                      class="inline-flex flex-1 items-center justify-center gap-2 rounded-lg border border-rose-400/40 bg-rose-500/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-rose-100 transition hover:border-rose-300 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      <span
+                        id="kickoff-stop-orchestrators-spinner"
+                        class="hidden h-3 w-3 animate-spin rounded-full border-2 border-rose-100 border-r-transparent"
+                        aria-hidden="true"
+                      ></span>
+                      <span id="kickoff-stop-orchestrators-label">Stop Orchestrators</span>
+                    </button>
+                    <label
+                      class="flex items-center gap-2 rounded-lg border border-zinc-800 bg-black px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-zinc-300"
+                    >
+                      <input id="kickoff-stop-force" type="checkbox" class="h-4 w-4 accent-zinc-200" />
+                      Force
+                    </label>
+                  </div>
+                </div>
+              </div>
+              <p
+                id="kickoff-message"
+                class="hidden mt-3 w-full rounded-lg border px-3 py-2 text-sm"
+                role="status"
+                aria-live="polite"
+              ></p>
+            </form>
+          </details>
         </section>
 
         <main class="mt-7 grid gap-6 xl:grid-cols-5">
-          <section class="xl:col-span-3 rounded-2xl border border-zinc-800 bg-zinc-900 p-5 shadow-lg shadow-white/10 sm:p-6">
+          <section class="xl:col-span-3 rounded-2xl border border-zinc-800 bg-zinc-900 p-6 shadow-lg shadow-white/10">
             <div class="flex flex-wrap items-center justify-between gap-4">
               <div>
                 <h2 class="text-xl font-semibold tracking-tight text-white">Orchestrator State</h2>
@@ -322,7 +392,7 @@
             <div id="orchestrator-items" class="mt-5 space-y-3"></div>
           </section>
 
-          <section class="xl:col-span-2 rounded-2xl border border-zinc-800 bg-zinc-900 p-5 shadow-lg shadow-white/10 sm:p-6">
+          <section class="xl:col-span-2 rounded-2xl border border-zinc-800 bg-zinc-900 p-6 shadow-lg shadow-white/10">
             <div class="flex flex-wrap items-center justify-between gap-4">
               <div>
                 <h2 class="text-xl font-semibold tracking-tight text-white">Runner Ledger</h2>
@@ -336,7 +406,7 @@
               </div>
             </div>
 
-            <div id="runner-runs" class="mt-5 space-y-4"></div>
+            <div id="runner-runs" class="mono-scrollbar mt-5 h-[500px] space-y-4 overflow-y-auto pr-2"></div>
           </section>
         </main>
 
@@ -350,10 +420,10 @@
             class="mt-4 hidden rounded-xl border border-zinc-600 bg-zinc-950/90 px-4 py-3 text-xs text-zinc-200"
           ></div>
           <div class="mt-5">
-            <ul id="terminal-tabs" class="flex overflow-x-auto border-b border-zinc-800"></ul>
+            <ul id="terminal-tabs" class="mono-scrollbar flex overflow-x-auto border-b border-zinc-800"></ul>
             <div
               id="terminal-window"
-              class="bg-black text-zinc-300 font-mono text-[10px] sm:text-xs p-4 h-96 overflow-y-auto rounded-b-xl border border-zinc-800 shadow-inner"
+              class="mono-scrollbar bg-black text-zinc-300 font-mono text-[10px] sm:text-xs p-4 h-96 overflow-y-auto rounded-b-xl border border-zinc-800 shadow-inner"
             >
               <pre id="terminal-output" class="whitespace-pre text-zinc-300">Waiting for an active run...</pre>
             </div>
