@@ -439,6 +439,29 @@ test("POST /internal/runner/stop-loop marks running ledger entries failed", asyn
 test("POST /internal/kickoff/stop-loop returns 200 STOPPED when loop is stopped", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-kickoff-stop-loop-200-stopped-"));
   const app = buildApp();
+
+  await writeFile(
+    join(repoRoot, ".agent-swarm.yml"),
+    ["version: \"1.0\"", "target:", "  owner: acme", "  repo: project-y"].join("\n") + "\n",
+    "utf8",
+  );
+  await writeFile(
+    join(repoRoot, ".runner-ledger.acme.project-y.json"),
+    JSON.stringify(
+      {
+        "orchestrator-loop-1": {
+          run_id: "orchestrator-loop-1",
+          role: "ORCHESTRATOR",
+          status: "running",
+          result: null,
+        },
+      },
+      null,
+      2,
+    ) + "\n",
+    "utf8",
+  );
+
   await registerInternalKickoffRoute(app, {
     repoRoot,
     preflightCheck: async () => ({ statusCode: 200, payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] } }),
@@ -453,6 +476,11 @@ test("POST /internal/kickoff/stop-loop returns 200 STOPPED when loop is stopped"
 
   assert.equal(reply.statusCode, 200);
   assert.deepEqual(result, { status: "STOPPED" });
+
+  const ledgerRaw = await readFile(join(repoRoot, ".runner-ledger.acme.project-y.json"), "utf8");
+  const ledger = JSON.parse(ledgerRaw);
+  assert.equal(ledger["orchestrator-loop-1"].status, "failed");
+  assert.equal(ledger["orchestrator-loop-1"].result.error_code, "runner_loop_stopped");
 });
 
 test("POST /internal/runner/stop-loop returns 409 REFUSED when manager refuses to stop", async () => {

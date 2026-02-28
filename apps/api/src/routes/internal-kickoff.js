@@ -601,22 +601,28 @@ function buildLoopManager({
     },
     async stop({ force = false } = {}) {
       return await enqueue(async () => {
-        let targets = [];
+        const targetsByPid = new Map();
 
         const state = await readLoopStateFromDisk(repoRoot);
         if (state && isProcessAliveFn(state.pid)) {
-          targets = [state];
+          targetsByPid.set(state.pid, state);
         } else {
           // Remove stale state file so we can fall back to process discovery.
           await safeUnlink(resolveLoopStatePath(repoRoot));
           LOOP_STATE_BY_REPO.delete(resolveRepoKey(repoRoot));
-
-          // Backwards-compat / operator recovery: if the loop was started by older
-          // code (no state file) or the state file was deleted, find detached loops
-          // by scanning /proc.
-          targets = await findLiveRunnerLoopCandidates(repoRoot, { maxCandidates: 8 });
         }
 
+        // Always scan for detached loop candidates so a single stop request can
+        // clean up all live loop processes for this repo (including orphaned ones
+        // that are not represented by the current loop-state file).
+        const discoveredTargets = await findLiveRunnerLoopCandidates(repoRoot, { maxCandidates: 16 });
+        for (const candidate of discoveredTargets) {
+          if (Number.isInteger(candidate?.pid) && candidate.pid > 0) {
+            targetsByPid.set(candidate.pid, candidate);
+          }
+        }
+
+        const targets = Array.from(targetsByPid.values());
         if (targets.length === 0) {
           return { status: "NOT_RUNNING" };
         }
