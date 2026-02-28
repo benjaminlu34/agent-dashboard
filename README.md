@@ -202,6 +202,9 @@ Optional:
 - `CODEX_TOOLS_CALL_TIMEOUT_S` (default `1800`)
 - `ORCHESTRATOR_SANITIZATION_REGEN_ATTEMPTS` (default `2`)
 
+Watchdog tuning note:
+- `RUNNER_WATCHDOG_TIMEOUT_S` should be configured for worst-case worker runtime (especially reviewer runs). If set too low, repeated reviewer watchdog timeouts can increase review cycles and push items into cycle-cap blocking.
+
 ## API Endpoints (Internal)
 
 - `GET /internal/preflight?role=<ROLE>`

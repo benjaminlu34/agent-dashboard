@@ -21,7 +21,7 @@ Optional:
 - `RUNNER_READY_BUFFER` (default `2`) - minimum number of `Ready` items runner tries to maintain via promotion
 - `REVIEW_STALL_POLLS` (default `50`) - after this many `In Review` polls, allow one retry reviewer dispatch; if still stalled, escalate
 - `BLOCKED_RETRY_MINUTES` (default `15`) - cooldown before auto-retrying retryable `Blocked` items back to `Ready`
-- `RUNNER_WATCHDOG_TIMEOUT_S` (default `900`) - timeout for stale `running` executor runs before forced `In Progress/In Review -> Blocked`
+- `RUNNER_WATCHDOG_TIMEOUT_S` (default `900`) - watchdog cutoff for stale `running` worker runs; `EXECUTOR` timeouts force `In Progress/In Review -> Blocked`, `REVIEWER` timeouts record `INCOMPLETE` and clear stale dispatch markers for re-dispatch
 - `RUNNER_DRY_RUN` (default `false`)
 - `RUNNER_LEDGER_PATH` (default `./.runner-ledger.json`)
 - `RUNNER_SPRINT_PLAN_PATH` (default `./.runner-sprint-plan.json`)
@@ -111,6 +111,13 @@ Worker sandbox policy:
 - Escalates long-running In Review stalls after `REVIEW_STALL_POLLS` and bounded reviewer retries.
 - Blocks items that exceed the review cycle cap (5 cycles).
 - Enforces a watchdog timeout for stale running intents (`RUNNER_WATCHDOG_TIMEOUT_S`).
+
+## Watchdog Tuning
+
+- Set `RUNNER_WATCHDOG_TIMEOUT_S` high enough for worst-case reviewer/executor runtime.
+- For unattended loops, keep `RUNNER_WATCHDOG_TIMEOUT_S` at or above `CODEX_TOOLS_CALL_TIMEOUT_S` plus network/API jitter margin.
+- If `RUNNER_WATCHDOG_TIMEOUT_S` is too low, reviewer runs can repeatedly timeout, produce `INCOMPLETE`, and raise `review_cycle_count`, which can eventually trigger `REVIEW_CYCLE_CAP_BLOCKED`.
+- `REVIEW_STALL_POLLS` and `RUNNER_WATCHDOG_TIMEOUT_S` guard different failure modes: board-level stall vs per-run liveness timeout.
 
 ## Human Rework Loop
 
