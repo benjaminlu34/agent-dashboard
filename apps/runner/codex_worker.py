@@ -151,7 +151,7 @@ class _JsonRpcClient:
 
         raw_line = self._proc.stdout.readline()
         if raw_line == "":
-            return None
+            raise CodexWorkerError("mcp server disconnected unexpectedly (EOF)", code="mcp_disconnected")
         line = raw_line.strip()
         if not line:
             return None

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import shlex
 import queue
 import signal
 import subprocess
@@ -167,6 +168,7 @@ def classify_failure(error: Exception) -> str:
         return "HARD_STOP"
     if isinstance(error, CodexWorkerError):
         if error.code in {
+            "mcp_disconnected",
             "mcp_timeout",
             "mcp_error_response",
             "mcp_invalid_result",
@@ -196,6 +198,7 @@ def is_retryable_failure(*, failure_classification: str, error_code: str) -> boo
     if normalized_class == "TRANSIENT":
         return True
     return normalized_code in {
+        "mcp_disconnected",
         "mcp_timeout",
         "backend_unreachable",
         "mcp_stdio_unavailable",
@@ -2768,9 +2771,10 @@ def _format_orchestrator_intent_observation(intent: RunIntent) -> str:
 def _spawn_orchestrator(cmd: str, *, env: dict[str, str]) -> subprocess.Popen[str]:
     proc: Optional[subprocess.Popen[str]] = None
     try:
+        argv = shlex.split(cmd)
         proc = subprocess.Popen(
-            cmd,
-            shell=True,
+            argv,
+            shell=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -2892,6 +2896,14 @@ def _build_kickoff_prompt(*, sprint: str, goal_text: str, ready_limit: int) -> t
         "- Do NOT make the sprint about improving this orchestration system; the sprint is about implementing the goal in the target repository.\n"
         "- The sprint goal issue may touch docs, but sprint tasks should generally touch real product code/assets, not just markdown.\n"
         "- ready_set_titles should include the most dependency-free P0 implementation tasks.\n\n"
+        "Product Management Heuristics:\n"
+        "- Treat the goal as incomplete; infer and include implied standard features required for a complete user experience.\n"
+        "- Anticipate edge cases and non-happy paths and bake them into tasks and acceptance criteria (e.g., empty states, loading states, error handling, validation, rate limits, local storage limits, and retries).\n"
+        "- Ensure the plan covers any missing CRUD surfaces and lifecycle flows needed for the feature to be usable end-to-end.\n\n"
+        "Architectural Best Practices:\n"
+        "- Acceptance criteria for each task must reflect senior engineering standards: strict data type safety, clear API/data contracts, validation, security/authorization, observability, and automated tests.\n"
+        "- Prefer clean interfaces and separation of concerns; avoid tight coupling and ad hoc one-off logic.\n"
+        "- Make failure modes explicit and safe (idempotency where relevant, deterministic behavior where required, and clear migration/rollback steps when data changes).\n\n"
         f"Output schema (exact keys):\n{schema}\n"
         f"\n{markdown_requirements}\n"
         "Notes:\n"
