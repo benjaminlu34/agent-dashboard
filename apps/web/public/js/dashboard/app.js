@@ -346,6 +346,7 @@ function renderOrchestrator(orchestrator) {
 
   orchestratorSummaryEl.innerHTML = "";
   const statusPairs = Object.entries(statusCounts);
+  orchestratorSummaryEl.classList.toggle("hidden", statusPairs.length === 0);
   if (statusPairs.length > 0) {
     orchestratorSummaryEl.innerHTML = statusPairs
       .map(
@@ -823,11 +824,9 @@ function renderRunner(entries) {
 
   if (entries.length === 0) {
     runnerRunsEl.innerHTML = `
-      <div class="flex h-full items-center justify-center">
-        <div class="w-full rounded-2xl border border-dashed border-zinc-800 bg-black px-5 py-10 text-center">
-          <p class="text-sm font-medium text-zinc-100">No active runs</p>
-          <p class="mt-2 text-xs text-zinc-500">Start Runner Loop to populate this ledger.</p>
-        </div>
+      <div class="rounded-2xl border border-dashed border-zinc-800 bg-black px-5 py-10 text-center">
+        <p class="text-sm font-medium text-zinc-100">No active runs</p>
+        <p class="mt-2 text-xs text-zinc-500">Start Runner Loop to populate this ledger.</p>
       </div>
     `;
     return;
