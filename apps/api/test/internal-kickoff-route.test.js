@@ -42,6 +42,8 @@ test("POST /internal/kickoff returns 400 when goal is missing", async () => {
   assert.equal(app.routes.has("/internal/kickoff"), true);
   assert.equal(app.routes.has("/internal/kickoff/start-loop"), true);
   assert.equal(app.routes.has("/internal/runner/start-loop"), true);
+  assert.equal(app.routes.has("/internal/kickoff/stop-loop"), true);
+  assert.equal(app.routes.has("/internal/runner/stop-loop"), true);
 
   const kickoffHandler = getPostHandler(app, "/internal/kickoff");
   const reply = buildReply();
@@ -353,4 +355,63 @@ test("POST /internal/runner/start-loop returns 409 when runner loop is already r
     sprint: "M2",
     started_at: "2026-02-26T09:50:00.000Z",
   });
+});
+
+test("POST /internal/runner/stop-loop returns 200 NOT_RUNNING when loop is not running", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-runner-stop-loop-200-not-running-"));
+  const app = buildApp();
+  await registerInternalKickoffRoute(app, {
+    repoRoot,
+    preflightCheck: async () => ({ statusCode: 200, payload: { role: "ORCHESTRATOR", status: "FAIL", errors: [] } }),
+    runnerLoopManager: {
+      stop: async () => ({ status: "NOT_RUNNING" }),
+    },
+  });
+
+  const stopLoopHandler = getPostHandler(app, "/internal/runner/stop-loop");
+  const reply = buildReply();
+  const result = await stopLoopHandler({ body: {} }, reply);
+
+  assert.equal(reply.statusCode, 200);
+  assert.deepEqual(result, { status: "NOT_RUNNING" });
+});
+
+test("POST /internal/kickoff/stop-loop returns 200 STOPPED when loop is stopped", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-kickoff-stop-loop-200-stopped-"));
+  const app = buildApp();
+  await registerInternalKickoffRoute(app, {
+    repoRoot,
+    preflightCheck: async () => ({ statusCode: 200, payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] } }),
+    kickoffLoopManager: {
+      stop: async () => ({ status: "STOPPED" }),
+    },
+  });
+
+  const stopLoopHandler = getPostHandler(app, "/internal/kickoff/stop-loop");
+  const reply = buildReply();
+  const result = await stopLoopHandler({ body: {} }, reply);
+
+  assert.equal(reply.statusCode, 200);
+  assert.deepEqual(result, { status: "STOPPED" });
+});
+
+test("POST /internal/runner/stop-loop returns 409 REFUSED when manager refuses to stop", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-runner-stop-loop-409-refused-"));
+  const app = buildApp();
+  await registerInternalKickoffRoute(app, {
+    repoRoot,
+    preflightCheck: async () => ({ statusCode: 200, payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] } }),
+    runnerLoopManager: {
+      stop: async () => ({ status: "REFUSED", detail: "pid mismatch" }),
+    },
+  });
+
+  const stopLoopHandler = getPostHandler(app, "/internal/runner/stop-loop");
+  const reply = buildReply();
+  const result = await stopLoopHandler({ body: {} }, reply);
+
+  assert.equal(reply.statusCode, 409);
+  assert.equal(result.status, "REFUSED");
+  assert.equal(typeof result.error, "string");
+  assert.equal(typeof result.detail, "string");
 });

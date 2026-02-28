@@ -278,6 +278,24 @@
                 ></span>
                 <span id="kickoff-start-runner-loop-label">Start Runner Loop (No Kickoff)</span>
               </button>
+              <button
+                id="kickoff-stop-orchestrators-button"
+                type="button"
+                class="inline-flex items-center gap-2 rounded-lg border border-rose-400/40 bg-rose-500/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-rose-100 transition hover:border-rose-300 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <span
+                  id="kickoff-stop-orchestrators-spinner"
+                  class="hidden h-3 w-3 animate-spin rounded-full border-2 border-rose-100 border-r-transparent"
+                  aria-hidden="true"
+                ></span>
+                <span id="kickoff-stop-orchestrators-label">Stop Orchestrators</span>
+              </button>
+              <label
+                class="flex items-center gap-2 self-center rounded-lg border border-zinc-800 bg-black px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-zinc-300"
+              >
+                <input id="kickoff-stop-force" type="checkbox" class="h-4 w-4 accent-zinc-200" />
+                Force
+              </label>
             </div>
             <p
               id="kickoff-message"
@@ -388,6 +406,10 @@
       const kickoffStartRunnerLoopButtonEl = document.getElementById("kickoff-start-runner-loop-button");
       const kickoffStartRunnerLoopSpinnerEl = document.getElementById("kickoff-start-runner-loop-spinner");
       const kickoffStartRunnerLoopLabelEl = document.getElementById("kickoff-start-runner-loop-label");
+      const kickoffStopOrchestratorsButtonEl = document.getElementById("kickoff-stop-orchestrators-button");
+      const kickoffStopOrchestratorsSpinnerEl = document.getElementById("kickoff-stop-orchestrators-spinner");
+      const kickoffStopOrchestratorsLabelEl = document.getElementById("kickoff-stop-orchestrators-label");
+      const kickoffStopForceEl = document.getElementById("kickoff-stop-force");
 
       const canvas = document.getElementById("bg-canvas");
       const ctx = canvas.getContext("2d");
@@ -1149,6 +1171,8 @@
         kickoffGoalEl.disabled = nextLoading;
         kickoffStartLoopButtonEl.disabled = nextLoading;
         kickoffStartRunnerLoopButtonEl.disabled = nextLoading;
+        kickoffStopOrchestratorsButtonEl.disabled = nextLoading;
+        kickoffStopForceEl.disabled = nextLoading;
         kickoffButtonSpinnerEl.classList.toggle("hidden", !nextLoading);
         kickoffButtonLabelEl.textContent = nextLoading ? "Saving..." : "Save Goal (Step 1)";
       }
@@ -1175,9 +1199,24 @@
         const nextLoading = Boolean(isLoading);
         kickoffStartLoopButtonEl.disabled = nextLoading;
         kickoffStartRunnerLoopButtonEl.disabled = nextLoading;
+        kickoffStopOrchestratorsButtonEl.disabled = nextLoading;
+        kickoffStopForceEl.disabled = nextLoading;
         kickoffSprintEl.disabled = nextLoading;
         spinnerEl.classList.toggle("hidden", !nextLoading);
         labelEl.textContent = nextLoading ? "Starting..." : idleLabel;
+      }
+
+      function setStopOrchestratorsLoading(isLoading) {
+        const nextLoading = Boolean(isLoading);
+        kickoffSubmitButtonEl.disabled = nextLoading;
+        kickoffGoalEl.disabled = nextLoading;
+        kickoffStartLoopButtonEl.disabled = nextLoading;
+        kickoffStartRunnerLoopButtonEl.disabled = nextLoading;
+        kickoffStopOrchestratorsButtonEl.disabled = nextLoading;
+        kickoffStopForceEl.disabled = nextLoading;
+        kickoffSprintEl.disabled = nextLoading;
+        kickoffStopOrchestratorsSpinnerEl.classList.toggle("hidden", !nextLoading);
+        kickoffStopOrchestratorsLabelEl.textContent = nextLoading ? "Stopping..." : "Stop Orchestrators";
       }
 
       async function submitKickoff(event) {
@@ -1367,6 +1406,67 @@
           showKickoffMessage(`Failed to start runner loop: ${error?.message ?? "Unknown error"}`, "error");
         } finally {
           setRunnerLoopLoading(false);
+        }
+      }
+
+      async function stopOrchestrators() {
+        clearKickoffMessage();
+
+        const force = Boolean(kickoffStopForceEl?.checked);
+        const confirmMessage = force
+          ? "Force-stop all agent loops for this repo? This bypasses PID sanity checks and may kill unrelated processes if the loop state is corrupt."
+          : "Stop runner/kickoff loops (and their orchestrators) for this repo?";
+        if (!window.confirm(confirmMessage)) {
+          return;
+        }
+
+        setStopOrchestratorsLoading(true);
+
+        try {
+          const results = [];
+          const endpoints = [
+            { label: "Runner", url: "/internal/runner/stop-loop" },
+            { label: "Kickoff", url: "/internal/kickoff/stop-loop" },
+          ];
+
+          for (const endpoint of endpoints) {
+            const response = await fetch(endpoint.url, {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+              },
+              body: JSON.stringify(force ? { force: true } : {}),
+            });
+
+            const rawResponseBody = await response.text();
+            let payload = {};
+            if (rawResponseBody.trim().length > 0) {
+              try {
+                payload = asObject(JSON.parse(rawResponseBody));
+              } catch {
+                payload = {};
+              }
+            }
+
+            if (!response.ok) {
+              const fallbackMessage =
+                (typeof payload.error === "string" && payload.error.trim().length > 0
+                  ? payload.error.trim()
+                  : rawResponseBody.trim()) || `HTTP ${response.status}`;
+              throw new Error(`${endpoint.label}: ${fallbackMessage}`);
+            }
+
+            const stoppedStatus =
+              typeof payload.status === "string" && payload.status.trim().length > 0 ? payload.status.trim() : "OK";
+            results.push(`${endpoint.label}: ${stoppedStatus}`);
+          }
+
+          showKickoffMessage(`Stop request complete. ${results.join(" · ")}`);
+          loadStatus();
+        } catch (error) {
+          showKickoffMessage(`Failed to stop orchestrators: ${error?.message ?? "Unknown error"}`, "error");
+        } finally {
+          setStopOrchestratorsLoading(false);
         }
       }
 
@@ -1651,6 +1751,7 @@
       kickoffFormEl.addEventListener("submit", submitKickoff);
       kickoffStartLoopButtonEl.addEventListener("click", startKickoffLoop);
       kickoffStartRunnerLoopButtonEl.addEventListener("click", startRunnerLoop);
+      kickoffStopOrchestratorsButtonEl.addEventListener("click", stopOrchestrators);
       terminalTabsEl.addEventListener("click", (event) => {
         if (!(event.target instanceof Element)) {
           return;

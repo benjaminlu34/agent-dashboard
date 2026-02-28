@@ -184,6 +184,16 @@ def _spawn_codex_mcp_server(*, codex_bin: str, codex_mcp_args: str) -> subproces
     )
 
 
+def _close_popen_pipes(proc: subprocess.Popen[str]) -> None:
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
 _STDERR_ERROR_HINT_RE = re.compile(r"(error|failed|exception|traceback|timeout|refused|unreachable)", re.IGNORECASE)
 _STDERR_COMMAND_HINT_RE = re.compile(
     r"^(?:\$|command:|running command:|run command:)\s*(.+)$",
@@ -734,6 +744,7 @@ def run_intent_with_codex_mcp(
             proc.kill()
         except Exception:
             pass
+        _close_popen_pipes(proc)
         transcript_writer.close()
 
 
@@ -880,4 +891,5 @@ def generate_json_with_codex_mcp(
             proc.kill()
         except Exception:
             pass
+        _close_popen_pipes(proc)
         transcript_writer.close()

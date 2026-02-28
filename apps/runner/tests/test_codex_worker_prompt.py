@@ -62,3 +62,16 @@ class CodexWorkerPromptTests(unittest.TestCase):
             expected_role="EXECUTOR",
         )
         self.assertEqual(result.marker_verified, True)
+
+    def test_extract_worker_result_strips_markdown_fences(self) -> None:
+        result = _extract_worker_result(
+            content=(
+                "```json\n"
+                '{"run_id":"r4","role":"REVIEWER","status":"succeeded",'
+                '"outcome":"PASS","summary":"ok","urls":{},"errors":[]}\n'
+                "```"
+            ),
+            expected_run_id="r4",
+            expected_role="REVIEWER",
+        )
+        self.assertEqual(result.outcome, "PASS")

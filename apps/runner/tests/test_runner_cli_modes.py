@@ -99,6 +99,27 @@ class RunnerCliModeTests(unittest.TestCase):
         self.assertEqual(captured["env"].get("ORCHESTRATOR_MAX_REVIEWERS"), "2")
         self.assertIn("--loop", str(captured["cmd"]))
 
+    def test_loop_closes_orchestrator_pipes(self) -> None:
+        captured: dict[str, object] = {}
+
+        def _spawn(cmd: str, *, env):
+            _ = cmd
+            _ = env
+            proc = _ProcStub()
+            captured["proc"] = proc
+            return proc
+
+        with patch.dict(os.environ, {"BACKEND_BASE_URL": "http://localhost:4000"}, clear=True):
+            with patch("apps.runner.runner.BackendClient", _BackendStub):
+                with patch("apps.runner.runner._spawn_orchestrator", _spawn):
+                    exit_code = runner.main(["--loop", "--dry-run", "--sprint", "M1"])
+
+        self.assertEqual(exit_code, 0)
+        proc = captured.get("proc")
+        assert isinstance(proc, _ProcStub)
+        self.assertTrue(proc.stdout.closed)
+        self.assertTrue(proc.stderr.closed)
+
     def test_loop_without_kickoff_without_sprint_is_config_error(self) -> None:
         with patch.dict(os.environ, {"BACKEND_BASE_URL": "http://localhost:4000"}, clear=True):
             stderr = io.StringIO()

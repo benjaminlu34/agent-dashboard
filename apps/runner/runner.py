@@ -40,6 +40,17 @@ def _set_active_orchestrator_proc(proc: Optional[subprocess.Popen[str]]) -> None
     _active_orchestrator_proc = proc
 
 
+def _close_popen_pipes(proc: Any) -> None:
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(proc, name, None)
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
 def _terminate_orchestrator_proc() -> None:
     proc = _active_orchestrator_proc
     if proc is None:
@@ -51,6 +62,8 @@ def _terminate_orchestrator_proc() -> None:
         proc.kill()
     except Exception:
         pass
+    _close_popen_pipes(proc)
+    _set_active_orchestrator_proc(None)
 
 
 def _handle_shutdown_signal(signum: int, frame: Any) -> None:
@@ -2775,6 +2788,8 @@ def _spawn_orchestrator(cmd: str, *, env: dict[str, str]) -> subprocess.Popen[st
                 proc.kill()
             except Exception:
                 pass
+            _close_popen_pipes(proc)
+        _set_active_orchestrator_proc(None)
         raise
 
 
@@ -3539,8 +3554,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                     continue
 
                 if channel == "stderr":
-                    sys.stderr.write(line)
-                    sys.stderr.flush()
+                    with _stderr_lock:
+                        sys.stderr.write(line)
+                        sys.stderr.flush()
 
                     payload: Optional[Dict[str, Any]] = None
                     try:
@@ -3696,6 +3712,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             proc.kill()
         except Exception:
             pass
+        _close_popen_pipes(proc)
         _set_active_orchestrator_proc(None)
         orchestrator_transcript.close()
 

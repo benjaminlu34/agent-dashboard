@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { readFile, writeFile } from "node:fs/promises";
+import { readdir, readFile, readlink, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,7 +11,10 @@ const GOAL_FILE_PATH = "goal.txt";
 const KICKOFF_ROLE = "ORCHESTRATOR";
 const SPRINT_RE = /^M[1-4]$/;
 const RUNNER_STARTUP_GRACE_MS = 350;
-const KICKOFF_LOOP_STATE_BY_REPO = new Map();
+const LOOP_STATE_FILE = ".runner-loop-state.json";
+const LOOP_TERMINATION_GRACE_MS = 2500;
+const LOOP_TERMINATION_POLL_MS = 80;
+const LOOP_STATE_BY_REPO = new Map();
 
 function resolveRepoKey(repoRoot) {
   return resolve(repoRoot);
@@ -29,6 +32,233 @@ function isProcessAlive(pid) {
   }
 }
 
+function resolveLoopStatePath(repoRoot) {
+  return resolve(repoRoot, LOOP_STATE_FILE);
+}
+
+async function sleep(ms) {
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+}
+
+async function safeUnlink(path) {
+  try {
+    await unlink(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+}
+
+function parseLoopMode(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const mode = value.trim().toUpperCase();
+  return mode === "KICKOFF" || mode === "RUNNER" ? mode : null;
+}
+
+function isValidLoopState(value) {
+  return (
+    value &&
+    typeof value === "object" &&
+    Number.isInteger(value.pid) &&
+    value.pid > 0 &&
+    typeof value.sprint === "string" &&
+    normalizeSprint(value.sprint) !== null &&
+    typeof value.startedAt === "string" &&
+    typeof value.loopMode === "string" &&
+    parseLoopMode(value.loopMode) !== null
+  );
+}
+
+async function rotateCorruptLoopStateFile(path) {
+  const suffix = new Date().toISOString().replace(/[:.]/g, "-");
+  try {
+    await rename(path, `${path}.corrupt-${suffix}`);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+}
+
+async function readLoopStateFromDisk(repoRoot) {
+  const path = resolveLoopStatePath(repoRoot);
+  let raw = "";
+  try {
+    raw = await readFile(path, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    await rotateCorruptLoopStateFile(path);
+    return null;
+  }
+
+  if (!isValidLoopState(parsed)) {
+    await rotateCorruptLoopStateFile(path);
+    return null;
+  }
+
+  return {
+    pid: parsed.pid,
+    sprint: normalizeSprint(parsed.sprint),
+    startedAt: parsed.startedAt,
+    loopMode: parseLoopMode(parsed.loopMode),
+  };
+}
+
+async function writeLoopStateToDisk(repoRoot, state) {
+  const path = resolveLoopStatePath(repoRoot);
+  const payload = JSON.stringify(state, null, 2) + "\n";
+  await writeFile(path, payload, "utf8");
+}
+
+async function waitForProcessDeath(pid, { timeoutMs }) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) {
+      return true;
+    }
+    await sleep(LOOP_TERMINATION_POLL_MS);
+  }
+  return !isProcessAlive(pid);
+}
+
+async function readProcCmdline(pid) {
+  try {
+    const buf = await readFile(`/proc/${pid}/cmdline`);
+    return buf
+      .toString("utf8")
+      .split("\u0000")
+      .map((token) => token.trim())
+      .filter(Boolean);
+  } catch {
+    return null;
+  }
+}
+
+async function readProcCwd(pid) {
+  try {
+    return await readlink(`/proc/${pid}/cwd`);
+  } catch {
+    return null;
+  }
+}
+
+async function looksLikeRunnerLoopProcess({ pid, repoRoot, loopMode, sprint }) {
+  const cmdline = await readProcCmdline(pid);
+  if (!cmdline) {
+    return { status: "UNKNOWN" };
+  }
+
+  const joined = cmdline.join("\n");
+  const hasModule = cmdline.includes("-m") && cmdline.includes("apps.runner");
+  const hasLoop = cmdline.includes("--loop");
+  const hasKickoffFlag = cmdline.includes("--kickoff");
+
+  if (!hasModule || !hasLoop) {
+    return { status: "MISMATCH", detail: `unexpected cmdline: ${joined}` };
+  }
+
+  if (loopMode === "KICKOFF" && !hasKickoffFlag) {
+    return { status: "MISMATCH", detail: `missing --kickoff in cmdline: ${joined}` };
+  }
+
+  if (loopMode === "RUNNER" && hasKickoffFlag) {
+    return { status: "MISMATCH", detail: `unexpected --kickoff in cmdline: ${joined}` };
+  }
+
+  const sprintIndex = cmdline.indexOf("--sprint");
+  if (sprintIndex !== -1) {
+    const seen = normalizeSprint(cmdline[sprintIndex + 1]);
+    if (seen && seen !== sprint) {
+      return { status: "MISMATCH", detail: `unexpected sprint ${seen} in cmdline: ${joined}` };
+    }
+  }
+
+  const cwd = await readProcCwd(pid);
+  if (cwd && resolve(cwd) !== resolve(repoRoot)) {
+    return { status: "MISMATCH", detail: `unexpected cwd ${cwd}` };
+  }
+
+  return { status: "MATCH" };
+}
+
+async function findLiveRunnerLoopCandidates(repoRoot, { maxCandidates = 2 } = {}) {
+  let entries;
+  try {
+    entries = await readdir("/proc", { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const candidates = [];
+
+  for (const entry of entries) {
+    if (!entry?.isDirectory?.()) {
+      continue;
+    }
+    if (!/^[0-9]+$/.test(entry.name)) {
+      continue;
+    }
+
+    const pid = Number(entry.name);
+    if (!Number.isInteger(pid) || pid <= 0) {
+      continue;
+    }
+
+    if (!isProcessAlive(pid)) {
+      continue;
+    }
+
+    const cmdline = await readProcCmdline(pid);
+    if (!cmdline) {
+      continue;
+    }
+
+    if (!(cmdline.includes("-m") && cmdline.includes("apps.runner") && cmdline.includes("--loop"))) {
+      continue;
+    }
+
+    const cwd = await readProcCwd(pid);
+    if (cwd && resolve(cwd) !== resolve(repoRoot)) {
+      continue;
+    }
+
+    const loopMode = cmdline.includes("--kickoff") ? "KICKOFF" : "RUNNER";
+    const sprintIndex = cmdline.indexOf("--sprint");
+    const sprint = sprintIndex !== -1 ? normalizeSprint(cmdline[sprintIndex + 1]) : null;
+
+    if (!sprint) {
+      continue;
+    }
+
+    candidates.push({
+      pid,
+      sprint,
+      startedAt: new Date().toISOString(),
+      loopMode,
+    });
+
+    if (candidates.length >= maxCandidates) {
+      break;
+    }
+  }
+
+  return candidates;
+}
+
 function normalizeSprint(value) {
   if (typeof value !== "string") {
     return null;
@@ -37,19 +267,57 @@ function normalizeSprint(value) {
   return SPRINT_RE.test(normalized) ? normalized : null;
 }
 
-function getActiveKickoffLoopState(repoRoot) {
+async function getActiveLoopState(repoRoot) {
   const repoKey = resolveRepoKey(repoRoot);
-  const current = KICKOFF_LOOP_STATE_BY_REPO.get(repoKey);
-  if (!current) {
+  const cached = LOOP_STATE_BY_REPO.get(repoKey);
+  if (cached && isProcessAlive(cached.pid)) {
+    return cached;
+  }
+
+  const diskState = await readLoopStateFromDisk(repoRoot);
+  if (!diskState) {
+    const candidates = await findLiveRunnerLoopCandidates(repoRoot);
+    if (candidates.length === 1) {
+      const state = candidates[0];
+      LOOP_STATE_BY_REPO.set(repoKey, state);
+      await writeLoopStateToDisk(repoRoot, state);
+      return state;
+    }
+
+    if (candidates.length > 1) {
+      // Multiple detached loops in the same repo root should never happen; fail closed by
+      // treating the loop as active so we don't spawn more.
+      const state = candidates[0];
+      LOOP_STATE_BY_REPO.set(repoKey, state);
+      return state;
+    }
+
+    LOOP_STATE_BY_REPO.delete(repoKey);
     return null;
   }
 
-  if (!isProcessAlive(current.pid)) {
-    KICKOFF_LOOP_STATE_BY_REPO.delete(repoKey);
+  if (!isProcessAlive(diskState.pid)) {
+    await safeUnlink(resolveLoopStatePath(repoRoot));
+    LOOP_STATE_BY_REPO.delete(repoKey);
     return null;
   }
 
-  return current;
+  const looksLike = await looksLikeRunnerLoopProcess({
+    pid: diskState.pid,
+    repoRoot,
+    loopMode: diskState.loopMode,
+    sprint: diskState.sprint,
+  });
+  if (looksLike.status === "MISMATCH") {
+    // Refuse to kill an unrelated process, but also refuse to start a new loop
+    // while a live PID is claimed. The operator must intervene by clearing the
+    // state file once the situation is understood.
+    LOOP_STATE_BY_REPO.set(repoKey, diskState);
+    return diskState;
+  }
+
+  LOOP_STATE_BY_REPO.set(repoKey, diskState);
+  return diskState;
 }
 
 async function defaultStartKickoffLoopProcess({ repoRoot, sprint }) {
@@ -136,43 +404,154 @@ async function defaultStartRunnerLoopProcess({ repoRoot, sprint }) {
   });
 }
 
-function buildLoopManager({ repoRoot = DEFAULT_REPO_ROOT, startLoopProcess = defaultStartKickoffLoopProcess } = {}) {
+function buildLoopManager({
+  repoRoot = DEFAULT_REPO_ROOT,
+  loopMode = "KICKOFF",
+  startLoopProcess = defaultStartKickoffLoopProcess,
+  isProcessAliveFn = isProcessAlive,
+} = {}) {
+  const normalizedLoopMode = parseLoopMode(loopMode) ?? "KICKOFF";
+  let opQueue = Promise.resolve();
+
+  const enqueue = (operation) => {
+    const next = opQueue.then(operation, operation);
+    opQueue = next.catch(() => {});
+    return next;
+  };
+
   return {
-    getActive() {
-      return getActiveKickoffLoopState(repoRoot);
+    async getActive() {
+      return await getActiveLoopState(repoRoot);
     },
     async start({ sprint }) {
-      const normalizedSprint = normalizeSprint(sprint);
-      if (!normalizedSprint) {
-        throw new Error("invalid sprint");
-      }
-
-      const existing = getActiveKickoffLoopState(repoRoot);
-      if (existing) {
-        return existing;
-      }
-
-      const child = await startLoopProcess({ repoRoot, sprint: normalizedSprint });
-      if (!Number.isInteger(child?.pid) || child.pid <= 0) {
-        throw new Error("unable to determine kickoff loop process id");
-      }
-
-      const repoKey = resolveRepoKey(repoRoot);
-      const state = {
-        pid: child.pid,
-        sprint: normalizedSprint,
-        startedAt: new Date().toISOString(),
-      };
-      KICKOFF_LOOP_STATE_BY_REPO.set(repoKey, state);
-
-      child.once("exit", () => {
-        const active = KICKOFF_LOOP_STATE_BY_REPO.get(repoKey);
-        if (active?.pid === state.pid) {
-          KICKOFF_LOOP_STATE_BY_REPO.delete(repoKey);
+      return await enqueue(async () => {
+        const normalizedSprint = normalizeSprint(sprint);
+        if (!normalizedSprint) {
+          throw new Error("invalid sprint");
         }
-      });
 
-      return state;
+        const existing = await getActiveLoopState(repoRoot);
+        if (existing) {
+          return existing;
+        }
+
+        const child = await startLoopProcess({ repoRoot, sprint: normalizedSprint });
+        if (!Number.isInteger(child?.pid) || child.pid <= 0) {
+          throw new Error("unable to determine kickoff loop process id");
+        }
+
+        // Reduce false STARTED responses when the detached process dies immediately after spawn.
+        if (!isProcessAliveFn(child.pid)) {
+          throw new Error("loop process exited during startup");
+        }
+
+        const repoKey = resolveRepoKey(repoRoot);
+        const state = {
+          pid: child.pid,
+          sprint: normalizedSprint,
+          startedAt: new Date().toISOString(),
+          loopMode: normalizedLoopMode,
+        };
+        LOOP_STATE_BY_REPO.set(repoKey, state);
+        try {
+          await writeLoopStateToDisk(repoRoot, state);
+        } catch (error) {
+          LOOP_STATE_BY_REPO.delete(repoKey);
+          // Best-effort cleanup: if we can't persist loop state we should not leave an orphan loop running.
+          try {
+            process.kill(-state.pid, "SIGTERM");
+          } catch {}
+          try {
+            process.kill(state.pid, "SIGTERM");
+          } catch {}
+          await waitForProcessDeath(state.pid, { timeoutMs: LOOP_TERMINATION_GRACE_MS });
+          throw error;
+        }
+
+        child.once("exit", () => {
+          const active = LOOP_STATE_BY_REPO.get(repoKey);
+          if (active?.pid === state.pid) {
+            LOOP_STATE_BY_REPO.delete(repoKey);
+          }
+        });
+
+        return state;
+      });
+    },
+    async stop({ force = false } = {}) {
+      return await enqueue(async () => {
+        let targets = [];
+
+        const state = await readLoopStateFromDisk(repoRoot);
+        if (state && isProcessAliveFn(state.pid)) {
+          targets = [state];
+        } else {
+          // Remove stale state file so we can fall back to process discovery.
+          await safeUnlink(resolveLoopStatePath(repoRoot));
+          LOOP_STATE_BY_REPO.delete(resolveRepoKey(repoRoot));
+
+          // Backwards-compat / operator recovery: if the loop was started by older
+          // code (no state file) or the state file was deleted, find detached loops
+          // by scanning /proc.
+          targets = await findLiveRunnerLoopCandidates(repoRoot, { maxCandidates: 8 });
+        }
+
+        if (targets.length === 0) {
+          return { status: "NOT_RUNNING" };
+        }
+
+        for (const target of targets) {
+          const looksLike = await looksLikeRunnerLoopProcess({
+            pid: target.pid,
+            repoRoot,
+            loopMode: target.loopMode,
+            sprint: target.sprint,
+          });
+          if (!force && looksLike.status === "MISMATCH") {
+            return { status: "REFUSED", detail: looksLike.detail };
+          }
+
+          // Try terminating the whole process group first (detached runner should be the leader).
+          try {
+            process.kill(-target.pid, "SIGTERM");
+          } catch (error) {
+            if (error?.code !== "ESRCH" && error?.code !== "EINVAL") {
+              // Fall through to direct PID kill below.
+            }
+          }
+          try {
+            process.kill(target.pid, "SIGTERM");
+          } catch (error) {
+            if (error?.code !== "ESRCH") {
+              throw error;
+            }
+          }
+
+          const exited = await waitForProcessDeath(target.pid, { timeoutMs: LOOP_TERMINATION_GRACE_MS });
+          if (!exited && isProcessAliveFn(target.pid)) {
+            try {
+              process.kill(-target.pid, "SIGKILL");
+            } catch (error) {
+              if (error?.code !== "ESRCH" && error?.code !== "EINVAL") {
+                // Fall through to direct PID kill below.
+              }
+            }
+            try {
+              process.kill(target.pid, "SIGKILL");
+            } catch (error) {
+              if (error?.code !== "ESRCH") {
+                throw error;
+              }
+            }
+
+            await waitForProcessDeath(target.pid, { timeoutMs: LOOP_TERMINATION_GRACE_MS });
+          }
+        }
+
+        await safeUnlink(resolveLoopStatePath(repoRoot));
+        LOOP_STATE_BY_REPO.delete(resolveRepoKey(repoRoot));
+        return { status: "STOPPED" };
+      });
     },
   };
 }
@@ -273,7 +652,7 @@ function buildInternalStartLoopHandler({
       return preflightFailure.payload;
     }
 
-    const active = loopManager.getActive();
+    const active = await loopManager.getActive();
     if (active) {
       reply.code(409);
       return {
@@ -304,13 +683,46 @@ function buildInternalStartLoopHandler({
   };
 }
 
+function buildInternalStopLoopHandler({ repoRoot, preflightCheck, loopManager, stopFailurePrefix }) {
+  return async function internalStopLoopHandler(request, reply) {
+    // Stop should remain available even if project preflight is failing; in practice
+    // operators use stop-loop to recover from bad identity/schema drift or credential issues.
+    const { statusCode: preflightStatusCode, payload: preflightResult } = await preflightCheck({
+      role: KICKOFF_ROLE,
+    });
+
+    if (preflightStatusCode !== 200) {
+      reply.code(preflightStatusCode);
+      return preflightResult;
+    }
+
+    const force = Boolean(request?.body?.force);
+    try {
+      const result = await loopManager.stop({ force });
+      if (result.status === "REFUSED") {
+        reply.code(409);
+        return {
+          status: "REFUSED",
+          error: `Refusing to stop ${stopFailurePrefix}; PID did not look like a runner loop process`,
+          detail: result.detail ?? "",
+        };
+      }
+      reply.code(200);
+      return { status: result.status };
+    } catch (error) {
+      reply.code(500);
+      return { error: `Failed to stop ${stopFailurePrefix}: ${error?.message ?? "Unknown error"}` };
+    }
+  };
+}
+
 export function buildInternalKickoffStartLoopHandler({
   repoRoot = DEFAULT_REPO_ROOT,
   preflightCheck,
   kickoffLoopManager,
 } = {}) {
   const resolvedPreflightCheck = resolvePreflightCheck({ preflightCheck, repoRoot });
-  const resolvedKickoffLoopManager = kickoffLoopManager ?? buildLoopManager({ repoRoot });
+  const resolvedKickoffLoopManager = kickoffLoopManager ?? buildLoopManager({ repoRoot, loopMode: "KICKOFF" });
 
   return buildInternalStartLoopHandler({
     repoRoot,
@@ -333,6 +745,7 @@ export function buildInternalRunnerStartLoopHandler({
     runnerLoopManager ??
     buildLoopManager({
       repoRoot,
+      loopMode: "RUNNER",
       startLoopProcess: defaultStartRunnerLoopProcess,
     });
 
@@ -347,8 +760,48 @@ export function buildInternalRunnerStartLoopHandler({
   });
 }
 
+export function buildInternalKickoffStopLoopHandler({
+  repoRoot = DEFAULT_REPO_ROOT,
+  preflightCheck,
+  kickoffLoopManager,
+} = {}) {
+  const resolvedPreflightCheck = resolvePreflightCheck({ preflightCheck, repoRoot });
+  const resolvedKickoffLoopManager = kickoffLoopManager ?? buildLoopManager({ repoRoot, loopMode: "KICKOFF" });
+
+  return buildInternalStopLoopHandler({
+    repoRoot,
+    preflightCheck: resolvedPreflightCheck,
+    loopManager: resolvedKickoffLoopManager,
+    stopFailurePrefix: "kickoff loop",
+  });
+}
+
+export function buildInternalRunnerStopLoopHandler({
+  repoRoot = DEFAULT_REPO_ROOT,
+  preflightCheck,
+  runnerLoopManager,
+} = {}) {
+  const resolvedPreflightCheck = resolvePreflightCheck({ preflightCheck, repoRoot });
+  const resolvedRunnerLoopManager =
+    runnerLoopManager ??
+    buildLoopManager({
+      repoRoot,
+      loopMode: "RUNNER",
+      startLoopProcess: defaultStartRunnerLoopProcess,
+    });
+
+  return buildInternalStopLoopHandler({
+    repoRoot,
+    preflightCheck: resolvedPreflightCheck,
+    loopManager: resolvedRunnerLoopManager,
+    stopFailurePrefix: "runner loop",
+  });
+}
+
 export async function registerInternalKickoffRoute(fastify, options = {}) {
   fastify.post("/internal/kickoff", buildInternalKickoffHandler(options));
   fastify.post("/internal/kickoff/start-loop", buildInternalKickoffStartLoopHandler(options));
   fastify.post("/internal/runner/start-loop", buildInternalRunnerStartLoopHandler(options));
+  fastify.post("/internal/kickoff/stop-loop", buildInternalKickoffStopLoopHandler(options));
+  fastify.post("/internal/runner/stop-loop", buildInternalRunnerStopLoopHandler(options));
 }
