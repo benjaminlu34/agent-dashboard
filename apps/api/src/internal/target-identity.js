@@ -31,6 +31,20 @@ function parseRepoNameFromGithubRepository(value) {
   return parts[1].trim();
 }
 
+function parseOptionalPositiveInt(value) {
+  if (Number.isInteger(value) && value > 0) {
+    return value;
+  }
+  if (!hasNonEmptyString(value)) {
+    return null;
+  }
+  const parsed = Number(value.trim());
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return null;
+  }
+  return parsed;
+}
+
 function readPolicyRepoName(repoPolicy, env) {
   if (hasNonEmptyString(repoPolicy?.repository_name)) {
     return repoPolicy.repository_name.trim();
@@ -75,17 +89,23 @@ function readRequiredEnvIdentity(env) {
     owner_type: ownerType,
     repo_name: env.TARGET_REPO_NAME.trim(),
     project_name: env.TARGET_PROJECT_NAME.trim(),
+    project_v2_number: parseOptionalPositiveInt(env.TARGET_PROJECT_NUMBER),
     template_path: hasNonEmptyString(env.TARGET_TEMPLATE_PATH) ? env.TARGET_TEMPLATE_PATH.trim() : DEFAULT_TEMPLATE_PATH,
     ref: hasNonEmptyString(env.TARGET_REF) ? env.TARGET_REF.trim() : DEFAULT_TARGET_REF,
     source: "env_override",
   };
 }
 
-function readPolicyIdentity(repoPolicy, env) {
-  const ownerLogin = hasNonEmptyString(repoPolicy?.owner_login) ? repoPolicy.owner_login.trim() : "";
+function readPolicyIdentity(repoPolicy, env, agentSwarmTarget) {
+  const ownerLogin = hasNonEmptyString(agentSwarmTarget?.owner)
+    ? agentSwarmTarget.owner.trim()
+    : (hasNonEmptyString(repoPolicy?.owner_login) ? repoPolicy.owner_login.trim() : "");
   const ownerType = normalizeOwnerType(repoPolicy?.owner_type);
-  const projectName = hasNonEmptyString(repoPolicy?.project_name) ? repoPolicy.project_name.trim() : "";
-  const repoName = readPolicyRepoName(repoPolicy, env);
+  const projectName = hasNonEmptyString(agentSwarmTarget?.project_name)
+    ? agentSwarmTarget.project_name.trim()
+    : (hasNonEmptyString(repoPolicy?.project_name) ? repoPolicy.project_name.trim() : "");
+  const repoName = hasNonEmptyString(agentSwarmTarget?.repo) ? agentSwarmTarget.repo.trim() : readPolicyRepoName(repoPolicy, env);
+  const projectV2Number = parseOptionalPositiveInt(agentSwarmTarget?.project_v2_number ?? repoPolicy?.project_v2_number);
 
   const missing = [];
   if (!ownerLogin) {
@@ -114,6 +134,7 @@ function readPolicyIdentity(repoPolicy, env) {
     owner_type: ownerType,
     repo_name: repoName,
     project_name: projectName,
+    project_v2_number: projectV2Number,
     template_path: hasNonEmptyString(env?.TARGET_TEMPLATE_PATH) ? env.TARGET_TEMPLATE_PATH.trim() : DEFAULT_TEMPLATE_PATH,
     ref: hasNonEmptyString(env?.TARGET_REF) ? env.TARGET_REF.trim() : DEFAULT_TARGET_REF,
     source: "policy",
@@ -132,6 +153,7 @@ export class TargetIdentityError extends Error {
 export function resolveTargetIdentity({
   env = process.env,
   repoPolicy,
+  agentSwarmTarget = null,
 } = {}) {
   if (!repoPolicy || typeof repoPolicy !== "object") {
     throw new TargetIdentityError("project identity policy JSON is required", {
@@ -145,13 +167,15 @@ export function resolveTargetIdentity({
     return readRequiredEnvIdentity(env);
   }
 
-  return readPolicyIdentity(repoPolicy, env);
+  return readPolicyIdentity(repoPolicy, env, agentSwarmTarget);
 }
 
 export function toProjectSchemaIdentity(targetIdentity) {
+  const projectV2Number = parseOptionalPositiveInt(targetIdentity.project_v2_number);
   return {
     owner_login: targetIdentity.owner_login,
     owner_type: targetIdentity.owner_type,
     project_name: targetIdentity.project_name,
+    ...(projectV2Number === null ? {} : { project_v2_number: projectV2Number }),
   };
 }

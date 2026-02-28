@@ -387,9 +387,23 @@
         </main>
 
         <section class="mt-7 rounded-2xl border border-zinc-800 bg-zinc-900 p-5 shadow-lg shadow-white/10 sm:p-6">
-          <div>
-            <h2 class="text-xl font-semibold tracking-tight text-white">Live Agent Terminals</h2>
-            <p class="mt-1 text-sm text-zinc-400">Real-time transcript stream for active and recently completed runs.</p>
+          <div class="flex flex-wrap items-start justify-between gap-4">
+            <div>
+              <h2 class="text-xl font-semibold tracking-tight text-white">Live Agent Terminals</h2>
+              <p class="mt-1 text-sm text-zinc-400">Real-time transcript stream for active runs.</p>
+            </div>
+            <label
+              for="terminal-active-only-toggle"
+              class="inline-flex cursor-pointer select-none items-center gap-2 rounded-lg border border-zinc-700 bg-black/50 px-3 py-2 text-xs font-medium text-zinc-300"
+            >
+              <input
+                id="terminal-active-only-toggle"
+                type="checkbox"
+                class="h-4 w-4 rounded border-zinc-600 bg-zinc-900 text-indigo-500 focus:ring-indigo-400"
+                checked
+              />
+              <span>Only active runs</span>
+            </label>
           </div>
           <div
             id="terminal-health-banner"

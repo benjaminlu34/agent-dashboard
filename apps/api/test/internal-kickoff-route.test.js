@@ -376,6 +376,66 @@ test("POST /internal/runner/stop-loop returns 200 NOT_RUNNING when loop is not r
   assert.deepEqual(result, { status: "NOT_RUNNING" });
 });
 
+test("POST /internal/runner/stop-loop marks running ledger entries failed", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-runner-stop-loop-ledger-cleanup-"));
+  const app = buildApp();
+
+  await writeFile(
+    join(repoRoot, ".agent-swarm.yml"),
+    ["version: \"1.0\"", "target:", "  owner: acme", "  repo: project-x"].join("\n") + "\n",
+    "utf8",
+  );
+  await writeFile(
+    join(repoRoot, ".runner-ledger.acme.project-x.json"),
+    JSON.stringify(
+      {
+        "run-1": {
+          run_id: "run-1",
+          role: "ORCHESTRATOR",
+          status: "running",
+          result: null,
+        },
+        "run-2": {
+          run_id: "run-2",
+          role: "EXECUTOR",
+          status: "succeeded",
+          result: {
+            status: "succeeded",
+            summary: "done",
+            errors: [],
+          },
+        },
+      },
+      null,
+      2,
+    ) + "\n",
+    "utf8",
+  );
+
+  await registerInternalKickoffRoute(app, {
+    repoRoot,
+    preflightCheck: async () => ({ statusCode: 200, payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] } }),
+    runnerLoopManager: {
+      stop: async () => ({ status: "NOT_RUNNING" }),
+    },
+  });
+
+  const stopLoopHandler = getPostHandler(app, "/internal/runner/stop-loop");
+  const reply = buildReply();
+  const result = await stopLoopHandler({ body: {} }, reply);
+
+  assert.equal(reply.statusCode, 200);
+  assert.deepEqual(result, { status: "NOT_RUNNING" });
+
+  const ledgerRaw = await readFile(join(repoRoot, ".runner-ledger.acme.project-x.json"), "utf8");
+  const ledger = JSON.parse(ledgerRaw);
+  assert.equal(ledger["run-1"].status, "failed");
+  assert.equal(ledger["run-1"].result.status, "failed");
+  assert.equal(ledger["run-1"].result.error_code, "runner_loop_stopped");
+  assert.equal(Array.isArray(ledger["run-1"].result.errors), true);
+  assert.equal(ledger["run-2"].status, "succeeded");
+});
+
 test("POST /internal/kickoff/stop-loop returns 200 STOPPED when loop is stopped", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-kickoff-stop-loop-200-stopped-"));
   const app = buildApp();

@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 
 import { AgentContextBundleError, loadAgentContextBundle } from "../internal/agent-context-loader.js";
+import { readAgentSwarmTarget } from "../internal/agent-swarm-config.js";
 import { createGitHubPlanApplyClient, GitHubPlanApplyError } from "../internal/github-plan-apply-client.js";
 import { buildPreflightHandler } from "./internal-preflight.js";
 import { resolveTargetIdentity, TargetIdentityError } from "../internal/target-identity.js";
@@ -280,12 +281,14 @@ export function buildInternalPlanApplyHandler({
     let projectIdentity;
     try {
       const repoPolicy = parseProjectIdentityPolicyFromBundle(bundle);
-      const target = resolveTargetIdentity({ env, repoPolicy });
+      const agentSwarmTarget = await readAgentSwarmTarget({ repoRoot });
+      const target = resolveTargetIdentity({ env, repoPolicy, agentSwarmTarget });
       targetIdentity = target;
       projectIdentity = {
         owner_login: target.owner_login,
         owner_type: target.owner_type,
         project_name: target.project_name,
+        project_v2_number: target.project_v2_number,
         repository_name: target.repo_name,
       };
     } catch (error) {

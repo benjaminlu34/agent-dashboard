@@ -123,6 +123,7 @@ Worker sandbox policy:
 
 When an item is in `Needs Human Approval`, request additional changes by moving:
 - `Needs Human Approval` -> `In Review`
+After, leave specified changes by commenting on the issue, not the PR.
 
 Do not move it back to `Ready`. This keeps one-PR linkage intact and causes orchestrator to run executor fixups on the existing linked PR branch.
 

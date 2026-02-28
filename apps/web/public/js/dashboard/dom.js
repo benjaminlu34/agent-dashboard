@@ -7,6 +7,7 @@ export const terminalTabsEl = document.getElementById("terminal-tabs");
 export const terminalWindowEl = document.getElementById("terminal-window");
 export const terminalOutputEl = document.getElementById("terminal-output");
 export const terminalHealthBannerEl = document.getElementById("terminal-health-banner");
+export const terminalActiveOnlyToggleEl = document.getElementById("terminal-active-only-toggle");
 export const targetRepoEl = document.getElementById("target-repo");
 export const lastRefreshEl = document.getElementById("last-refresh");
 export const errorBannerEl = document.getElementById("error-banner");

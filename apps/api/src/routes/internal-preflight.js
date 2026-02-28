@@ -2,6 +2,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { AgentContextBundleError, loadAgentContextBundle } from "../internal/agent-context-loader.js";
+import { readAgentSwarmTarget } from "../internal/agent-swarm-config.js";
 import { GitHubTemplateReadError, readTemplateMetadataFromGitHub } from "../internal/github-template-reader.js";
 import { ProjectSchemaReadError, readProjectSchemaFromGitHub } from "../internal/policy/github-project-schema-reader.js";
 import { compareProjectSchema } from "../internal/project-schema-compare.js";
@@ -123,9 +124,11 @@ export async function runPreflightCheck({
 
   let targetIdentity;
   try {
+    const agentSwarmTarget = await readAgentSwarmTarget({ repoRoot });
     targetIdentity = resolveTargetIdentity({
       env,
       repoPolicy: projectIdentityPolicy.repoPolicy,
+      agentSwarmTarget,
     });
   } catch (error) {
     if (error instanceof TargetIdentityError) {

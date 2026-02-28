@@ -4,6 +4,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 
+import { readAgentSwarmTarget } from "../../api/src/internal/agent-swarm-config.js";
 import { loadAgentContextBundle } from "../../api/src/internal/agent-context-loader.js";
 import { createGitHubPlanApplyClient } from "../../api/src/internal/github-plan-apply-client.js";
 import { resolveTargetIdentity, TargetIdentityError } from "../../api/src/internal/target-identity.js";
@@ -506,6 +507,7 @@ function buildClientIdentity(targetIdentity) {
     owner_login: targetIdentity.owner_login,
     owner_type: targetIdentity.owner_type,
     project_name: targetIdentity.project_name,
+    project_v2_number: targetIdentity.project_v2_number,
     repository_name: targetIdentity.repo_name,
   };
 }
@@ -526,10 +528,11 @@ async function runCycle({
   const bundle = await loadAgentContextBundle({ repoRoot, role: "ORCHESTRATOR" });
   const repoPolicy = parseProjectIdentityPolicy(bundle);
   const projectSchema = parseProjectSchema(bundle);
+  const agentSwarmTarget = await readAgentSwarmTarget({ repoRoot });
 
   let targetIdentity;
   try {
-    targetIdentity = resolveTargetIdentity({ env, repoPolicy });
+    targetIdentity = resolveTargetIdentity({ env, repoPolicy, agentSwarmTarget });
   } catch (error) {
     if (error instanceof TargetIdentityError) {
       const missing = Array.isArray(error?.details?.missing) && error.details.missing.length > 0

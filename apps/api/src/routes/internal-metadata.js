@@ -2,6 +2,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { AgentContextBundleError, loadAgentContextBundle } from "../internal/agent-context-loader.js";
+import { readAgentSwarmTarget } from "../internal/agent-swarm-config.js";
 import { createGitHubPlanApplyClient, GitHubPlanApplyError } from "../internal/github-plan-apply-client.js";
 import { resolveTargetIdentity, TargetIdentityError } from "../internal/target-identity.js";
 import { buildPreflightHandler } from "./internal-preflight.js";
@@ -72,10 +73,12 @@ function readGitHubToken(env) {
 }
 
 function buildClientIdentity(targetIdentity) {
+  const hasProjectNumber = Number.isInteger(targetIdentity.project_v2_number) && targetIdentity.project_v2_number > 0;
   return {
     owner_login: targetIdentity.owner_login,
     owner_type: targetIdentity.owner_type,
     project_name: targetIdentity.project_name,
+    ...(hasProjectNumber ? { project_v2_number: targetIdentity.project_v2_number } : {}),
     repository_name: targetIdentity.repo_name,
   };
 }
@@ -242,9 +245,11 @@ async function resolveMetadataTargetIdentity({ repoRoot, env }) {
     throw new Error(parsedPolicy.error);
   }
 
+  const agentSwarmTarget = await readAgentSwarmTarget({ repoRoot });
   return resolveTargetIdentity({
     env,
     repoPolicy: parsedPolicy.repoPolicy,
+    agentSwarmTarget,
   });
 }
 
