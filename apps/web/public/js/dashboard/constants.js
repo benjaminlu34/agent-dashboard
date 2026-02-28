@@ -5,3 +5,4 @@ export const TERMINAL_LOG_CACHE_MAX_CHARS = 120000;
 
 export const STATUS_NEEDS_HUMAN_APPROVAL = "Needs Human Approval";
 export const UI_STORAGE_KEY_SOUND_NEEDS_HUMAN_APPROVAL = "agent-dashboard:sound:needs-human-approval";
+export const UI_STORAGE_KEY_TERMINAL_ACTIVE_ONLY = "agent-dashboard:terminal:active-only";

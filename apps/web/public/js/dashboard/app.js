@@ -5,6 +5,7 @@ import {
   TERMINAL_RECENT_WINDOW_MS,
   TERMINAL_STREAM_RECONNECT_MS,
   UI_STORAGE_KEY_SOUND_NEEDS_HUMAN_APPROVAL,
+  UI_STORAGE_KEY_TERMINAL_ACTIVE_ONLY,
 } from "./constants.js";
 import {
   canvas,
@@ -50,6 +51,7 @@ import {
   settingsTargetOwnerEl,
   settingsTargetRepoEl,
   targetRepoEl,
+  terminalActiveOnlyToggleEl,
   terminalHealthBannerEl,
   terminalOutputEl,
   terminalTabsEl,
@@ -76,6 +78,8 @@ let terminalStreamSource = null;
 let terminalStreamRunId = "";
 let terminalStreamReconnectTimerId = 0;
 let terminalStreamSessionId = 0;
+let terminalOnlyActiveRuns = true;
+let latestRunnerEntries = [];
 const settingsFieldByName = {
   targetOwner: settingsTargetOwnerEl,
   targetRepo: settingsTargetRepoEl,
@@ -128,6 +132,10 @@ function loadUiPreferences() {
   soundNeedsHumanApprovalEnabled = readStoredBoolean(UI_STORAGE_KEY_SOUND_NEEDS_HUMAN_APPROVAL, true);
   if (settingsSoundNeedsHumanApprovalEl) {
     settingsSoundNeedsHumanApprovalEl.checked = soundNeedsHumanApprovalEnabled;
+  }
+  terminalOnlyActiveRuns = readStoredBoolean(UI_STORAGE_KEY_TERMINAL_ACTIVE_ONLY, true);
+  if (terminalActiveOnlyToggleEl) {
+    terminalActiveOnlyToggleEl.checked = terminalOnlyActiveRuns;
   }
 }
 
@@ -469,12 +477,17 @@ function collectTerminalRunIds(runnerEntries) {
     }
 
     const normalizedStatus = String(entry?.status ?? "").toUpperCase();
-    const isRunning = normalizedStatus === "RUNNING";
-    const isFinished = normalizedStatus === "SUCCEEDED" || normalizedStatus === "FAILED" || normalizedStatus === "SKIPPED";
-    const isRecentlyFinished = isFinished && entry.timestampMs > 0 && nowMs - entry.timestampMs <= TERMINAL_RECENT_WINDOW_MS;
-
-    if (!isRunning && !isRecentlyFinished) {
-      continue;
+    if (terminalOnlyActiveRuns) {
+      if (normalizedStatus !== "RUNNING") {
+        continue;
+      }
+    } else {
+      const isRunning = normalizedStatus === "RUNNING";
+      const isFinished = normalizedStatus === "SUCCEEDED" || normalizedStatus === "FAILED" || normalizedStatus === "SKIPPED";
+      const isRecentlyFinished = isFinished && entry.timestampMs > 0 && nowMs - entry.timestampMs <= TERMINAL_RECENT_WINDOW_MS;
+      if (!isRunning && !isRecentlyFinished) {
+        continue;
+      }
     }
 
     seen.add(runId);
@@ -517,10 +530,13 @@ function renderTerminalOutput(logs) {
 
 function renderTerminalTabs() {
   if (terminalRunIds.length === 0) {
+    const emptyLabel = terminalOnlyActiveRuns ? "No active runs" : "No active/recent runs";
     terminalTabsEl.innerHTML = `
-      <li class="px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">No active runs</li>
+      <li class="px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">${escapeHtml(emptyLabel)}</li>
     `;
-    terminalOutputEl.textContent = "Waiting for an active or recently finished run...";
+    terminalOutputEl.textContent = terminalOnlyActiveRuns
+      ? "Waiting for an active run..."
+      : "Waiting for an active or recently finished run...";
     return;
   }
 
@@ -1413,6 +1429,7 @@ async function loadStatus() {
     const orchestrator = asObject(payload?.orchestrator);
     const runner = asObject(payload?.runner);
     const runnerEntries = buildRunnerEntries(runner);
+    latestRunnerEntries = runnerEntries;
 
     if (detectReviewerNeedsHumanApprovalTransition(orchestrator)) {
       playNotificationBeep();
@@ -1474,6 +1491,11 @@ terminalTabsEl.addEventListener("click", (event) => {
     return;
   }
   setActiveTerminalRun(button.getAttribute("data-run-id"));
+});
+terminalActiveOnlyToggleEl?.addEventListener("change", () => {
+  terminalOnlyActiveRuns = Boolean(terminalActiveOnlyToggleEl.checked);
+  writeStoredBoolean(UI_STORAGE_KEY_TERMINAL_ACTIVE_ONLY, terminalOnlyActiveRuns);
+  syncTerminalRuns(latestRunnerEntries);
 });
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && isSettingsOpen) {

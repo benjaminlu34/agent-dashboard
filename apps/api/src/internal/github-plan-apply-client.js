@@ -1,6 +1,8 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
+import { readAgentSwarmTarget } from "./agent-swarm-config.js";
+
 const GITHUB_API_BASE_URL = "https://api.github.com";
 const GITHUB_GRAPHQL_URL = "https://api.github.com/graphql";
 const REQUIRED_PROJECT_FIELDS = ["Status", "Size", "Area", "Priority", "Sprint"];
@@ -19,6 +21,21 @@ function normalizeOwnerType(value) {
     return "org";
   }
   return normalized;
+}
+
+function toPositiveInteger(value) {
+  if (Number.isInteger(value) && value > 0) {
+    return value;
+  }
+
+  if (isNonEmptyString(value)) {
+    const parsed = Number(value.trim());
+    if (Number.isInteger(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+
+  return null;
 }
 
 function extractRepoFromGitRemoteUrl(remoteUrl) {
@@ -234,15 +251,29 @@ export async function createGitHubPlanApplyClient({
     throw new GitHubPlanApplyError("missing GitHub token");
   }
 
-  const ownerLogin = projectIdentity?.owner_login;
-  const ownerType = normalizeOwnerType(projectIdentity?.owner_type);
-  const projectName = projectIdentity?.project_name;
+  const agentSwarmTarget = await readAgentSwarmTarget({ repoRoot });
 
-  if (!isNonEmptyString(ownerLogin) || !isNonEmptyString(projectName) || (ownerType !== "user" && ownerType !== "org")) {
+  const ownerLogin = isNonEmptyString(agentSwarmTarget?.owner)
+    ? agentSwarmTarget.owner
+    : projectIdentity?.owner_login;
+  const ownerType = normalizeOwnerType(projectIdentity?.owner_type);
+  const projectName = isNonEmptyString(agentSwarmTarget?.project_name)
+    ? agentSwarmTarget.project_name
+    : projectIdentity?.project_name;
+  const projectNumber = toPositiveInteger(agentSwarmTarget?.project_v2_number ?? projectIdentity?.project_v2_number);
+
+  if (!isNonEmptyString(ownerLogin) || (!isNonEmptyString(projectName) && projectNumber === null) || (ownerType !== "user" && ownerType !== "org")) {
     throw new GitHubPlanApplyError("invalid project identity");
   }
 
-  const repositoryName = await resolveRepositoryName({ repoRoot, projectIdentity });
+  const repositoryName = await resolveRepositoryName({
+    repoRoot,
+    projectIdentity: {
+      ...projectIdentity,
+      repository_name: isNonEmptyString(agentSwarmTarget?.repo) ? agentSwarmTarget.repo : projectIdentity?.repository_name,
+      repo: isNonEmptyString(agentSwarmTarget?.repo) ? agentSwarmTarget.repo : projectIdentity?.repo,
+    },
+  });
   const ownerNode = buildOwnerNode(ownerType);
 
   const projectData = await requestGraphql({
@@ -254,6 +285,7 @@ export async function createGitHubPlanApplyClient({
           projectsV2(first: 100) {
             nodes {
               id
+              number
               title
               fields(first: 100) {
                 nodes {
@@ -281,8 +313,13 @@ export async function createGitHubPlanApplyClient({
     throw new GitHubPlanApplyError("project owner not found");
   }
 
-  const project = projects.find((entry) => entry?.title === projectName);
+  const project = projectNumber !== null
+    ? projects.find((entry) => entry?.number === projectNumber)
+    : projects.find((entry) => entry?.title === projectName);
   if (!project) {
+    if (projectNumber !== null) {
+      throw new GitHubPlanApplyError(`project not found: number ${projectNumber}`);
+    }
     throw new GitHubPlanApplyError(`project not found: ${projectName}`);
   }
 

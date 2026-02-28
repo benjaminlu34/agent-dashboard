@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 
 import { AgentContextBundleError, loadAgentContextBundle } from "../internal/agent-context-loader.js";
+import { readAgentSwarmTarget } from "../internal/agent-swarm-config.js";
 import { fetchIssueBodyFromGithub, fetchRepositoryMapFromGithub } from "../internal/github-repository-map.js";
 import { parseIssueTaskBrief } from "../internal/task-brief-parser.js";
 import { resolveTargetIdentity, TargetIdentityError } from "../internal/target-identity.js";
@@ -99,9 +100,11 @@ async function buildAgentContextEnrichment({
 
   let targetIdentity;
   try {
+    const agentSwarmTarget = await readAgentSwarmTarget({ repoRoot });
     targetIdentity = resolveTargetIdentity({
       env,
       repoPolicy,
+      agentSwarmTarget,
     });
   } catch (error) {
     if (error instanceof TargetIdentityError) {

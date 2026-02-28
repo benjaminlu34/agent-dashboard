@@ -3,6 +3,8 @@ import { readdir, readFile, readlink, rename, unlink, writeFile } from "node:fs/
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import YAML from "yaml";
+
 import { runPreflightCheck } from "./internal-preflight.js";
 
 const MODULE_DIRNAME = dirname(fileURLToPath(import.meta.url));
@@ -12,6 +14,8 @@ const KICKOFF_ROLE = "ORCHESTRATOR";
 const SPRINT_RE = /^M[1-4]$/;
 const RUNNER_STARTUP_GRACE_MS = 350;
 const LOOP_STATE_FILE = ".runner-loop-state.json";
+const AGENT_SWARM_CONFIG_PATH = ".agent-swarm.yml";
+const DEFAULT_RUNNER_LEDGER_PATH = "./.runner-ledger.json";
 const LOOP_TERMINATION_GRACE_MS = 2500;
 const LOOP_TERMINATION_POLL_MS = 80;
 const LOOP_STATE_BY_REPO = new Map();
@@ -57,6 +61,123 @@ function parseLoopMode(value) {
   }
   const mode = value.trim().toUpperCase();
   return mode === "KICKOFF" || mode === "RUNNER" ? mode : null;
+}
+
+function hasNonEmptyString(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function sanitizeStatePathToken(value) {
+  return String(value).trim().replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+async function readTargetIdentityFromAgentSwarm({ repoRoot }) {
+  const configPath = resolve(repoRoot, AGENT_SWARM_CONFIG_PATH);
+  let rawConfig = "";
+  try {
+    rawConfig = await readFile(configPath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+
+  let parsed = {};
+  try {
+    parsed = YAML.parse(rawConfig) ?? {};
+  } catch {
+    return null;
+  }
+
+  const owner = parsed?.target?.owner;
+  const repo = parsed?.target?.repo;
+  if (!hasNonEmptyString(owner) || !hasNonEmptyString(repo)) {
+    return null;
+  }
+
+  return {
+    owner: owner.trim(),
+    repo: repo.trim(),
+  };
+}
+
+function resolveRunnerLedgerPath({ repoRoot, env, targetIdentity }) {
+  const defaultPath = hasNonEmptyString(targetIdentity?.owner) && hasNonEmptyString(targetIdentity?.repo)
+    ? `./.runner-ledger.${sanitizeStatePathToken(targetIdentity.owner)}.${sanitizeStatePathToken(targetIdentity.repo)}.json`
+    : DEFAULT_RUNNER_LEDGER_PATH;
+  const configured = hasNonEmptyString(env?.RUNNER_LEDGER_PATH) ? env.RUNNER_LEDGER_PATH.trim() : defaultPath;
+  return resolve(repoRoot, configured);
+}
+
+function toStoppedLedgerResult({ previousResult, reason, nowIso }) {
+  const base = previousResult && typeof previousResult === "object" ? previousResult : {};
+  const previousErrors = Array.isArray(base.errors) ? base.errors.filter((entry) => entry && typeof entry === "object") : [];
+  const hasStopMarker = previousErrors.some((entry) => entry.code === "runner_loop_stopped");
+  const errors = hasStopMarker ? previousErrors : [...previousErrors, { code: "runner_loop_stopped", message: reason }];
+  return {
+    ...base,
+    status: "failed",
+    summary: reason,
+    errors,
+    failure_classification: "HARD_STOP",
+    error_code: "runner_loop_stopped",
+    completed_at: nowIso,
+  };
+}
+
+async function markRunningLedgerEntriesStopped({ repoRoot, env = process.env, reason }) {
+  const targetIdentity = await readTargetIdentityFromAgentSwarm({ repoRoot });
+  const ledgerPath = resolveRunnerLedgerPath({
+    repoRoot,
+    env,
+    targetIdentity,
+  });
+
+  let raw = "";
+  try {
+    raw = await readFile(ledgerPath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return 0;
+    }
+    throw error;
+  }
+
+  let parsed = {};
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return 0;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return 0;
+  }
+
+  const nowIso = new Date().toISOString();
+  let updated = 0;
+  for (const entry of Object.values(parsed)) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+    const status = typeof entry.status === "string" ? entry.status.trim().toLowerCase() : "";
+    if (status !== "running") {
+      continue;
+    }
+    entry.status = "failed";
+    entry.result = toStoppedLedgerResult({
+      previousResult: entry.result,
+      reason,
+      nowIso,
+    });
+    updated += 1;
+  }
+
+  if (updated > 0) {
+    await writeFile(ledgerPath, `${JSON.stringify(parsed, null, 2)}\n`, "utf8");
+  }
+
+  return updated;
 }
 
 function isValidLoopState(value) {
@@ -706,6 +827,12 @@ function buildInternalStopLoopHandler({ repoRoot, preflightCheck, loopManager, s
           error: `Refusing to stop ${stopFailurePrefix}; PID did not look like a runner loop process`,
           detail: result.detail ?? "",
         };
+      }
+      if (result.status === "STOPPED" || result.status === "NOT_RUNNING") {
+        await markRunningLedgerEntriesStopped({
+          repoRoot,
+          reason: `Runner loop stop requested by operator (${stopFailurePrefix}).`,
+        });
       }
       reply.code(200);
       return { status: result.status };

@@ -70,3 +70,66 @@ test("readProjectSchemaFromGitHub surfaces GitHub message on non-OK response", a
     },
   );
 });
+
+test("readProjectSchemaFromGitHub resolves project by project_v2_number", async () => {
+  await withServer(
+    async (request, response) => {
+      let rawBody = "";
+      for await (const chunk of request) {
+        rawBody += chunk;
+      }
+      const parsedBody = JSON.parse(rawBody);
+      assert.equal(typeof parsedBody.query, "string");
+      assert.deepEqual(parsedBody.variables, { ownerLogin: "owner" });
+
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          data: {
+            user: {
+              projectsV2: {
+                nodes: [
+                  {
+                    number: 2,
+                    title: "Wrong Board",
+                    fields: { nodes: [] },
+                  },
+                  {
+                    number: 3,
+                    title: "Correct Board",
+                    fields: {
+                      nodes: [
+                        {
+                          __typename: "ProjectV2SingleSelectField",
+                          name: "Status",
+                          dataType: "SINGLE_SELECT",
+                          options: [{ name: "Backlog" }, { name: "Done" }],
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        }),
+      );
+    },
+    async (endpoint) => {
+      const schema = await readProjectSchemaFromGitHub({
+        projectIdentity: {
+          owner_login: "owner",
+          owner_type: "user",
+          project_v2_number: 3,
+        },
+        githubToken: "token",
+        endpoint,
+      });
+
+      assert.equal(schema.project_name, "Correct Board");
+      assert.equal(schema.project_owner, "owner");
+      assert.equal(schema.project_owner_type, "user");
+      assert.deepEqual(schema.fields, [{ name: "Status", type: "single_select", options: ["Backlog", "Done"] }]);
+    },
+  );
+});

@@ -14,6 +14,20 @@ function normalizeGraphqlDataType(value) {
   return value.trim().toLowerCase();
 }
 
+function toPositiveInteger(value) {
+  if (Number.isInteger(value) && value > 0) {
+    return value;
+  }
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return null;
+  }
+  const parsed = Number(value.trim());
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return null;
+  }
+  return parsed;
+}
+
 function mapProjectFields(project) {
   return (project?.fields?.nodes ?? [])
     .filter((field) => typeof field?.name === "string" && field.name.length > 0)
@@ -71,10 +85,11 @@ export async function readProjectSchemaFromGitHub({
   const ownerLogin = typeof projectIdentity?.owner_login === "string" ? projectIdentity.owner_login.trim() : "";
   const ownerType = typeof projectIdentity?.owner_type === "string" ? projectIdentity.owner_type.trim() : "";
   const projectName = typeof projectIdentity?.project_name === "string" ? projectIdentity.project_name.trim() : "";
+  const projectNumber = toPositiveInteger(projectIdentity?.project_v2_number);
 
-  if (!ownerLogin || !projectName || (ownerType !== "user" && ownerType !== "org")) {
+  if (!ownerLogin || (!projectName && projectNumber === null) || (ownerType !== "user" && ownerType !== "org")) {
     throw new ProjectSchemaReadError(
-      "invalid project identity: expected owner_login, owner_type (user|org), and project_name",
+      "invalid project identity: expected owner_login, owner_type (user|org), and project_name or project_v2_number",
     );
   }
 
@@ -92,6 +107,7 @@ export async function readProjectSchemaFromGitHub({
         ${queryRoot} {
           projectsV2(first: 100) {
             nodes {
+              number
               title
               fields(first: 100) {
                 nodes {
@@ -122,13 +138,20 @@ export async function readProjectSchemaFromGitHub({
     throw new ProjectSchemaReadError(`owner not found for project schema read: ${ownerType}/${ownerLogin}`);
   }
 
-  const project = projects.find((entry) => entry?.title === projectName);
+  const project = projectNumber !== null
+    ? projects.find((entry) => entry?.number === projectNumber)
+    : projects.find((entry) => entry?.title === projectName);
   if (!project) {
+    if (projectNumber !== null) {
+      throw new ProjectSchemaReadError(`project not found for owner ${ownerLogin}: number ${projectNumber}`);
+    }
     throw new ProjectSchemaReadError(`project not found for owner ${ownerLogin}: ${projectName}`);
   }
 
+  const resolvedProjectName = typeof project?.title === "string" ? project.title : projectName;
+
   return {
-    project_name: projectName,
+    project_name: resolvedProjectName,
     project_owner: ownerLogin,
     project_owner_type: ownerType,
     fields: mapProjectFields(project),
