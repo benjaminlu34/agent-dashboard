@@ -1,8 +1,10 @@
 import {
   POLL_INTERVAL_MS,
+  STATUS_NEEDS_HUMAN_APPROVAL,
   TERMINAL_LOG_CACHE_MAX_CHARS,
   TERMINAL_RECENT_WINDOW_MS,
   TERMINAL_STREAM_RECONNECT_MS,
+  UI_STORAGE_KEY_SOUND_NEEDS_HUMAN_APPROVAL,
 } from "./constants.js";
 import {
   canvas,
@@ -10,6 +12,7 @@ import {
   errorBannerEl,
   kickoffButtonLabelEl,
   kickoffButtonSpinnerEl,
+  kickoffDetailsEl,
   kickoffFormEl,
   kickoffGoalEl,
   kickoffMessageEl,
@@ -43,6 +46,7 @@ import {
   settingsOpenButtonEl,
   settingsProjectNumberEl,
   settingsSaveButtonEl,
+  settingsSoundNeedsHumanApprovalEl,
   settingsTargetOwnerEl,
   settingsTargetRepoEl,
   targetRepoEl,
@@ -82,6 +86,191 @@ const settingsFieldByName = {
 };
 
 const background = createBackgroundAnimator({ canvas, ctx });
+
+let soundNeedsHumanApprovalEnabled = true;
+let notificationAudioContext = null;
+let hasOrchestratorSnapshot = false;
+const previousOrchestratorStatusByItemId = new Map();
+let kickoffWasAutoCollapsed = false;
+
+function normalizeStatus(value) {
+  return String(value ?? "").trim().toUpperCase();
+}
+
+function readStoredBoolean(key, defaultValue) {
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (raw === null) {
+      return defaultValue;
+    }
+    const normalized = raw.trim().toLowerCase();
+    if (normalized === "1" || normalized === "true" || normalized === "yes") {
+      return true;
+    }
+    if (normalized === "0" || normalized === "false" || normalized === "no") {
+      return false;
+    }
+  } catch {
+    // ignore storage failures (private mode, quota, etc.)
+  }
+  return defaultValue;
+}
+
+function writeStoredBoolean(key, value) {
+  try {
+    window.localStorage.setItem(key, value ? "1" : "0");
+  } catch {
+    // ignore storage failures (private mode, quota, etc.)
+  }
+}
+
+function loadUiPreferences() {
+  soundNeedsHumanApprovalEnabled = readStoredBoolean(UI_STORAGE_KEY_SOUND_NEEDS_HUMAN_APPROVAL, true);
+  if (settingsSoundNeedsHumanApprovalEl) {
+    settingsSoundNeedsHumanApprovalEl.checked = soundNeedsHumanApprovalEnabled;
+  }
+}
+
+function ensureNotificationAudioContext() {
+  if (notificationAudioContext) {
+    return notificationAudioContext;
+  }
+
+  const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextCtor) {
+    return null;
+  }
+
+  notificationAudioContext = new AudioContextCtor();
+  return notificationAudioContext;
+}
+
+async function unlockNotificationAudio() {
+  const ctx = ensureNotificationAudioContext();
+  if (!ctx) {
+    return false;
+  }
+  try {
+    if (ctx.state === "suspended") {
+      await ctx.resume();
+    }
+  } catch {
+    return false;
+  }
+  return ctx.state === "running";
+}
+
+function collapseKickoffSection({ force = false } = {}) {
+  if (!kickoffDetailsEl) {
+    return;
+  }
+  if (!kickoffDetailsEl.open) {
+    kickoffWasAutoCollapsed = true;
+    return;
+  }
+  if (!force && kickoffWasAutoCollapsed) {
+    return;
+  }
+  kickoffDetailsEl.open = false;
+  kickoffWasAutoCollapsed = true;
+}
+
+function handleNotificationAudioUnlockGesture() {
+  if (!soundNeedsHumanApprovalEnabled) {
+    return;
+  }
+  const ctx = ensureNotificationAudioContext();
+  if (!ctx || ctx.state === "running") {
+    return;
+  }
+  void unlockNotificationAudio();
+}
+
+function playNotificationBeep() {
+  if (!soundNeedsHumanApprovalEnabled) {
+    return;
+  }
+
+  const ctx = ensureNotificationAudioContext();
+  if (!ctx) {
+    return;
+  }
+
+  const play = () => {
+    const now = ctx.currentTime;
+    const oscillator = ctx.createOscillator();
+    const gain = ctx.createGain();
+
+    oscillator.type = "triangle";
+    oscillator.frequency.setValueAtTime(880, now);
+
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.15, now + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.22);
+
+    oscillator.connect(gain);
+    gain.connect(ctx.destination);
+
+    oscillator.start(now);
+    oscillator.stop(now + 0.24);
+    oscillator.onended = () => {
+      oscillator.disconnect();
+      gain.disconnect();
+    };
+  };
+
+  if (ctx.state !== "running") {
+    void unlockNotificationAudio().then((unlocked) => {
+      if (unlocked) {
+        play();
+      }
+    });
+    return;
+  }
+
+  play();
+}
+
+function detectReviewerNeedsHumanApprovalTransition(orchestrator) {
+  const needsApproval = normalizeStatus(STATUS_NEEDS_HUMAN_APPROVAL);
+  const itemsObj = asObject(orchestrator?.items);
+  const nextStatuses = new Map();
+
+  let shouldBeep = false;
+  for (const [projectItemId, item] of Object.entries(itemsObj)) {
+    const nextStatusRaw = item?.last_seen_status ?? "";
+    const nextStatus = normalizeStatus(nextStatusRaw);
+    nextStatuses.set(projectItemId, nextStatus);
+
+    if (!hasOrchestratorSnapshot) {
+      continue;
+    }
+
+    const previousStatus = previousOrchestratorStatusByItemId.get(projectItemId);
+    if (typeof previousStatus !== "string" || !previousStatus) {
+      continue;
+    }
+
+    if (previousStatus === needsApproval || nextStatus !== needsApproval) {
+      continue;
+    }
+
+    const lastRole = String(item?.last_dispatched_role ?? "").trim().toUpperCase();
+    if (lastRole !== "REVIEWER") {
+      continue;
+    }
+
+    shouldBeep = true;
+  }
+
+  previousOrchestratorStatusByItemId.clear();
+  for (const [projectItemId, status] of nextStatuses.entries()) {
+    previousOrchestratorStatusByItemId.set(projectItemId, status);
+  }
+  hasOrchestratorSnapshot = true;
+
+  return shouldBeep;
+}
 
 function deriveTargetFromData(orchestrator, runner, ownerHeader, repoHeader) {
   if (ownerHeader && repoHeader) {
@@ -157,20 +346,21 @@ function renderOrchestrator(orchestrator) {
 
   orchestratorSummaryEl.innerHTML = "";
   const statusPairs = Object.entries(statusCounts);
+  orchestratorSummaryEl.classList.toggle("hidden", statusPairs.length === 0);
   if (statusPairs.length > 0) {
     orchestratorSummaryEl.innerHTML = statusPairs
       .map(
         ([status, count]) =>
-          `<span class="inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold ${statusBadgeClasses(status)}">${escapeHtml(status)} <span class="text-[11px] opacity-80">${count}</span></span>`,
+          `<span class="inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-medium ${statusBadgeClasses(status)}">${escapeHtml(status)} <span class="text-[11px] opacity-80">${count}</span></span>`,
       )
       .join("");
   }
 
   if (entries.length === 0) {
     orchestratorItemsEl.innerHTML = `
-      <div class="rounded-2xl border border-dashed border-zinc-700 bg-black px-6 py-10 text-center">
-        <p class="text-sm font-semibold text-zinc-200">No queue activity yet</p>
-        <p class="mt-2 text-sm text-zinc-500">When orchestrator state appears, sprint items will show up here with live status badges.</p>
+      <div class="rounded-2xl border border-dashed border-zinc-800 bg-black px-6 py-10 text-center">
+        <p class="text-sm font-medium text-zinc-100">Awaiting sprint kickoff</p>
+        <p class="mt-2 text-xs text-zinc-500">Start Runner Loop or Kickoff to populate sprint items.</p>
       </div>
     `;
     return;
@@ -182,24 +372,24 @@ function renderOrchestrator(orchestrator) {
         <article class="rounded-xl border border-zinc-800 bg-black p-4 shadow-md shadow-white/5 transition hover:-translate-y-0.5 hover:shadow-lg hover:shadow-white/10">
           <div class="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <p class="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">Issue</p>
-              <h3 class="mt-1 text-base font-semibold text-white">${
+              <p class="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Issue</p>
+              <h3 class="mt-1 text-base font-medium text-zinc-100">${
                 entry.issueNumber > 0 ? `#${entry.issueNumber}` : "Unnumbered Issue"
               }${
                 entry.issueTitle ? ` · ${escapeHtml(entry.issueTitle)}` : ""
               }</h3>
             </div>
-            <span class="inline-flex rounded-full px-3 py-1 text-xs font-semibold ${statusBadgeClasses(entry.status)}">${escapeHtml(entry.status)}</span>
+            <span class="inline-flex rounded-full px-3 py-1 text-xs font-medium ${statusBadgeClasses(entry.status)}">${escapeHtml(entry.status)}</span>
           </div>
-          <div class="mt-3 grid gap-2 text-xs text-zinc-400 sm:grid-cols-2">
-            <p>Last seen: <span class="font-medium text-zinc-200">${escapeHtml(formatTime(entry.lastSeenAt))}</span></p>
-            <p>In status since: <span class="font-medium text-zinc-200">${escapeHtml(formatTime(entry.statusSinceAt))}</span></p>
-            <p>Last dispatch role: <span class="font-medium text-zinc-200">${escapeHtml(entry.lastRole || "—")}</span></p>
-            <p>Review cycles: <span class="font-medium text-zinc-200">${Number.isFinite(entry.reviewCycles) ? entry.reviewCycles : 0}</span></p>
+          <div class="mt-3 grid gap-2 text-[11px] text-zinc-500 sm:grid-cols-2">
+            <p>Last seen: <span class="font-medium text-zinc-300">${escapeHtml(formatTime(entry.lastSeenAt))}</span></p>
+            <p>In status since: <span class="font-medium text-zinc-300">${escapeHtml(formatTime(entry.statusSinceAt))}</span></p>
+            <p>Last dispatch role: <span class="font-medium text-zinc-300">${escapeHtml(entry.lastRole || "—")}</span></p>
+            <p>Review cycles: <span class="font-medium text-zinc-300">${Number.isFinite(entry.reviewCycles) ? entry.reviewCycles : 0}</span></p>
           </div>
           ${
             entry.lastRunId
-              ? `<p class="mt-3 rounded-lg border border-zinc-800 bg-zinc-900/70 px-3 py-2 text-[11px] text-zinc-500">run_id: <span class="font-mono text-[11px] text-zinc-300">${escapeHtml(entry.lastRunId)}</span></p>`
+              ? `<p class="mt-3 rounded-lg border border-zinc-800 bg-zinc-900/70 px-3 py-2 text-[10px] text-zinc-500">run_id: <span class="font-mono text-[10px] text-zinc-300">${escapeHtml(entry.lastRunId)}</span></p>`
               : ""
           }
         </article>
@@ -212,6 +402,7 @@ function buildRunnerEntries(runner) {
   return Object.values(asObject(runner))
     .filter((value) => value && typeof value === "object")
     .map((value) => {
+      const normalizedStatus = normalizeStatus(value?.status ?? "");
       const timestamp =
         value?.running_at ??
         value?.result?.completed_at ??
@@ -243,6 +434,7 @@ function buildRunnerEntries(runner) {
         runId: value?.run_id ?? "",
         role: value?.role ?? "UNKNOWN",
         status: value?.status ?? "unknown",
+        isRunning: normalizedStatus === "RUNNING",
         timestamp,
         timestampMs,
         receivedAt: value?.received_at ?? "",
@@ -257,8 +449,13 @@ function buildRunnerEntries(runner) {
           "",
       };
     })
-    .sort((left, right) => right.timestampMs - left.timestampMs)
-    .slice(0, 30);
+    .sort((left, right) => {
+      if (left.isRunning !== right.isRunning) {
+        return left.isRunning ? -1 : 1;
+      }
+      return right.timestampMs - left.timestampMs;
+    })
+    .slice(0, 200);
 }
 
 function collectTerminalRunIds(runnerEntries) {
@@ -627,9 +824,9 @@ function renderRunner(entries) {
 
   if (entries.length === 0) {
     runnerRunsEl.innerHTML = `
-      <div class="rounded-2xl border border-dashed border-zinc-700 bg-black px-5 py-10 text-center">
-        <p class="text-sm font-semibold text-zinc-200">No runner entries yet</p>
-        <p class="mt-2 text-sm text-zinc-500">As runs are queued and executed, this timeline will populate automatically.</p>
+      <div class="rounded-2xl border border-dashed border-zinc-800 bg-black px-5 py-10 text-center">
+        <p class="text-sm font-medium text-zinc-100">No active runs</p>
+        <p class="mt-2 text-xs text-zinc-500">Start Runner Loop to populate this ledger.</p>
       </div>
     `;
     return;
@@ -637,23 +834,26 @@ function renderRunner(entries) {
 
   runnerRunsEl.innerHTML = entries
     .map((entry) => {
-      const normalizedStatus = String(entry.status ?? "").toLowerCase();
-      const showBlocked = normalizedStatus === "failed" || normalizedStatus === "blocked";
+      const normalizedStatus = normalizeStatus(entry.status);
+      const isRunning = Boolean(entry?.isRunning);
+      const isDimmed = !isRunning;
+      const showBlocked = normalizedStatus === "FAILED" || normalizedStatus === "BLOCKED";
       const failureDetail = deriveRunFailureDetail(entry);
+      const headerToneClass = isRunning ? "text-zinc-100" : "text-zinc-500";
       return `
-        <article class="relative rounded-xl border border-zinc-800 bg-black p-4 shadow-md shadow-white/5">
+        <article class="relative rounded-xl border border-zinc-800 bg-black p-4 shadow-md shadow-white/5 ${isDimmed ? "opacity-75" : ""}">
           <div class="absolute left-0 top-5 h-4 w-1 rounded-r-full ${showBlocked ? "bg-zinc-500" : "bg-white/70"}"></div>
           <div class="flex flex-wrap items-start justify-between gap-3 pl-3">
             <div>
-              <p class="text-xs font-semibold uppercase tracking-[0.16em] text-zinc-500">${escapeHtml(entry.role)}</p>
-              <p class="mt-1 text-sm font-semibold text-white">${entry.runId ? escapeHtml(entry.runId) : "Unknown run"}</p>
-              <p class="mt-1 text-xs text-zinc-500">${escapeHtml(formatTime(entry.timestamp || entry.receivedAt))}</p>
+              <p class="text-[10px] font-semibold uppercase tracking-[0.16em] ${headerToneClass}">${escapeHtml(entry.role)}</p>
+              <p class="mt-1 text-[11px] font-mono font-medium ${isRunning ? "text-zinc-100" : "text-zinc-500"}">${entry.runId ? escapeHtml(entry.runId) : "Unknown run"}</p>
+              <p class="mt-1 text-[11px] text-zinc-500">${escapeHtml(formatTime(entry.timestamp || entry.receivedAt))}</p>
             </div>
-            <span class="inline-flex rounded-full px-3 py-1 text-xs font-semibold ${runBadgeClasses(entry.status)}">${escapeHtml(String(entry.status).toUpperCase())}</span>
+            <span class="inline-flex rounded-full px-3 py-1 text-xs font-medium ${runBadgeClasses(entry.status)}">${escapeHtml(String(entry.status).toUpperCase())}</span>
           </div>
           ${
             entry.outcome
-              ? `<p class="mt-3 pl-3 text-xs text-zinc-400">Outcome: <span class="font-semibold text-zinc-200">${escapeHtml(entry.outcome)}</span></p>`
+              ? `<p class="mt-3 pl-3 text-[11px] text-zinc-500">Outcome: <span class="font-medium text-zinc-300">${escapeHtml(entry.outcome)}</span></p>`
               : ""
           }
           ${
@@ -852,6 +1052,7 @@ async function startKickoffLoop() {
   }
 
   kickoffSprintEl.value = sprint;
+  collapseKickoffSection({ force: true });
   setKickoffLoopLoading(true);
 
   try {
@@ -880,6 +1081,7 @@ async function startKickoffLoop() {
         const runningPid = Number(payload.pid);
         const runningPidText = Number.isInteger(runningPid) && runningPid > 0 ? `, PID ${runningPid}` : "";
         showKickoffMessage(`Kickoff loop is already running (Sprint ${runningSprint}${runningPidText}).`);
+        collapseKickoffSection({ force: true });
         return;
       }
       const fallbackMessage =
@@ -903,7 +1105,12 @@ async function startKickoffLoop() {
     }
     const suffix = statusParts.length > 0 ? ` (${statusParts.join(", ")})` : "";
     showKickoffMessage(`${successMessage}${suffix}`);
+    collapseKickoffSection({ force: true });
   } catch (error) {
+    if (kickoffDetailsEl) {
+      kickoffDetailsEl.open = true;
+    }
+    kickoffWasAutoCollapsed = false;
     showKickoffMessage(`Failed to start kickoff loop: ${error?.message ?? "Unknown error"}`, "error");
   } finally {
     setKickoffLoopLoading(false);
@@ -1207,6 +1414,18 @@ async function loadStatus() {
     const runner = asObject(payload?.runner);
     const runnerEntries = buildRunnerEntries(runner);
 
+    if (detectReviewerNeedsHumanApprovalTransition(orchestrator)) {
+      playNotificationBeep();
+    }
+
+    const hasRunningRun = runnerEntries.some((entry) => normalizeStatus(entry?.status) === "RUNNING");
+    const orchestratorLoopRunning = runnerEntries.some(
+      (entry) => normalizeRoleLabel(entry?.role) === "ORCHESTRATOR" && normalizeStatus(entry?.status) === "RUNNING",
+    );
+    if (orchestratorLoopRunning || hasRunningRun) {
+      collapseKickoffSection();
+    }
+
     const ownerHeader = response.headers.get("x-target-owner") ?? "";
     const repoHeader = response.headers.get("x-target-repo") ?? "";
 
@@ -1235,6 +1454,13 @@ settingsCloseButtonEl.addEventListener("click", () => setSettingsOpen(false));
 settingsCancelButtonEl.addEventListener("click", () => setSettingsOpen(false));
 settingsBackdropEl.addEventListener("click", () => setSettingsOpen(false));
 settingsFormEl.addEventListener("submit", submitConfig);
+settingsSoundNeedsHumanApprovalEl?.addEventListener("change", () => {
+  soundNeedsHumanApprovalEnabled = Boolean(settingsSoundNeedsHumanApprovalEl.checked);
+  writeStoredBoolean(UI_STORAGE_KEY_SOUND_NEEDS_HUMAN_APPROVAL, soundNeedsHumanApprovalEnabled);
+  if (soundNeedsHumanApprovalEnabled) {
+    void unlockNotificationAudio();
+  }
+});
 kickoffFormEl.addEventListener("submit", submitKickoff);
 kickoffStartLoopButtonEl.addEventListener("click", startKickoffLoop);
 kickoffStartRunnerLoopButtonEl.addEventListener("click", startRunnerLoop);
@@ -1258,6 +1484,9 @@ window.addEventListener("keydown", (event) => {
 background.resize();
 background.start();
 
+loadUiPreferences();
+window.addEventListener("pointerdown", handleNotificationAudioUnlockGesture, { passive: true });
+window.addEventListener("keydown", handleNotificationAudioUnlockGesture, { passive: true });
 loadConfig();
 loadStatus();
 setInterval(loadStatus, POLL_INTERVAL_MS);
