@@ -256,7 +256,7 @@ function detectReviewerNeedsHumanApprovalTransition(orchestrator) {
     }
 
     const lastRole = String(item?.last_dispatched_role ?? "").trim().toUpperCase();
-    if (lastRole && lastRole !== "REVIEWER") {
+    if (lastRole !== "REVIEWER") {
       continue;
     }
 
@@ -835,7 +835,7 @@ function renderRunner(entries) {
   runnerRunsEl.innerHTML = entries
     .map((entry) => {
       const normalizedStatus = normalizeStatus(entry.status);
-      const isRunning = Boolean(entry?.isRunning) || normalizedStatus === "RUNNING";
+      const isRunning = Boolean(entry?.isRunning);
       const isDimmed = !isRunning;
       const showBlocked = normalizedStatus === "FAILED" || normalizedStatus === "BLOCKED";
       const failureDetail = deriveRunFailureDetail(entry);
