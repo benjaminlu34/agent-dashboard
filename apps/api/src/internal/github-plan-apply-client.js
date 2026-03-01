@@ -5,10 +5,19 @@ import { readAgentSwarmTarget } from "./agent-swarm-config.js";
 
 const GITHUB_API_BASE_URL = "https://api.github.com";
 const GITHUB_GRAPHQL_URL = "https://api.github.com/graphql";
-const REQUIRED_PROJECT_FIELDS = ["Status", "Size", "Area", "Priority", "Sprint"];
+const REQUIRED_SINGLE_SELECT_FIELDS = ["Status", "Size", "Area", "Priority"];
+const REQUIRED_TEXT_FIELDS = ["DependsOn"];
+const REQUIRED_FLEX_FIELDS = ["Sprint"];
 
 function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function normalizeGraphqlDataType(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  return value.trim().toLowerCase();
 }
 
 function normalizeOwnerType(value) {
@@ -105,31 +114,67 @@ function buildOwnerNode(ownerType) {
   throw new GitHubPlanApplyError("owner_type must be user or org");
 }
 
-function buildSingleSelectFieldMap(project) {
+function buildProjectFieldMap(project) {
   const fields = {};
   const nodes = project?.fields?.nodes ?? [];
 
   for (const node of nodes) {
-    if (node?.__typename !== "ProjectV2SingleSelectField") {
+    if (!isNonEmptyString(node?.name) || !isNonEmptyString(node?.id)) {
       continue;
     }
 
-    const optionsByName = {};
-    for (const option of node.options ?? []) {
-      if (isNonEmptyString(option?.name) && isNonEmptyString(option?.id)) {
-        optionsByName[option.name] = option.id;
+    if (node.__typename === "ProjectV2SingleSelectField") {
+      const optionsByName = {};
+      for (const option of node.options ?? []) {
+        if (isNonEmptyString(option?.name) && isNonEmptyString(option?.id)) {
+          optionsByName[option.name] = option.id;
+        }
       }
+
+      fields[node.name] = {
+        field_id: node.id,
+        data_type: normalizeGraphqlDataType(node.dataType),
+        options_by_name: optionsByName,
+      };
+      continue;
     }
 
-    fields[node.name] = {
-      field_id: node.id,
-      options_by_name: optionsByName,
-    };
+    if (node.__typename === "ProjectV2Field") {
+      fields[node.name] = {
+        field_id: node.id,
+        data_type: normalizeGraphqlDataType(node.dataType),
+      };
+      continue;
+    }
   }
 
-  for (const requiredField of REQUIRED_PROJECT_FIELDS) {
-    if (!fields[requiredField]) {
+  for (const requiredField of REQUIRED_SINGLE_SELECT_FIELDS) {
+    const field = fields[requiredField];
+    if (!field) {
       throw new GitHubPlanApplyError(`required project field missing: ${requiredField}`);
+    }
+    if (field.data_type !== "single_select" || !field.options_by_name) {
+      throw new GitHubPlanApplyError(`required project field must be single_select: ${requiredField}`);
+    }
+  }
+
+  for (const requiredField of REQUIRED_TEXT_FIELDS) {
+    const field = fields[requiredField];
+    if (!field) {
+      throw new GitHubPlanApplyError(`required project field missing: ${requiredField}`);
+    }
+    if (field.data_type !== "text") {
+      throw new GitHubPlanApplyError(`required project field must be text: ${requiredField}`);
+    }
+  }
+
+  for (const requiredField of REQUIRED_FLEX_FIELDS) {
+    const field = fields[requiredField];
+    if (!field) {
+      throw new GitHubPlanApplyError(`required project field missing: ${requiredField}`);
+    }
+    if (field.data_type !== "text" && field.data_type !== "single_select") {
+      throw new GitHubPlanApplyError(`required project field must be text or single_select: ${requiredField}`);
     }
   }
 
@@ -213,9 +258,18 @@ function parseProjectItemFields(fieldValuesNodes) {
   const fields = {};
   for (const node of fieldValuesNodes ?? []) {
     const fieldName = node?.field?.name;
+    if (!isNonEmptyString(fieldName)) {
+      continue;
+    }
+
     const optionName = node?.name;
-    if (isNonEmptyString(fieldName) && isNonEmptyString(optionName)) {
+    if (isNonEmptyString(optionName)) {
       fields[fieldName] = optionName;
+      continue;
+    }
+
+    if (typeof node?.text === "string") {
+      fields[fieldName] = node.text;
     }
   }
   return fields;
@@ -223,7 +277,13 @@ function parseProjectItemFields(fieldValuesNodes) {
 
 function requireOptionId(fieldsByName, fieldName, optionName) {
   const field = fieldsByName[fieldName];
-  const optionId = field?.options_by_name?.[optionName];
+  if (!field) {
+    throw new GitHubPlanApplyError(`project field not found: ${fieldName}`);
+  }
+  if (field.data_type !== "single_select" || !field.options_by_name) {
+    throw new GitHubPlanApplyError(`project field is not single_select: ${fieldName}`);
+  }
+  const optionId = field.options_by_name[optionName];
   if (!isNonEmptyString(optionId)) {
     throw new GitHubPlanApplyError(`project option not found: ${fieldName}=${optionName}`);
   }
@@ -280,8 +340,21 @@ export async function createGitHubPlanApplyClient({
     token: githubToken,
     endpoint: graphqlEndpoint,
     query: `
-      query($ownerLogin: String!) {
+      query($ownerLogin: String!, $repoName: String!) {
         ${ownerNode}(login: $ownerLogin) {
+          repository(name: $repoName) {
+            id
+            labels(first: 100) {
+              nodes {
+                id
+                name
+              }
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
+            }
+          }
           projectsV2(first: 100) {
             nodes {
               id
@@ -290,9 +363,15 @@ export async function createGitHubPlanApplyClient({
               fields(first: 100) {
                 nodes {
                   __typename
+                  ... on ProjectV2Field {
+                    id
+                    name
+                    dataType
+                  }
                   ... on ProjectV2SingleSelectField {
                     id
                     name
+                    dataType
                     options {
                       id
                       name
@@ -305,12 +384,77 @@ export async function createGitHubPlanApplyClient({
         }
       }
     `,
-    variables: { ownerLogin },
+    variables: { ownerLogin, repoName: repositoryName },
   });
 
-  const projects = projectData?.[ownerNode]?.projectsV2?.nodes;
+  const ownerData = projectData?.[ownerNode];
+  const projects = ownerData?.projectsV2?.nodes;
   if (!Array.isArray(projects)) {
     throw new GitHubPlanApplyError("project owner not found");
+  }
+
+  const repositoryId = ownerData?.repository?.id;
+  if (!isNonEmptyString(repositoryId)) {
+    throw new GitHubPlanApplyError("repository not found for project identity");
+  }
+
+  const allLabelNodes = [];
+  const firstLabelConnection = ownerData?.repository?.labels;
+  const firstLabelNodes = firstLabelConnection?.nodes ?? [];
+  if (Array.isArray(firstLabelNodes) && firstLabelNodes.length > 0) {
+    allLabelNodes.push(...firstLabelNodes);
+  }
+
+  let labelsCursor = firstLabelConnection?.pageInfo?.hasNextPage ? firstLabelConnection.pageInfo.endCursor : null;
+
+  while (isNonEmptyString(labelsCursor)) {
+    const pageData = await requestGraphql({
+      token: githubToken,
+      endpoint: graphqlEndpoint,
+      query: `
+        query($ownerLogin: String!, $repoName: String!, $cursor: String) {
+          ${ownerNode}(login: $ownerLogin) {
+            repository(name: $repoName) {
+              labels(first: 100, after: $cursor) {
+                nodes {
+                  id
+                  name
+                }
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
+              }
+            }
+          }
+        }
+      `,
+      variables: { ownerLogin, repoName: repositoryName, cursor: labelsCursor },
+    });
+
+    const nextConnection = pageData?.[ownerNode]?.repository?.labels;
+    const nextNodes = nextConnection?.nodes ?? [];
+    if (Array.isArray(nextNodes) && nextNodes.length > 0) {
+      allLabelNodes.push(...nextNodes);
+    }
+
+    if (!nextConnection?.pageInfo?.hasNextPage) {
+      break;
+    }
+
+    labelsCursor = nextConnection.pageInfo.endCursor;
+  }
+
+  const labelIdByName = {};
+  for (const node of allLabelNodes) {
+    if (!isNonEmptyString(node?.name) || !isNonEmptyString(node?.id)) {
+      continue;
+    }
+    labelIdByName[node.name] = node.id;
+    const lower = node.name.trim().toLowerCase();
+    if (lower && !labelIdByName[lower]) {
+      labelIdByName[lower] = node.id;
+    }
   }
 
   const project = projectNumber !== null
@@ -323,37 +467,140 @@ export async function createGitHubPlanApplyClient({
     throw new GitHubPlanApplyError(`project not found: ${projectName}`);
   }
 
-  const fieldsByName = buildSingleSelectFieldMap(project);
+  const fieldsByName = buildProjectFieldMap(project);
 
-  async function updateProjectItemSingleSelectField({ projectItemId, fieldName, optionName }) {
-    const { field_id: fieldId, option_id: optionId } = requireOptionId(fieldsByName, fieldName, optionName);
+  function buildProjectItemFieldUpdateRequest({ projectItemId, values }) {
+    const entries = Object.entries(values ?? {}).sort(([left], [right]) => left.localeCompare(right));
+    if (entries.length === 0) {
+      return null;
+    }
 
-    await requestGraphql({
-      token: githubToken,
-      endpoint: graphqlEndpoint,
-      query: `
-        mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
-          updateProjectV2ItemFieldValue(
-            input: {
-              projectId: $projectId
-              itemId: $itemId
-              fieldId: $fieldId
-              value: { singleSelectOptionId: $optionId }
-            }
-          ) {
-            projectV2Item {
-              id
+    const variableFragments = ["$projectId: ID!", "$itemId: ID!"];
+    const variables = {
+      projectId: project.id,
+      itemId: projectItemId,
+    };
+
+    const mutationLines = [];
+
+    for (let index = 0; index < entries.length; index += 1) {
+      const [fieldName, value] = entries[index];
+      const field = fieldsByName[fieldName];
+      if (!field) {
+        throw new GitHubPlanApplyError(`project field not found: ${fieldName}`);
+      }
+
+      const alias = `f${index}`;
+      const fieldIdKey = `fieldId${index}`;
+      variableFragments.push(`$${fieldIdKey}: ID!`);
+      variables[fieldIdKey] = field.field_id;
+
+      if (field.data_type === "single_select") {
+        const { option_id: optionId } = requireOptionId(fieldsByName, fieldName, value);
+        const optionKey = `optionId${index}`;
+        variableFragments.push(`$${optionKey}: String!`);
+        variables[optionKey] = optionId;
+        mutationLines.push(
+          `${alias}: updateProjectV2ItemFieldValue(input:{projectId:$projectId,itemId:$itemId,fieldId:$${fieldIdKey},value:{singleSelectOptionId:$${optionKey}}}){projectV2Item{id}}`,
+        );
+        continue;
+      }
+
+      if (field.data_type === "text") {
+        if (typeof value !== "string") {
+          throw new GitHubPlanApplyError(`project text field value must be a string: ${fieldName}`);
+        }
+        const textKey = `textValue${index}`;
+        variableFragments.push(`$${textKey}: String!`);
+        variables[textKey] = value;
+        mutationLines.push(
+          `${alias}: updateProjectV2ItemFieldValue(input:{projectId:$projectId,itemId:$itemId,fieldId:$${fieldIdKey},value:{text:$${textKey}}}){projectV2Item{id}}`,
+        );
+        continue;
+      }
+
+      throw new GitHubPlanApplyError(`unsupported project field type: ${fieldName}=${field.data_type || "unknown"}`);
+    }
+
+    return {
+      query: `mutation(${variableFragments.join(",")}){${mutationLines.join("")}}`,
+      variables,
+    };
+  }
+
+  async function updateProjectItemFieldValue({ projectItemId, fieldName, value }) {
+    const field = fieldsByName[fieldName];
+    if (!field) {
+      throw new GitHubPlanApplyError(`project field not found: ${fieldName}`);
+    }
+
+    if (field.data_type === "single_select") {
+      const { field_id: fieldId, option_id: optionId } = requireOptionId(fieldsByName, fieldName, value);
+
+      await requestGraphql({
+        token: githubToken,
+        endpoint: graphqlEndpoint,
+        query: `
+          mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+            updateProjectV2ItemFieldValue(
+              input: {
+                projectId: $projectId
+                itemId: $itemId
+                fieldId: $fieldId
+                value: { singleSelectOptionId: $optionId }
+              }
+            ) {
+              projectV2Item {
+                id
+              }
             }
           }
-        }
-      `,
-      variables: {
-        projectId: project.id,
-        itemId: projectItemId,
-        fieldId,
-        optionId,
-      },
-    });
+        `,
+        variables: {
+          projectId: project.id,
+          itemId: projectItemId,
+          fieldId,
+          optionId,
+        },
+      });
+      return;
+    }
+
+    if (field.data_type === "text") {
+      if (typeof value !== "string") {
+        throw new GitHubPlanApplyError(`project text field value must be a string: ${fieldName}`);
+      }
+
+      await requestGraphql({
+        token: githubToken,
+        endpoint: graphqlEndpoint,
+        query: `
+          mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $textValue: String!) {
+            updateProjectV2ItemFieldValue(
+              input: {
+                projectId: $projectId
+                itemId: $itemId
+                fieldId: $fieldId
+                value: { text: $textValue }
+              }
+            ) {
+              projectV2Item {
+                id
+              }
+            }
+          }
+        `,
+        variables: {
+          projectId: project.id,
+          itemId: projectItemId,
+          fieldId: field.field_id,
+          textValue: value,
+        },
+      });
+      return;
+    }
+
+    throw new GitHubPlanApplyError(`unsupported project field type: ${fieldName}=${field.data_type || "unknown"}`);
   }
 
   return {
@@ -363,16 +610,59 @@ export async function createGitHubPlanApplyClient({
           throw new GitHubPlanApplyError("issue labels must be a non-empty array of strings");
         }
       }
-      const payload = await requestJson(`${restEndpoint}/repos/${ownerLogin}/${repositoryName}/issues`, {
-        method: "POST",
+      if (!isNonEmptyString(title)) {
+        throw new GitHubPlanApplyError("issue title is required");
+      }
+      if (!isNonEmptyString(body)) {
+        throw new GitHubPlanApplyError("issue body is required");
+      }
+
+      const labelIds = [];
+      for (const label of Array.isArray(labels) ? labels : []) {
+        const key = label.trim();
+        const id = labelIdByName[key] ?? labelIdByName[key.toLowerCase()];
+        if (!isNonEmptyString(id)) {
+          throw new GitHubPlanApplyError(`label not found: ${key}`);
+        }
+        if (!labelIds.includes(id)) {
+          labelIds.push(id);
+        }
+      }
+
+      const data = await requestGraphql({
         token: githubToken,
-        body: {
+        endpoint: graphqlEndpoint,
+        query: `
+          mutation($repositoryId: ID!, $title: String!, $body: String!, $labelIds: [ID!]) {
+            createIssue(input: { repositoryId: $repositoryId, title: $title, body: $body, labelIds: $labelIds }) {
+              issue {
+                id
+                number
+                url
+              }
+            }
+          }
+        `,
+        variables: {
+          repositoryId,
           title,
           body,
-          ...(Array.isArray(labels) ? { labels } : {}),
+          labelIds,
         },
       });
-      return parseIssueResult(payload);
+
+      const issue = data?.createIssue?.issue;
+      const issueNumber = issue?.number;
+      const issueUrl = issue?.url;
+      const issueNodeId = issue?.id;
+      if (!Number.isInteger(issueNumber) || !isNonEmptyString(issueUrl) || !isNonEmptyString(issueNodeId)) {
+        throw new GitHubPlanApplyError("unexpected GitHub createIssue response");
+      }
+      return {
+        issue_number: issueNumber,
+        issue_url: issueUrl,
+        issue_node_id: issueNodeId,
+      };
     },
 
     async updateIssue({ issueNumber, body }) {
@@ -455,17 +745,21 @@ export async function createGitHubPlanApplyClient({
     },
 
     async setProjectFields({ projectItemId, values }) {
-      for (const [fieldName, optionName] of Object.entries(values)) {
-        await updateProjectItemSingleSelectField({ projectItemId, fieldName, optionName });
+      const request = buildProjectItemFieldUpdateRequest({ projectItemId, values });
+      if (!request) {
+        return;
       }
+
+      await requestGraphql({
+        token: githubToken,
+        endpoint: graphqlEndpoint,
+        query: request.query,
+        variables: request.variables,
+      });
     },
 
     async updateProjectItemField({ projectItemId, field, value }) {
-      await updateProjectItemSingleSelectField({
-        projectItemId,
-        fieldName: field,
-        optionName: value,
-      });
+      await updateProjectItemFieldValue({ projectItemId, fieldName: field, value });
     },
 
     async getProjectItemFieldValue({ projectItemId, field }) {
@@ -480,6 +774,9 @@ export async function createGitHubPlanApplyClient({
                   ... on ProjectV2ItemFieldSingleSelectValue {
                     name
                   }
+                  ... on ProjectV2ItemFieldTextValue {
+                    text
+                  }
                 }
               }
             }
@@ -491,8 +788,12 @@ export async function createGitHubPlanApplyClient({
         },
       });
 
-      const fieldName = data?.node?.fieldValueByName?.name;
-      return isNonEmptyString(fieldName) ? fieldName : "";
+      const value = data?.node?.fieldValueByName;
+      const singleSelect = value?.name;
+      if (isNonEmptyString(singleSelect)) {
+        return singleSelect;
+      }
+      return typeof value?.text === "string" ? value.text : "";
     },
 
     async listProjectItems() {
@@ -533,6 +834,14 @@ export async function createGitHubPlanApplyClient({
                             name
                             field {
                               ... on ProjectV2SingleSelectField {
+                                name
+                              }
+                            }
+                          }
+                          ... on ProjectV2ItemFieldTextValue {
+                            text
+                            field {
+                              ... on ProjectV2Field {
                                 name
                               }
                             }

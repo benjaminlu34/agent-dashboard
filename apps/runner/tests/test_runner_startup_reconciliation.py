@@ -1,9 +1,13 @@
+import contextlib
+import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from apps.runner.runner import Runner
+from apps.runner.runner import Runner, _drift_defense_or_exit, _phase_guard_or_exit
 
 
 class _BackendStub:
@@ -36,6 +40,47 @@ def _build_runner(*, backend, state_path: str, dry_run: bool = False) -> Runner:
 
 
 class RunnerStartupReconciliationTests(unittest.TestCase):
+    def test_phase_guard_exits_when_pending_verification_and_poll_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = f"{tmp_dir}/orchestrator-state.json"
+            Path(state_path).write_text(
+                json.dumps({"sprint_phase": "PENDING_VERIFICATION"}),
+                encoding="utf-8",
+            )
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                with patch.dict(os.environ, {"RUNNER_VERIFY_POLL_SECONDS": "0"}, clear=False):
+                    with patch("apps.runner.runner.sys.exit") as exit_mock:
+                        _phase_guard_or_exit(orchestrator_state_path=state_path)
+
+            exit_mock.assert_called_once_with(2)
+            self.assertIn("Sprint pending verification. Awaiting seal.", stderr.getvalue())
+
+    def test_drift_defense_exits_on_plan_version_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            plan_path = f"{tmp_dir}/runner-sprint-plan.json"
+            ledger_path = f"{tmp_dir}/runner-ledger.json"
+            Path(plan_path).write_text(
+                json.dumps({"plan_version": "2026-02-28T00:00:00.000Z"}),
+                encoding="utf-8",
+            )
+            Path(ledger_path).write_text(
+                json.dumps({"plan_version": "2026-02-28T00:00:01.000Z"}),
+                encoding="utf-8",
+            )
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                with patch("apps.runner.runner.sys.exit") as exit_mock:
+                    _drift_defense_or_exit(sprint_plan_path=plan_path, ledger_path=ledger_path)
+
+            exit_mock.assert_called_once_with(2)
+            self.assertIn(
+                "Ledger/Plan version mismatch. Sprint was re-sealed or state is corrupted.",
+                stderr.getvalue(),
+            )
+
     def test_reconcile_startup_state_rehydrates_items_and_clears_dispatch_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             state_path = f"{tmp_dir}/orchestrator-state.json"

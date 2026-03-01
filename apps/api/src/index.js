@@ -6,6 +6,7 @@ import fastifyStatic from "@fastify/static";
 import { registerInternalPreflightRoute } from "./routes/internal-preflight.js";
 import { registerInternalRunRoute } from "./routes/internal-run.js";
 import { registerInternalPlanApplyRoute } from "./routes/internal-plan-apply.js";
+import { registerInternalSprintSealRoute } from "./routes/internal-sprint-seal.js";
 import { registerInternalProjectItemUpdateFieldRoute } from "./routes/internal-project-item-update-field.js";
 import { registerInternalAgentContextRoute } from "./routes/internal-agent-context.js";
 import { registerInternalExecutorClaimReadyItemRoute } from "./routes/internal-executor-claim-ready-item.js";
@@ -26,6 +27,7 @@ export async function buildApp({ repoRoot = DEFAULT_REPO_ROOT, logger = true } =
   await registerInternalPreflightRoute(app, routeOptions);
   await registerInternalRunRoute(app, routeOptions);
   await registerInternalPlanApplyRoute(app, routeOptions);
+  await registerInternalSprintSealRoute(app, routeOptions);
   await registerInternalProjectItemUpdateFieldRoute(app, routeOptions);
   await registerInternalAgentContextRoute(app, routeOptions);
   await registerInternalExecutorClaimReadyItemRoute(app, routeOptions);

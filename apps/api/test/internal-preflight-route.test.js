@@ -67,8 +67,11 @@ async function writeBundleFiles(repoRoot) {
           },
           {
             name: "Sprint",
-            type: "single_select",
-            allowed_options: ["M1", "M2", "M3", "M4"],
+            type: "text",
+          },
+          {
+            name: "DependsOn",
+            type: "text",
           },
         ],
       },
@@ -107,8 +110,13 @@ function buildMatchingProjectSchema() {
       },
       {
         name: "Sprint",
-        type: "single_select",
-        options: ["M1", "M2", "M3", "M4"],
+        type: "text",
+        options: [],
+      },
+      {
+        name: "DependsOn",
+        type: "text",
+        options: [],
       },
     ],
   };
@@ -270,8 +278,13 @@ test("GET /internal/preflight returns PASS when Status options match as a set wi
         },
         {
           name: "Sprint",
-          type: "single_select",
-          options: ["M4", "M3", "M2", "M1"],
+          type: "text",
+          options: [],
+        },
+        {
+          name: "DependsOn",
+          type: "text",
+          options: [],
         },
       ],
     }),

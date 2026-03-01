@@ -234,12 +234,12 @@ def _empty_orchestrator_state() -> Dict[str, Any]:
     }
 
 
-def _load_orchestrator_state_for_reconciliation(path: str) -> Dict[str, Any]:
+def _load_orchestrator_state_file(path: str) -> Dict[str, Any]:
     state_path = Path(path)
     try:
         raw = state_path.read_text(encoding="utf8")
     except FileNotFoundError:
-        return _empty_orchestrator_state()
+        return {}
 
     try:
         parsed = json.loads(raw)
@@ -259,7 +259,7 @@ def _load_orchestrator_state_for_reconciliation(path: str) -> Dict[str, Any]:
                 "error": "state file contains invalid JSON",
             }
         )
-        return _empty_orchestrator_state()
+        return {}
 
     if not isinstance(parsed, dict):
         backup_path = f"{path}.corrupt-{int(time.time() * 1000)}"
@@ -277,17 +277,143 @@ def _load_orchestrator_state_for_reconciliation(path: str) -> Dict[str, Any]:
                 "error": "state file must be a JSON object",
             }
         )
-        return _empty_orchestrator_state()
+        return {}
+
+    return parsed
+
+
+def _load_orchestrator_state_for_reconciliation(path: str) -> Dict[str, Any]:
+    parsed = _load_orchestrator_state_file(path)
+    if not parsed:
+        parsed = _empty_orchestrator_state()
 
     items = parsed.get("items")
     sprint_plan = parsed.get("sprint_plan")
     ownership_index = parsed.get("ownership_index")
-    return {
-        "poll_count": parsed.get("poll_count") if isinstance(parsed.get("poll_count"), int) and parsed.get("poll_count") >= 0 else 0,
-        "items": items if isinstance(items, dict) else {},
-        "sprint_plan": sprint_plan if isinstance(sprint_plan, dict) else {},
-        "ownership_index": ownership_index if isinstance(ownership_index, dict) else {},
-    }
+
+    next_state: Dict[str, Any] = dict(parsed)
+    next_state["poll_count"] = parsed.get("poll_count") if isinstance(parsed.get("poll_count"), int) and parsed.get("poll_count") >= 0 else 0
+    next_state["items"] = items if isinstance(items, dict) else {}
+    next_state["sprint_plan"] = sprint_plan if isinstance(sprint_plan, dict) else {}
+    next_state["ownership_index"] = ownership_index if isinstance(ownership_index, dict) else {}
+    return next_state
+
+
+def _parse_int_env(name: str, default: int = 0) -> int:
+    raw = os.environ.get(name, "")
+    if not isinstance(raw, str):
+        return default
+    stripped = raw.strip()
+    if not stripped:
+        return default
+    try:
+        return int(stripped)
+    except ValueError:
+        _log_stderr(
+            {
+                "type": "CONFIG_ERROR",
+                "error": f"{name} must be an integer",
+                "value": raw,
+            }
+        )
+        return default
+
+
+def _phase_guard_or_exit(*, orchestrator_state_path: str) -> None:
+    def _read_phase() -> str:
+        state = _load_orchestrator_state_file(orchestrator_state_path)
+        value = state.get("sprint_phase")
+        if not isinstance(value, str):
+            return ""
+        return value.strip().upper()
+
+    phase = _read_phase()
+    if phase == "ACTIVE":
+        return
+
+    if phase != "PENDING_VERIFICATION":
+        _log_stderr(
+            {
+                "type": "FATAL",
+                "error": "Unknown or missing sprint_phase. Runner requires a sealed sprint.",
+                "sprint_phase": phase,
+                "path": orchestrator_state_path,
+            }
+        )
+        sys.exit(2)
+        return
+
+    _log_stderr({"type": "RUNNER_PHASE_GUARD", "message": "Sprint pending verification. Awaiting seal."})
+
+    poll_seconds = _parse_int_env("RUNNER_VERIFY_POLL_SECONDS", 0)
+    if poll_seconds <= 0:
+        sys.exit(2)
+        return
+
+    while True:
+        time.sleep(poll_seconds)
+        phase = _read_phase()
+        if phase == "ACTIVE":
+            return
+        if phase != "PENDING_VERIFICATION":
+            _log_stderr(
+                {
+                    "type": "FATAL",
+                    "error": "Unexpected sprint_phase while awaiting seal.",
+                    "sprint_phase": phase,
+                    "path": orchestrator_state_path,
+                }
+            )
+            sys.exit(2)
+            return
+
+
+def _drift_defense_or_exit(*, sprint_plan_path: str, ledger_path: str) -> None:
+    try:
+        sprint_plan = _load_json_file(sprint_plan_path) or {}
+    except Exception as exc:
+        _log_stderr(
+            {
+                "type": "FATAL",
+                "error": "Ledger/Plan version mismatch. Sprint was re-sealed or state is corrupted.",
+                "reason": "failed_to_load_sprint_plan",
+                "path": sprint_plan_path,
+                "details": str(exc),
+            }
+        )
+        sys.exit(2)
+        return
+
+    try:
+        ledger = _load_json_file(ledger_path) or {}
+    except Exception as exc:
+        _log_stderr(
+            {
+                "type": "FATAL",
+                "error": "Ledger/Plan version mismatch. Sprint was re-sealed or state is corrupted.",
+                "reason": "failed_to_load_ledger",
+                "path": ledger_path,
+                "details": str(exc),
+            }
+        )
+        sys.exit(2)
+        return
+
+    plan_version = str(sprint_plan.get("plan_version") or "").strip()
+    ledger_version = str(ledger.get("plan_version") or "").strip()
+    if not plan_version or not ledger_version or ledger_version != plan_version:
+        _log_stderr(
+            {
+                "type": "FATAL",
+                "error": "Ledger/Plan version mismatch. Sprint was re-sealed or state is corrupted.",
+                "plan_version": plan_version,
+                "ledger_version": ledger_version,
+                "sprint_plan_path": sprint_plan_path,
+                "ledger_path": ledger_path,
+            }
+        )
+        sys.exit(2)
+        return
 
 
 def _priority_rank(priority: str) -> int:
@@ -1180,12 +1306,11 @@ class Runner:
                 "in_review_origin": in_review_origin if status == "In Review" else "",
             }
 
-        next_state = {
-            "poll_count": poll_count,
-            "items": next_items,
-            "sprint_plan": local_state.get("sprint_plan") if isinstance(local_state.get("sprint_plan"), dict) else {},
-            "ownership_index": local_state.get("ownership_index") if isinstance(local_state.get("ownership_index"), dict) else {},
-        }
+        next_state: Dict[str, Any] = dict(local_state) if isinstance(local_state, dict) else {}
+        next_state["poll_count"] = poll_count
+        next_state["items"] = next_items
+        next_state["sprint_plan"] = local_state.get("sprint_plan") if isinstance(local_state.get("sprint_plan"), dict) else {}
+        next_state["ownership_index"] = local_state.get("ownership_index") if isinstance(local_state.get("ownership_index"), dict) else {}
         pruned_items = len([project_item_id for project_item_id in local_items.keys() if project_item_id not in next_items])
         changed = local_state != next_state
 
@@ -1673,6 +1798,14 @@ class Runner:
         if not isinstance(stalled_entries, list):
             return
 
+        now_iso = _utc_now_iso()
+        stall_minutes = _parse_int_env("ORCHESTRATOR_STALL_MINUTES", 120)
+        if stall_minutes <= 0:
+            stall_minutes = 120
+
+        state_root = self._read_orchestrator_state()
+        sealed_at = _normalize_iso(state_root.get("sealed_at"))
+
         for entry in stalled_entries:
             if not isinstance(entry, dict):
                 continue
@@ -1693,6 +1826,20 @@ class Runner:
             if state_item.get("last_seen_status") != "In Progress":
                 continue
 
+            last_activity_at = ""
+            if self._ledger:
+                getter = getattr(self._ledger, "get_task_last_activity", None)
+                if callable(getter):
+                    try:
+                        last_activity_at = str(getter(project_item_id) or "")
+                    except Exception:
+                        last_activity_at = ""
+
+            baseline_at = _normalize_iso(last_activity_at) or sealed_at
+            effective_stuck_minutes = _minutes_since(baseline_at, now_iso=now_iso) if baseline_at else stuck_minutes
+            if effective_stuck_minutes < stall_minutes:
+                continue
+
             run_id = str(state_item.get("last_run_id") or "").strip()
             if self._ledger and run_id:
                 ledger_entry = self._ledger.get(run_id)
@@ -1706,8 +1853,8 @@ class Runner:
                     issue_number=issue_number,
                     project_item_id=project_item_id,
                     run_id=run_id,
-                    stuck_minutes=stuck_minutes,
-                    status_since_at=status_since_at,
+                    stuck_minutes=effective_stuck_minutes,
+                    status_since_at=baseline_at or status_since_at,
                 )
                 _log_stderr(
                     {
@@ -1715,8 +1862,11 @@ class Runner:
                         "issue_number": issue_number,
                         "project_item_id": project_item_id,
                         "run_id": run_id,
-                        "stuck_minutes": stuck_minutes,
-                        "status_since_at": status_since_at,
+                        "stuck_minutes": effective_stuck_minutes,
+                        "status_since_at": baseline_at or status_since_at,
+                        "stall_minutes": stall_minutes,
+                        "baseline_last_activity_at": _normalize_iso(last_activity_at),
+                        "baseline_sealed_at": sealed_at,
                         "backend_payload": payload,
                     }
                 )
@@ -2229,6 +2379,7 @@ class Runner:
             return
 
         issue_number = self._resolve_issue_number_for_intent(intent)
+        task_project_item_id = self._resolve_project_item_id_for_issue(issue_number) if issue_number > 0 else ""
         started_at = time.time()
         heartbeat_stop = threading.Event()
 
@@ -2266,6 +2417,13 @@ class Runner:
                     )
                 )
             self._ledger.mark_running(intent.run_id)
+            if task_project_item_id:
+                toucher = getattr(self._ledger, "touch_task_last_activity", None)
+                if callable(toucher):
+                    try:
+                        toucher(task_project_item_id, at_iso=_utc_now_iso())
+                    except Exception:
+                        pass
 
         self._reserve_issue_slot(issue_number=issue_number, run_id=intent.run_id, role=intent.role)
         slot_released = False
@@ -2386,6 +2544,13 @@ class Runner:
                         "last_executor_response_at": None,
                     },
                 )
+                if task_project_item_id:
+                    toucher = getattr(self._ledger, "touch_task_last_activity", None)
+                    if callable(toucher):
+                        try:
+                            toucher(task_project_item_id, at_iso=_utc_now_iso())
+                        except Exception:
+                            pass
             release_issue_slot_once()
             raise
         finally:
@@ -2490,6 +2655,13 @@ class Runner:
                         "error_code": str(error_code or ""),
                     },
                 )
+                if task_project_item_id:
+                    toucher = getattr(self._ledger, "touch_task_last_activity", None)
+                    if callable(toucher):
+                        try:
+                            toucher(task_project_item_id, at_iso=completed_at)
+                        except Exception:
+                            pass
             if intent.role == "EXECUTOR" and result.status != "succeeded":
                 self._transition_executor_failure_to_blocked(
                     run_id=intent.run_id,
@@ -2543,6 +2715,13 @@ class Runner:
                         "last_executor_response_at": None,
                     },
                 )
+                if task_project_item_id:
+                    toucher = getattr(self._ledger, "touch_task_last_activity", None)
+                    if callable(toucher):
+                        try:
+                            toucher(task_project_item_id, at_iso=_utc_now_iso())
+                        except Exception:
+                            pass
             if intent.role == "EXECUTOR":
                 self._transition_executor_failure_to_blocked(
                     run_id=intent.run_id,
@@ -3027,8 +3206,7 @@ def _apply_kickoff_plan(
         "sprint_plan": sprint_scope_plan,
         "ownership_index": ownership_index,
     }
-    _atomic_write_json(sprint_plan_path, plan_cache)
-    _log_stderr({"type": "SPRINT_PLAN_SAVED", "path": sprint_plan_path, "sprint": plan_cache.get("sprint")})
+    _log_stderr({"type": "SPRINT_PLAN_COMPUTED", "sprint": plan_cache.get("sprint"), "task_count": len(tasks_plan)})
 
     promoted: List[Dict[str, Any]] = []
     scope_plan = _extract_scope_plan(plan_cache)
@@ -3198,32 +3376,94 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     backend = BackendClient(base_url=config.backend_base_url, timeout_s=config.backend_timeout_s)
 
-    # Preflight gate.
-    try:
-        preflight = backend.preflight_orchestrator()
-    except HttpError as exc:
-        classification = classify_failure(exc)
-        _log_stderr(
-            {
-                "type": classification,
-                "reason": "backend_preflight_failed",
-                "error": str(exc),
-                "code": exc.code,
-                "status_code": exc.status_code,
-                "payload": exc.payload,
-            }
-        )
-        return exit_code_for_classification(classification)
+    repo_root_path = Path(repo_root)
+    orchestrator_state_path = str((repo_root_path / config.orchestrator_state_path).resolve())
+    sprint_plan_path = str((repo_root_path / config.sprint_plan_path).resolve())
+    configured_ledger_path = str((repo_root_path / config.ledger_path).resolve())
+    default_ledger_path = str((repo_root_path / ".runner-ledger.json").resolve())
 
-    if preflight.get("status") != "PASS":
-        _log_stderr({"type": "HARD_STOP", "reason": "preflight_fail", "payload": preflight})
-        return 2
+    def _run_preflight_or_exit() -> int:
+        try:
+            preflight = backend.preflight_orchestrator()
+        except HttpError as exc:
+            classification = classify_failure(exc)
+            _log_stderr(
+                {
+                    "type": classification,
+                    "reason": "backend_preflight_failed",
+                    "error": str(exc),
+                    "code": exc.code,
+                    "status_code": exc.status_code,
+                    "payload": exc.payload,
+                }
+            )
+            return exit_code_for_classification(classification)
+
+        if preflight.get("status") != "PASS":
+            _log_stderr({"type": "HARD_STOP", "reason": "preflight_fail", "payload": preflight})
+            return 2
+        return 0
+
+    def _select_sealed_ledger_path() -> str:
+        candidates: list[str] = []
+        for path in (configured_ledger_path, default_ledger_path):
+            if path not in candidates:
+                candidates.append(path)
+
+        plan_version = ""
+        try:
+            sprint_plan = _load_json_file(sprint_plan_path) or {}
+            if isinstance(sprint_plan, dict):
+                plan_version = str(sprint_plan.get("plan_version") or "").strip()
+        except Exception:
+            plan_version = ""
+
+        if plan_version:
+            for candidate in candidates:
+                if not Path(candidate).exists():
+                    continue
+                try:
+                    payload = _load_json_file(candidate) or {}
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                candidate_version = str(payload.get("plan_version") or "").strip()
+                if candidate_version and candidate_version == plan_version:
+                    if candidate != configured_ledger_path:
+                        _log_stderr(
+                            {
+                                "type": "LEDGER_PATH_OVERRIDE",
+                                "configured": configured_ledger_path,
+                                "selected": candidate,
+                                "reason": "matching_plan_version",
+                            }
+                        )
+                    return candidate
+
+        if Path(default_ledger_path).exists() and not Path(configured_ledger_path).exists():
+            if default_ledger_path != configured_ledger_path:
+                _log_stderr(
+                    {
+                        "type": "LEDGER_PATH_OVERRIDE",
+                        "configured": configured_ledger_path,
+                        "selected": default_ledger_path,
+                        "reason": "default_sealed_ledger_detected",
+                    }
+                )
+            return default_ledger_path
+
+        return configured_ledger_path
 
     ledger: Optional[RunLedger] = None
-    if not config.dry_run:
-        ledger = RunLedger(config.ledger_path)
 
     if args.kickoff:
+        preflight_status = _run_preflight_or_exit()
+        if preflight_status != 0:
+            return preflight_status
+        if not config.dry_run:
+            ledger = RunLedger(configured_ledger_path)
+
         kickoff_run_id = f"kickoff-{uuid4()}"
         if ledger:
             ledger.upsert(
@@ -3289,6 +3529,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             kickoff_plan = validate_kickoff_plan(kickoff_raw, sprint=sprint, ready_limit=ready_limit)
             draft = kickoff_plan_to_plan_apply_draft(kickoff_plan)
+            draft["require_verification"] = _parse_int_env("KICKOFF_REQUIRE_VERIFICATION", 0) > 0
             _log_stderr({"type": "KICKOFF_PLAN", "plan": kickoff_plan})
             _log_stderr({"type": "KICKOFF_DRAFT", "draft": draft})
 
@@ -3298,10 +3539,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                     plan=kickoff_plan,
                     draft=draft,
                     dry_run=config.dry_run,
-                    sprint_plan_path=config.sprint_plan_path,
+                    sprint_plan_path=sprint_plan_path,
                     ready_target=ready_limit,
                     sanitization_regen_attempts=config.orchestrator_sanitization_regen_attempts,
-                    orchestrator_state_path=config.orchestrator_state_path,
+                    orchestrator_state_path=orchestrator_state_path,
                 )
             except HttpError as exc:
                 # Treat any kickoff write failure as hard stop (including 409 preflight/policy failures).
@@ -3374,6 +3615,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         # In kickoff mode, we only run the scheduler if explicitly requested.
         if not (args.once or args.loop):
             return 0
+        # Discard any kickoff ledger handle; sealed sprint ledger is loaded after verification.
+        ledger = None
+
+    _phase_guard_or_exit(orchestrator_state_path=orchestrator_state_path)
+    sealed_ledger_path = _select_sealed_ledger_path()
+    _drift_defense_or_exit(sprint_plan_path=sprint_plan_path, ledger_path=sealed_ledger_path)
+
+    preflight_status = _run_preflight_or_exit()
+    if preflight_status != 0:
+        return preflight_status
+
+    if not config.dry_run:
+        ledger = RunLedger(sealed_ledger_path)
 
     if not config.dry_run:
         try:
@@ -3389,7 +3643,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         codex_bin=config.codex_bin,
         codex_mcp_args=config.codex_mcp_args,
         codex_tools_call_timeout_s=config.codex_tools_call_timeout_s,
-        orchestrator_state_path=config.orchestrator_state_path,
+        orchestrator_state_path=orchestrator_state_path,
         review_stall_polls=config.review_stall_polls,
         blocked_retry_minutes=config.blocked_retry_minutes,
         watchdog_timeout_s=config.watchdog_timeout_s,
@@ -3423,7 +3677,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     orchestrator_env = dict(os.environ)
     orchestrator_env["ORCHESTRATOR_SPRINT"] = config.orchestrator_sprint
     orchestrator_env["ORCHESTRATOR_BACKEND_BASE_URL"] = config.backend_base_url
-    orchestrator_env["ORCHESTRATOR_STATE_PATH"] = config.orchestrator_state_path
+    orchestrator_env["ORCHESTRATOR_STATE_PATH"] = orchestrator_state_path
     # By default, keep orchestrator emission aligned with runner concurrency.
     orchestrator_env.setdefault("ORCHESTRATOR_MAX_EXECUTORS", str(config.runner_max_executors))
     orchestrator_env.setdefault("ORCHESTRATOR_MAX_REVIEWERS", str(config.runner_max_reviewers))
@@ -3449,11 +3703,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     sprint_plan: Optional[Dict[str, Any]] = None
     if config.autopromote:
         try:
-            sprint_plan = _load_json_file(config.sprint_plan_path)
+            sprint_plan = _load_json_file(sprint_plan_path)
             if sprint_plan and sprint_plan.get("sprint") != config.orchestrator_sprint:
                 sprint_plan = None
         except Exception as exc:
-            _log_stderr({"type": "HARD_STOP", "reason": "sprint_plan_invalid", "error": str(exc), "path": config.sprint_plan_path})
+            _log_stderr({"type": "HARD_STOP", "reason": "sprint_plan_invalid", "error": str(exc), "path": sprint_plan_path})
             return 2
 
     orchestrator_loop_run_id = f"orchestrator-loop-{uuid4()}"
@@ -3610,7 +3864,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                                     dry_run=config.dry_run,
                                     ready_target=config.runner_ready_buffer,
                                     sanitization_regen_attempts=config.orchestrator_sanitization_regen_attempts,
-                                    orchestrator_state_path=config.orchestrator_state_path,
+                                    orchestrator_state_path=orchestrator_state_path,
                                 )
                         except SanitizationRegenHandoffRequestedError as exc:
                             _mark_orchestrator_loop_result(

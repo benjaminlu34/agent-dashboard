@@ -84,12 +84,30 @@ class RunnerCliModeTests(unittest.TestCase):
             captured["env"] = dict(env)
             return _ProcStub()
 
-        with patch.dict(os.environ, {"BACKEND_BASE_URL": "http://localhost:4000"}, clear=True):
-            with patch("apps.runner.runner.BackendClient", _BackendStub):
-                with patch("apps.runner.runner._spawn_orchestrator", _spawn):
-                    stderr = io.StringIO()
-                    with contextlib.redirect_stderr(stderr):
-                        exit_code = runner.main(["--loop", "--dry-run", "--sprint", "M1"])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = f"{tmp_dir}/orchestrator-state.json"
+            plan_path = f"{tmp_dir}/runner-sprint-plan.json"
+            ledger_path = f"{tmp_dir}/runner-ledger.json"
+            plan_version = "2026-02-28T00:00:00.000Z"
+            with open(state_path, "w", encoding="utf-8") as handle:
+                json.dump({"sprint_phase": "ACTIVE", "sealed_at": plan_version, "poll_count": 0, "items": {}}, handle)
+            with open(plan_path, "w", encoding="utf-8") as handle:
+                json.dump({"sprint": "M1", "plan_version": plan_version, "tasks": []}, handle)
+            with open(ledger_path, "w", encoding="utf-8") as handle:
+                json.dump({"plan_version": plan_version, "runs": {}, "tasks": {}}, handle)
+
+            env = {
+                "BACKEND_BASE_URL": "http://localhost:4000",
+                "ORCHESTRATOR_STATE_PATH": state_path,
+                "RUNNER_SPRINT_PLAN_PATH": plan_path,
+                "RUNNER_LEDGER_PATH": ledger_path,
+            }
+            with patch.dict(os.environ, env, clear=True):
+                with patch("apps.runner.runner.BackendClient", _BackendStub):
+                    with patch("apps.runner.runner._spawn_orchestrator", _spawn):
+                        stderr = io.StringIO()
+                        with contextlib.redirect_stderr(stderr):
+                            exit_code = runner.main(["--loop", "--dry-run", "--sprint", "M1"])
 
         self.assertEqual(exit_code, 0)
         self.assertIsNotNone(captured["env"])
@@ -109,10 +127,28 @@ class RunnerCliModeTests(unittest.TestCase):
             captured["proc"] = proc
             return proc
 
-        with patch.dict(os.environ, {"BACKEND_BASE_URL": "http://localhost:4000"}, clear=True):
-            with patch("apps.runner.runner.BackendClient", _BackendStub):
-                with patch("apps.runner.runner._spawn_orchestrator", _spawn):
-                    exit_code = runner.main(["--loop", "--dry-run", "--sprint", "M1"])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = f"{tmp_dir}/orchestrator-state.json"
+            plan_path = f"{tmp_dir}/runner-sprint-plan.json"
+            ledger_path = f"{tmp_dir}/runner-ledger.json"
+            plan_version = "2026-02-28T00:00:00.000Z"
+            with open(state_path, "w", encoding="utf-8") as handle:
+                json.dump({"sprint_phase": "ACTIVE", "sealed_at": plan_version, "poll_count": 0, "items": {}}, handle)
+            with open(plan_path, "w", encoding="utf-8") as handle:
+                json.dump({"sprint": "M1", "plan_version": plan_version, "tasks": []}, handle)
+            with open(ledger_path, "w", encoding="utf-8") as handle:
+                json.dump({"plan_version": plan_version, "runs": {}, "tasks": {}}, handle)
+
+            env = {
+                "BACKEND_BASE_URL": "http://localhost:4000",
+                "ORCHESTRATOR_STATE_PATH": state_path,
+                "RUNNER_SPRINT_PLAN_PATH": plan_path,
+                "RUNNER_LEDGER_PATH": ledger_path,
+            }
+            with patch.dict(os.environ, env, clear=True):
+                with patch("apps.runner.runner.BackendClient", _BackendStub):
+                    with patch("apps.runner.runner._spawn_orchestrator", _spawn):
+                        exit_code = runner.main(["--loop", "--dry-run", "--sprint", "M1"])
 
         self.assertEqual(exit_code, 0)
         proc = captured.get("proc")
@@ -266,8 +302,9 @@ class RunnerCliModeTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             with open(ledger_path, "r", encoding="utf-8") as handle:
                 ledger_payload = json.load(handle)
-            self.assertEqual(len(ledger_payload), 1)
-            entry = next(iter(ledger_payload.values()))
+            self.assertIn("runs", ledger_payload)
+            self.assertEqual(len(ledger_payload["runs"]), 1)
+            entry = next(iter(ledger_payload["runs"].values()))
             self.assertEqual(entry.get("role"), "ORCHESTRATOR")
             self.assertEqual(entry.get("status"), "succeeded")
             self.assertTrue(str(entry.get("run_id", "")).startswith("kickoff-"))
@@ -281,6 +318,7 @@ class RunnerCliModeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             ledger_path = f"{tmp_dir}/runner-ledger.json"
             orchestrator_state_path = f"{tmp_dir}/orchestrator-state.json"
+            plan_version = "2026-02-28T00:00:00.000Z"
             config = SimpleNamespace(
                 backend_base_url="http://localhost:4000",
                 backend_timeout_s=120.0,
@@ -304,6 +342,13 @@ class RunnerCliModeTests(unittest.TestCase):
                 autopromote=True,
             )
             transcript_run_ids = []
+
+            with open(orchestrator_state_path, "w", encoding="utf-8") as handle:
+                json.dump({"sprint_phase": "ACTIVE", "sealed_at": plan_version, "poll_count": 0, "items": {}}, handle)
+            with open(config.sprint_plan_path, "w", encoding="utf-8") as handle:
+                json.dump({"sprint": "M1", "plan_version": plan_version, "tasks": []}, handle)
+            with open(ledger_path, "w", encoding="utf-8") as handle:
+                json.dump({"plan_version": plan_version, "runs": {}, "tasks": {}}, handle)
 
             class _TranscriptStub:
                 def __init__(self, *, repo_root: str, run_id: str, **_kwargs: object) -> None:
@@ -332,8 +377,9 @@ class RunnerCliModeTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             with open(ledger_path, "r", encoding="utf-8") as handle:
                 ledger_payload = json.load(handle)
-            self.assertEqual(len(ledger_payload), 1)
-            entry = next(iter(ledger_payload.values()))
+            self.assertIn("runs", ledger_payload)
+            self.assertEqual(len(ledger_payload["runs"]), 1)
+            entry = next(iter(ledger_payload["runs"].values()))
             self.assertEqual(entry.get("role"), "ORCHESTRATOR")
             self.assertEqual(entry.get("status"), "succeeded")
             run_id = str(entry.get("run_id", ""))
@@ -344,6 +390,7 @@ class RunnerCliModeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             ledger_path = f"{tmp_dir}/runner-ledger.json"
             orchestrator_state_path = f"{tmp_dir}/orchestrator-state.json"
+            plan_version = "2026-02-28T00:00:00.000Z"
             config = SimpleNamespace(
                 backend_base_url="http://localhost:4000",
                 backend_timeout_s=120.0,
@@ -376,6 +423,13 @@ class RunnerCliModeTests(unittest.TestCase):
                 "needs_attention": {"stalled_in_progress": [], "in_review_churn": []},
                 "skipped": {},
             }
+
+            with open(orchestrator_state_path, "w", encoding="utf-8") as handle:
+                json.dump({"sprint_phase": "ACTIVE", "sealed_at": plan_version, "poll_count": 0, "items": {}}, handle)
+            with open(config.sprint_plan_path, "w", encoding="utf-8") as handle:
+                json.dump({"sprint": "M1", "plan_version": plan_version, "tasks": []}, handle)
+            with open(ledger_path, "w", encoding="utf-8") as handle:
+                json.dump({"plan_version": plan_version, "runs": {}, "tasks": {}}, handle)
 
             class _TranscriptStub:
                 def __init__(self, *, repo_root: str, run_id: str, **_kwargs: object) -> None:

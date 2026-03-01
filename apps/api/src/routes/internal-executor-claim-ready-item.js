@@ -82,7 +82,20 @@ function validateSprint({ sprint, projectSchema }) {
   const sprintField = Array.isArray(projectSchema?.required_fields)
     ? projectSchema.required_fields.find((field) => field?.name === "Sprint")
     : null;
+
+  const sprintType = typeof sprintField?.type === "string" ? sprintField.type.trim().toLowerCase() : "";
+  if (sprintType === "text") {
+    return { ok: true };
+  }
+
+  if (sprintType !== "single_select") {
+    return { error: "Sprint field type is not supported by project schema policy" };
+  }
+
   const allowedOptions = Array.isArray(sprintField?.allowed_options) ? sprintField.allowed_options : [];
+  if (allowedOptions.length === 0) {
+    return { error: "project schema policy missing Sprint.allowed_options" };
+  }
   if (!allowedOptions.includes(sprint)) {
     return { error: "body.sprint is not allowed by project schema policy" };
   }

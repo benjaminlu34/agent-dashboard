@@ -155,8 +155,11 @@ async function markRunningLedgerEntriesStopped({ repoRoot, env = process.env, re
   }
 
   const nowIso = new Date().toISOString();
+  const runsRoot =
+    parsed.runs && typeof parsed.runs === "object" && !Array.isArray(parsed.runs) ? parsed.runs : null;
+  const entries = runsRoot ? Object.values(runsRoot) : Object.values(parsed);
   let updated = 0;
-  for (const entry of Object.values(parsed)) {
+  for (const entry of entries) {
     if (!entry || typeof entry !== "object") {
       continue;
     }
@@ -441,14 +444,16 @@ async function getActiveLoopState(repoRoot) {
   return diskState;
 }
 
-async function defaultStartKickoffLoopProcess({ repoRoot, sprint }) {
+async function defaultStartKickoffLoopProcess({ repoRoot, sprint, requireVerification }) {
   const args = ["-m", "apps.runner", "--kickoff", "--sprint", sprint, "--goal-file", `./${GOAL_FILE_PATH}`, "--loop"];
   return new Promise((resolveStarted, rejectStart) => {
+    const env = { ...process.env };
+    env.KICKOFF_REQUIRE_VERIFICATION = requireVerification === true ? "1" : "0";
     const child = spawn("python3", args, {
       cwd: repoRoot,
       detached: true,
       stdio: "ignore",
-      env: { ...process.env },
+      env,
     });
 
     const failStartup = (message) => {
@@ -544,7 +549,7 @@ function buildLoopManager({
     async getActive() {
       return await getActiveLoopState(repoRoot);
     },
-    async start({ sprint }) {
+    async start({ sprint, require_verification } = {}) {
       return await enqueue(async () => {
         const normalizedSprint = normalizeSprint(sprint);
         if (!normalizedSprint) {
@@ -556,7 +561,11 @@ function buildLoopManager({
           return existing;
         }
 
-        const child = await startLoopProcess({ repoRoot, sprint: normalizedSprint });
+        const child = await startLoopProcess({
+          repoRoot,
+          sprint: normalizedSprint,
+          requireVerification: require_verification === true,
+        });
         if (!Number.isInteger(child?.pid) || child.pid <= 0) {
           throw new Error("unable to determine kickoff loop process id");
         }
@@ -751,6 +760,12 @@ function buildInternalStartLoopHandler({
       return { error: "body.sprint must be one of M1, M2, M3, or M4" };
     }
 
+    const requireVerificationRaw = request?.body?.require_verification;
+    if (requireVerificationRaw !== undefined && typeof requireVerificationRaw !== "boolean") {
+      reply.code(400);
+      return { error: "body.require_verification must be a boolean" };
+    }
+
     if (requireGoalFile) {
       const goalPath = resolve(repoRoot, GOAL_FILE_PATH);
       let goalContent = "";
@@ -786,7 +801,10 @@ function buildInternalStartLoopHandler({
     }
 
     try {
-      const started = await loopManager.start({ sprint });
+      const started = await loopManager.start({
+        sprint,
+        ...(requireVerificationRaw !== undefined ? { require_verification: requireVerificationRaw } : {}),
+      });
       reply.code(202);
       return {
         status: "STARTED",

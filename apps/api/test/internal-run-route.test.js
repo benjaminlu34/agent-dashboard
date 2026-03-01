@@ -66,8 +66,11 @@ async function writeBundleFiles(repoRoot) {
           },
           {
             name: "Sprint",
-            type: "single_select",
-            allowed_options: ["M1", "M2", "M3", "M4"],
+            type: "text",
+          },
+          {
+            name: "DependsOn",
+            type: "text",
           },
         ],
       },

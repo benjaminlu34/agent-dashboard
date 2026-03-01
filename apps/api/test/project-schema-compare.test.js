@@ -108,3 +108,27 @@ test("compareProjectSchema returns FAIL when type differs", () => {
     },
   ]);
 });
+
+test("compareProjectSchema supports text fields like Sprint and DependsOn", () => {
+  const requiredSchema = {
+    project_name: "Codex Task Board",
+    required_fields: [
+      ...REQUIRED_SCHEMA.required_fields,
+      { name: "Sprint", type: "text" },
+      { name: "DependsOn", type: "text" },
+    ],
+  };
+
+  const liveSchema = {
+    project_name: "Codex Task Board",
+    fields: [
+      { name: "Status", type: "single_select", options: ["Backlog", "Ready", "In Progress"] },
+      { name: "Size", type: "single_select", options: ["S", "M", "L"] },
+      { name: "Sprint", type: "text", options: [] },
+      { name: "DependsOn", type: "text", options: [] },
+    ],
+  };
+
+  const result = compareProjectSchema(requiredSchema, liveSchema);
+  assert.deepEqual(result, { status: "PASS", mismatches: [] });
+});
