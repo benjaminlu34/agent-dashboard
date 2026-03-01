@@ -348,9 +348,9 @@ export async function generateRunnerStateFromProjectSprint({
   };
 
   const sprintPlanPath = resolve(repoRoot, runnerSprintPlanPath);
-  const sprintPlanTmpPath = `${sprintPlanPath}.tmp`;
+  const sprintPlanTmpPath = `${sprintPlanPath}.tmp-${process.pid}`;
   const ledgerPath = resolve(repoRoot, runnerLedgerPath);
-  const ledgerTmpPath = `${ledgerPath}.tmp`;
+  const ledgerTmpPath = `${ledgerPath}.tmp-${process.pid}`;
 
   try {
     await atomicWriteJson({
@@ -404,4 +404,3 @@ export async function generateRunnerStateFromProjectSprint({
     plan_version: planVersion,
   };
 }
-

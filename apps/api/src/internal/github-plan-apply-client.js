@@ -542,73 +542,51 @@ export async function createGitHubPlanApplyClient({
       throw new GitHubPlanApplyError(`project field not found: ${fieldName}`);
     }
 
+    const variables = {
+      projectId: project.id,
+      itemId: projectItemId,
+      fieldId: field.field_id,
+    };
+    let variableDefinition = "";
+    let valueFragment = "";
+
     if (field.data_type === "single_select") {
-      const { field_id: fieldId, option_id: optionId } = requireOptionId(fieldsByName, fieldName, value);
-
-      await requestGraphql({
-        token: githubToken,
-        endpoint: graphqlEndpoint,
-        query: `
-          mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
-            updateProjectV2ItemFieldValue(
-              input: {
-                projectId: $projectId
-                itemId: $itemId
-                fieldId: $fieldId
-                value: { singleSelectOptionId: $optionId }
-              }
-            ) {
-              projectV2Item {
-                id
-              }
-            }
-          }
-        `,
-        variables: {
-          projectId: project.id,
-          itemId: projectItemId,
-          fieldId,
-          optionId,
-        },
-      });
-      return;
-    }
-
-    if (field.data_type === "text") {
+      const { option_id: optionId } = requireOptionId(fieldsByName, fieldName, value);
+      variableDefinition = ", $optionId: String!";
+      valueFragment = "{ singleSelectOptionId: $optionId }";
+      variables.optionId = optionId;
+    } else if (field.data_type === "text") {
       if (typeof value !== "string") {
         throw new GitHubPlanApplyError(`project text field value must be a string: ${fieldName}`);
       }
-
-      await requestGraphql({
-        token: githubToken,
-        endpoint: graphqlEndpoint,
-        query: `
-          mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $textValue: String!) {
-            updateProjectV2ItemFieldValue(
-              input: {
-                projectId: $projectId
-                itemId: $itemId
-                fieldId: $fieldId
-                value: { text: $textValue }
-              }
-            ) {
-              projectV2Item {
-                id
-              }
-            }
-          }
-        `,
-        variables: {
-          projectId: project.id,
-          itemId: projectItemId,
-          fieldId: field.field_id,
-          textValue: value,
-        },
-      });
-      return;
+      variableDefinition = ", $textValue: String!";
+      valueFragment = "{ text: $textValue }";
+      variables.textValue = value;
+    } else {
+      throw new GitHubPlanApplyError(`unsupported project field type: ${fieldName}=${field.data_type || "unknown"}`);
     }
 
-    throw new GitHubPlanApplyError(`unsupported project field type: ${fieldName}=${field.data_type || "unknown"}`);
+    await requestGraphql({
+      token: githubToken,
+      endpoint: graphqlEndpoint,
+      query: `
+        mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!${variableDefinition}) {
+          updateProjectV2ItemFieldValue(
+            input: {
+              projectId: $projectId
+              itemId: $itemId
+              fieldId: $fieldId
+              value: ${valueFragment}
+            }
+          ) {
+            projectV2Item {
+              id
+            }
+          }
+        }
+      `,
+      variables,
+    });
   }
 
   return {
