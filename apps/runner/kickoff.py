@@ -396,6 +396,7 @@ def kickoff_plan_to_plan_apply_draft(plan: Dict[str, Any]) -> Dict[str, Any]:
                 "area": map_task_area_to_policy_area(task["area"]),
                 "priority": task["priority"],
                 "initial_status": task["initial_status"],
+                "depends_on": list(task.get("depends_on_titles") or []),
             }
         )
 
@@ -413,4 +414,3 @@ def kickoff_plan_to_plan_apply_draft(plan: Dict[str, Any]) -> Dict[str, Any]:
         "sprint": sprint,
         "issues": issues,
     }
-

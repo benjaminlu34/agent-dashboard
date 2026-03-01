@@ -175,13 +175,22 @@ function parseProjectSchema(bundle) {
   }
 
   const sprintField = requiredFields.find((field) => field?.name === "Sprint");
+  if (!sprintField) {
+    throw withErrorCode(new Error("project schema policy missing Sprint field"), "preflight_failed");
+  }
+
+  const sprintType = typeof sprintField?.type === "string" ? sprintField.type.trim().toLowerCase() : "";
   const sprintOptions = Array.isArray(sprintField?.allowed_options) ? sprintField.allowed_options : [];
-  if (sprintOptions.length === 0) {
+  if (sprintType === "single_select" && sprintOptions.length === 0) {
     throw withErrorCode(new Error("project schema policy missing Sprint.allowed_options"), "preflight_failed");
+  }
+  if (sprintType !== "single_select" && sprintType !== "text") {
+    throw withErrorCode(new Error("project schema policy Sprint.type must be single_select or text"), "preflight_failed");
   }
 
   return {
     statusOptions,
+    sprintType,
     sprintOptions,
   };
 }
@@ -543,7 +552,7 @@ async function runCycle({
     throw error;
   }
 
-  if (!projectSchema.sprintOptions.includes(sprint)) {
+  if (projectSchema.sprintType === "single_select" && !projectSchema.sprintOptions.includes(sprint)) {
     throw withErrorCode(new Error(`ORCHESTRATOR_SPRINT=${sprint} is not allowed by policy/project-schema.json`), "malformed_item_data");
   }
 

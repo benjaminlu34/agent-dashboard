@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import tempfile
 import threading
 import time
@@ -39,12 +40,20 @@ class _BackendStub:
 
 
 class _LedgerStub:
-    def __init__(self, payload):
+    def __init__(self, payload, *, tasks=None):
         self._payload = payload
+        self._tasks = tasks or {}
         self.mark_result_calls = []
 
     def get(self, run_id: str):
         return self._payload.get(run_id)
+
+    def get_task_last_activity(self, project_item_id: str) -> str:
+        value = self._tasks.get(project_item_id)
+        return value if isinstance(value, str) else ""
+
+    def touch_task_last_activity(self, project_item_id: str, *, at_iso: str) -> None:
+        self._tasks[project_item_id] = at_iso
 
     def mark_result(self, run_id: str, *, status: str, result):
         self.mark_result_calls.append((run_id, status, result))
@@ -763,6 +772,169 @@ class RunnerReviewAndStallTests(unittest.TestCase):
 
         update_calls = [call for call in backend.calls if call[0] == "/internal/project-item/update-field"]
         self.assertEqual(update_calls, [])
+
+    def test_stalled_in_progress_skips_when_recent_activity_in_ledger(self) -> None:
+        backend = _BackendStub()
+        ledger = _LedgerStub(
+            {
+                "run-stale": {
+                    "status": "failed",
+                    "result": {"failure_classification": "ITEM_STOP", "error_code": "worker_invalid_output"},
+                }
+            },
+            tasks={"PVTI_9": "2026-02-28T01:30:00.000Z"},
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = f"{tmp_dir}/orchestrator-state.json"
+            Path(state_path).write_text(
+                json.dumps(
+                    {
+                        "poll_count": 48,
+                        "sealed_at": "2026-02-28T00:00:00.000Z",
+                        "items": {
+                            "PVTI_9": {
+                                "last_seen_issue_number": 9,
+                                "last_seen_status": "In Progress",
+                                "status_since_at": "2026-02-08T00:00:00.000Z",
+                                "last_run_id": "run-stale",
+                                "last_dispatched_role": "EXECUTOR",
+                                "last_dispatched_status": "In Progress",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runner = _build_runner(backend=backend, state_path=state_path, ledger=ledger)
+            summary = {
+                "needs_attention": {
+                    "stalled_in_progress": [
+                        {
+                            "issue_number": 9,
+                            "project_item_id": "PVTI_9",
+                            "stuck_minutes": 180,
+                            "status_since_at": "2026-02-08T00:00:00.000Z",
+                        }
+                    ],
+                    "in_review_churn": [],
+                },
+                "processed_items": [{"issue_number": 9, "project_item_id": "PVTI_9", "status": "In Progress"}],
+            }
+            with patch.dict(os.environ, {"ORCHESTRATOR_STALL_MINUTES": "120"}, clear=False):
+                with patch("apps.runner.runner._utc_now_iso", return_value="2026-02-28T02:00:00.000Z"):
+                    runner.handle_dispatch_summary(summary=summary)
+
+        update_calls = [call for call in backend.calls if call[0] == "/internal/project-item/update-field"]
+        self.assertEqual(update_calls, [])
+
+    def test_stalled_in_progress_blocks_when_activity_exceeds_stall_minutes(self) -> None:
+        backend = _BackendStub()
+        ledger = _LedgerStub(
+            {
+                "run-stale": {
+                    "status": "failed",
+                    "result": {"failure_classification": "ITEM_STOP", "error_code": "worker_invalid_output"},
+                }
+            },
+            tasks={"PVTI_9": "2026-02-28T00:00:00.000Z"},
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = f"{tmp_dir}/orchestrator-state.json"
+            Path(state_path).write_text(
+                json.dumps(
+                    {
+                        "poll_count": 48,
+                        "sealed_at": "2026-02-28T00:00:00.000Z",
+                        "items": {
+                            "PVTI_9": {
+                                "last_seen_issue_number": 9,
+                                "last_seen_status": "In Progress",
+                                "status_since_at": "2026-02-08T00:00:00.000Z",
+                                "last_run_id": "run-stale",
+                                "last_dispatched_role": "EXECUTOR",
+                                "last_dispatched_status": "In Progress",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runner = _build_runner(backend=backend, state_path=state_path, ledger=ledger)
+            summary = {
+                "needs_attention": {
+                    "stalled_in_progress": [
+                        {
+                            "issue_number": 9,
+                            "project_item_id": "PVTI_9",
+                            "stuck_minutes": 180,
+                            "status_since_at": "2026-02-08T00:00:00.000Z",
+                        }
+                    ],
+                    "in_review_churn": [],
+                },
+                "processed_items": [{"issue_number": 9, "project_item_id": "PVTI_9", "status": "In Progress"}],
+            }
+            with patch.dict(os.environ, {"ORCHESTRATOR_STALL_MINUTES": "120"}, clear=False):
+                with patch("apps.runner.runner._utc_now_iso", return_value="2026-02-28T03:00:00.000Z"):
+                    runner.handle_dispatch_summary(summary=summary)
+
+        update_calls = [call for call in backend.calls if call[0] == "/internal/project-item/update-field"]
+        self.assertEqual(len(update_calls), 1)
+        self.assertEqual(update_calls[0][1]["value"], "Blocked")
+
+    def test_stalled_in_progress_falls_back_to_sealed_at_when_ledger_missing_activity(self) -> None:
+        backend = _BackendStub()
+        ledger = _LedgerStub(
+            {
+                "run-stale": {
+                    "status": "failed",
+                    "result": {"failure_classification": "ITEM_STOP", "error_code": "worker_invalid_output"},
+                }
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_path = f"{tmp_dir}/orchestrator-state.json"
+            Path(state_path).write_text(
+                json.dumps(
+                    {
+                        "poll_count": 48,
+                        "sealed_at": "2026-02-28T00:00:00.000Z",
+                        "items": {
+                            "PVTI_9": {
+                                "last_seen_issue_number": 9,
+                                "last_seen_status": "In Progress",
+                                "status_since_at": "2026-02-08T00:00:00.000Z",
+                                "last_run_id": "run-stale",
+                                "last_dispatched_role": "EXECUTOR",
+                                "last_dispatched_status": "In Progress",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runner = _build_runner(backend=backend, state_path=state_path, ledger=ledger)
+            summary = {
+                "needs_attention": {
+                    "stalled_in_progress": [
+                        {
+                            "issue_number": 9,
+                            "project_item_id": "PVTI_9",
+                            "stuck_minutes": 180,
+                            "status_since_at": "2026-02-08T00:00:00.000Z",
+                        }
+                    ],
+                    "in_review_churn": [],
+                },
+                "processed_items": [{"issue_number": 9, "project_item_id": "PVTI_9", "status": "In Progress"}],
+            }
+            with patch.dict(os.environ, {"ORCHESTRATOR_STALL_MINUTES": "120"}, clear=False):
+                with patch("apps.runner.runner._utc_now_iso", return_value="2026-02-28T03:00:00.000Z"):
+                    runner.handle_dispatch_summary(summary=summary)
+
+        update_calls = [call for call in backend.calls if call[0] == "/internal/project-item/update-field"]
+        self.assertEqual(len(update_calls), 1)
+        self.assertEqual(update_calls[0][1]["value"], "Blocked")
 
     def test_blocked_retry_triggers_after_cooldown_for_retryable_failure(self) -> None:
         backend = _BackendStub()

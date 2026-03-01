@@ -215,6 +215,41 @@
 
         <div id="error-banner" class="mt-5 hidden rounded-xl border border-zinc-700 bg-zinc-900 px-4 py-3 text-sm font-medium text-zinc-200 shadow-md shadow-white/5"></div>
 
+        <section
+          id="seal-controls"
+          class="mt-5 hidden rounded-2xl border border-zinc-800 bg-zinc-900 p-5 shadow-lg shadow-white/10"
+        >
+          <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p class="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-400">Sprint Verification</p>
+              <p id="seal-verification-prompt" class="mt-2 text-sm text-zinc-300">
+                Sprint pending human verification. Edit issues in GitHub, then Seal to begin.
+              </p>
+              <p class="mt-2 text-xs text-zinc-500">
+                Sprint: <span id="seal-sprint" class="font-semibold text-zinc-200">N/A</span>
+              </p>
+            </div>
+            <button
+              id="seal-sprint-button"
+              type="button"
+              class="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-zinc-200 bg-white px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-zinc-950 transition hover:bg-zinc-200 disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto"
+            >
+              <span
+                id="seal-sprint-spinner"
+                class="hidden h-3 w-3 animate-spin rounded-full border-2 border-zinc-900 border-r-transparent"
+                aria-hidden="true"
+              ></span>
+              <span id="seal-sprint-label">Seal Sprint</span>
+            </button>
+          </div>
+          <div
+            id="seal-errors-container"
+            class="hidden mt-4 text-red-400 bg-red-900/20 p-4 rounded mb-4 text-sm"
+            role="alert"
+            aria-live="polite"
+          ></div>
+        </section>
+
         <section class="mt-7 rounded-2xl border border-zinc-800 bg-zinc-900 p-6 shadow-lg shadow-white/10">
           <details id="kickoff-details" open class="group">
             <summary class="flex cursor-pointer list-none flex-wrap items-center justify-between gap-4 marker:hidden">
@@ -260,8 +295,23 @@
                     class="w-full rounded-lg border border-zinc-700 bg-black px-3 py-2 text-sm text-white outline-none transition focus:border-zinc-500"
                   />
                 </label>
+                <label class="flex w-full items-start gap-2 rounded-lg border border-zinc-800 bg-black/60 px-3 py-2 text-xs text-zinc-300 sm:max-w-xl">
+                  <input
+                    id="kickoff-require-verification"
+                    type="checkbox"
+                    class="mt-0.5 h-4 w-4 accent-zinc-200"
+                  />
+                  <span class="block">
+                    <span class="block text-[11px] font-semibold uppercase tracking-[0.14em] text-zinc-300">
+                      Pause for human verification before starting sprint
+                    </span>
+                    <span class="mt-1 block text-xs text-zinc-500">
+                      Creates GitHub items, then waits for Seal Sprint.
+                    </span>
+                  </span>
+                </label>
               </div>
-              <div class="mt-3 rounded-lg border border-zinc-800 bg-black px-3 py-2 text-xs text-zinc-400">
+              <div id="kickoff-start-workflow-hint" class="mt-3 rounded-lg border border-zinc-800 bg-black px-3 py-2 text-xs text-zinc-400">
                 <p class="font-semibold uppercase tracking-[0.16em] text-zinc-300">Start Workflow</p>
                 <p class="mt-1">
                   Click <span class="font-semibold text-zinc-200">Start Kickoff Loop (Step 2)</span> to launch kickoff from the GUI. Manual fallback:
@@ -301,7 +351,7 @@
                     </button>
                   </div>
 
-                  <div class="flex flex-col gap-2">
+                  <div id="kickoff-runner-loop-container" class="flex flex-col gap-2">
                     <span class="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Resume existing tasks:</span>
                     <button
                       id="kickoff-start-runner-loop-button"

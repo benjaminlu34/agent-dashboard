@@ -5,6 +5,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { AgentContextBundleError, loadAgentContextBundle } from "../internal/agent-context-loader.js";
 import { readAgentSwarmTarget } from "../internal/agent-swarm-config.js";
 import { createGitHubPlanApplyClient, GitHubPlanApplyError } from "../internal/github-plan-apply-client.js";
+import { generateRunnerStateFromProjectSprint } from "../internal/sprint-state-generator.js";
 import { buildPreflightHandler } from "./internal-preflight.js";
 import { resolveTargetIdentity, TargetIdentityError } from "../internal/target-identity.js";
 import {
@@ -16,12 +17,10 @@ import {
 const MODULE_DIRNAME = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../../");
 const PROJECT_IDENTITY_PATH = "policy/github-project.json";
-const VALID_SPRINTS = new Set(["M1", "M2", "M3", "M4"]);
-const VALID_SIZES = new Set(["S", "M", "L"]);
-const VALID_AREAS = new Set(["db", "api", "web", "providers", "infra", "docs"]);
-const VALID_PRIORITIES = new Set(["P0", "P1", "P2"]);
-const VALID_INITIAL_STATUSES = new Set(["Backlog", "Ready"]);
+const PROJECT_SCHEMA_PATH = "policy/project-schema.json";
 const DEFAULT_ORCHESTRATOR_STATE_PATH = "./.orchestrator-state.json";
+const RUNNER_SPRINT_PLAN_PATH = "./.runner-sprint-plan.json";
+const RUNNER_LEDGER_PATH = "./.runner-ledger.json";
 
 function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
@@ -40,6 +39,20 @@ function resolveOrchestratorStatePath({ repoRoot, env, ownerLogin, repoName }) {
     ? env.ORCHESTRATOR_STATE_PATH.trim()
     : defaultPath;
   return resolve(repoRoot, configuredPath);
+}
+
+function resolveRunnerLedgerPathToken({ env, ownerLogin, repoName }) {
+  const hasScopedIdentity = isNonEmptyString(ownerLogin) && isNonEmptyString(repoName);
+  const defaultPath = hasScopedIdentity
+    ? `./.runner-ledger.${sanitizeStatePathToken(ownerLogin)}.${sanitizeStatePathToken(repoName)}.json`
+    : RUNNER_LEDGER_PATH;
+  return isNonEmptyString(env?.RUNNER_LEDGER_PATH) ? env.RUNNER_LEDGER_PATH.trim() : defaultPath;
+}
+
+function resolveRunnerSprintPlanPathToken({ env }) {
+  return isNonEmptyString(env?.RUNNER_SPRINT_PLAN_PATH)
+    ? env.RUNNER_SPRINT_PLAN_PATH.trim()
+    : RUNNER_SPRINT_PLAN_PATH;
 }
 
 function ensureStringArray(value) {
@@ -69,6 +82,102 @@ function parseProjectIdentityPolicyFromBundle(bundle) {
   }
 }
 
+function normalizePolicyFieldType(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  return value.trim().toLowerCase();
+}
+
+function normalizeAllowedOptions(options) {
+  if (!Array.isArray(options)) {
+    return [];
+  }
+  return options
+    .filter((option) => isNonEmptyString(option))
+    .map((option) => option.trim())
+    .filter((option) => option.length > 0);
+}
+
+function parseProjectSchemaPolicyFromBundle(bundle) {
+  const schemaFile = bundle.files.find((file) => file.path === PROJECT_SCHEMA_PATH);
+  if (!schemaFile) {
+    throw new GitHubPlanApplyError("missing project schema policy");
+  }
+
+  try {
+    return JSON.parse(schemaFile.content);
+  } catch {
+    throw new GitHubPlanApplyError("invalid project schema policy JSON");
+  }
+}
+
+function buildPlanApplySchemaPolicy(schemaPolicy) {
+  const requiredFields = Array.isArray(schemaPolicy?.required_fields) ? schemaPolicy.required_fields : [];
+  const getField = (name) => requiredFields.find((field) => field?.name === name);
+
+  const requireSingleSelectOptions = (name) => {
+    const field = getField(name);
+    if (!field) {
+      throw new GitHubPlanApplyError(`project schema policy missing ${name} field`);
+    }
+    const type = normalizePolicyFieldType(field.type);
+    if (type !== "single_select") {
+      throw new GitHubPlanApplyError(`project schema policy field must be single_select: ${name}`);
+    }
+    const options = normalizeAllowedOptions(field.allowed_options);
+    if (options.length === 0) {
+      throw new GitHubPlanApplyError(`project schema policy missing ${name}.allowed_options`);
+    }
+    return new Set(options);
+  };
+
+  const sprintField = getField("Sprint");
+  if (!sprintField) {
+    throw new GitHubPlanApplyError("project schema policy missing Sprint field");
+  }
+  const sprintType = normalizePolicyFieldType(sprintField.type);
+  if (sprintType !== "single_select" && sprintType !== "text") {
+    throw new GitHubPlanApplyError("project schema policy Sprint.type must be single_select or text");
+  }
+  const sprintOptions = sprintType === "single_select" ? normalizeAllowedOptions(sprintField.allowed_options) : [];
+  if (sprintType === "single_select" && sprintOptions.length === 0) {
+    throw new GitHubPlanApplyError("project schema policy missing Sprint.allowed_options");
+  }
+
+  return {
+    statusOptions: requireSingleSelectOptions("Status"),
+    sizeOptions: requireSingleSelectOptions("Size"),
+    areaOptions: requireSingleSelectOptions("Area"),
+    priorityOptions: requireSingleSelectOptions("Priority"),
+    sprintType,
+    sprintOptions: new Set(sprintOptions),
+  };
+}
+
+function formatDependsOnFieldValue(dependsOn) {
+  if (!Array.isArray(dependsOn) || dependsOn.length === 0) {
+    return "";
+  }
+  const tokens = [];
+  for (const entry of dependsOn) {
+    if (typeof entry === "number") {
+      if (Number.isInteger(entry) && entry > 0) {
+        tokens.push(String(entry));
+      }
+      continue;
+    }
+
+    if (typeof entry === "string") {
+      const trimmed = entry.trim();
+      if (trimmed.length > 0) {
+        tokens.push(trimmed);
+      }
+    }
+  }
+  return tokens.join(", ");
+}
+
 function normalizeIssue(issue) {
   const normalizedStatus = isNonEmptyString(issue?.initial_status) ? issue.initial_status : "Backlog";
 
@@ -83,11 +192,12 @@ function normalizeIssue(issue) {
     area: issue?.area,
     priority: issue?.priority,
     initial_status: normalizedStatus === "Ready" ? "Ready" : "Backlog",
+    depends_on: issue?.depends_on,
     labels: issue?.labels,
   };
 }
 
-function validateDraftIssue(issue, index) {
+function validateDraftIssue(issue, index, schemaPolicy) {
   if (!isNonEmptyString(issue.title)) {
     return `draft.issues[${index}].title is required`;
   }
@@ -106,17 +216,41 @@ function validateDraftIssue(issue, index) {
   if (!ensureStringArray(issue.definition_of_done)) {
     return `draft.issues[${index}].definition_of_done must be a non-empty string array`;
   }
-  if (!VALID_SIZES.has(issue.size)) {
-    return `draft.issues[${index}].size must be one of S, M, L`;
+  if (!schemaPolicy.sizeOptions.has(issue.size)) {
+    return `draft.issues[${index}].size must be one of ${[...schemaPolicy.sizeOptions].join(", ")}`;
   }
-  if (!VALID_AREAS.has(issue.area)) {
-    return `draft.issues[${index}].area must be one of db, api, web, providers, infra, docs`;
+  if (!schemaPolicy.areaOptions.has(issue.area)) {
+    return `draft.issues[${index}].area must be one of ${[...schemaPolicy.areaOptions].join(", ")}`;
   }
-  if (!VALID_PRIORITIES.has(issue.priority)) {
-    return `draft.issues[${index}].priority must be one of P0, P1, P2`;
+  if (!schemaPolicy.priorityOptions.has(issue.priority)) {
+    return `draft.issues[${index}].priority must be one of ${[...schemaPolicy.priorityOptions].join(", ")}`;
   }
-  if (!VALID_INITIAL_STATUSES.has(issue.initial_status)) {
+  if (issue.initial_status !== "Backlog" && issue.initial_status !== "Ready") {
     return `draft.issues[${index}].initial_status must be Backlog or Ready`;
+  }
+  if (!schemaPolicy.statusOptions.has(issue.initial_status)) {
+    return `draft.issues[${index}].initial_status must be one of ${[...schemaPolicy.statusOptions].join(", ")}`;
+  }
+  if (issue.depends_on !== undefined) {
+    if (!Array.isArray(issue.depends_on)) {
+      return `draft.issues[${index}].depends_on must be an array`;
+    }
+    for (let depIndex = 0; depIndex < issue.depends_on.length; depIndex += 1) {
+      const dependency = issue.depends_on[depIndex];
+      if (typeof dependency === "number") {
+        if (!Number.isInteger(dependency) || dependency <= 0) {
+          return `draft.issues[${index}].depends_on[${depIndex}] must be a positive integer`;
+        }
+        continue;
+      }
+      if (typeof dependency === "string") {
+        if (dependency.trim().length === 0) {
+          return `draft.issues[${index}].depends_on[${depIndex}] must be a non-empty string`;
+        }
+        continue;
+      }
+      return `draft.issues[${index}].depends_on[${depIndex}] must be a positive integer or non-empty string`;
+    }
   }
   if (issue.labels !== undefined && !ensureStringArray(issue.labels)) {
     return `draft.issues[${index}].labels must be a non-empty string array`;
@@ -161,6 +295,7 @@ function buildFieldValues({ draftSprint, issue }) {
     Area: issue.area,
     Priority: issue.priority,
     Sprint: draftSprint,
+    DependsOn: formatDependsOnFieldValue(issue.depends_on),
   };
 }
 
@@ -182,6 +317,122 @@ function buildIssueTitle(rawTitle) {
     return trimmed;
   }
   return `[TASK] ${trimmed}`;
+}
+
+function stripBracketPrefix(value) {
+  if (!isNonEmptyString(value)) {
+    return "";
+  }
+  const trimmed = value.trim();
+  const match = trimmed.match(/^\[[^\]]+\]\s*(.+)$/u);
+  return match?.[1] ? match[1].trim() : "";
+}
+
+function buildIssueNumberLookup({ created, issues }) {
+  const lookup = new Map();
+
+  const addKey = (key, issueNumber) => {
+    if (!isNonEmptyString(key)) {
+      return;
+    }
+    const normalized = key.trim().toLowerCase();
+    if (!normalized) {
+      return;
+    }
+    const existing = lookup.get(normalized);
+    if (existing === undefined) {
+      lookup.set(normalized, issueNumber);
+      return;
+    }
+    if (existing !== issueNumber) {
+      lookup.set(normalized, null);
+    }
+  };
+
+  for (const entry of created ?? []) {
+    const issueNumber = entry?.issue_number;
+    const index = entry?.index;
+    if (!Number.isInteger(issueNumber) || issueNumber <= 0 || !Number.isInteger(index) || index < 0) {
+      continue;
+    }
+
+    const issue = issues?.[index];
+    const rawTitle = isNonEmptyString(issue?.title) ? issue.title.trim() : "";
+    const canonicalTitle = rawTitle ? buildIssueTitle(rawTitle) : "";
+
+    addKey(rawTitle, issueNumber);
+    addKey(canonicalTitle, issueNumber);
+
+    const strippedRaw = stripBracketPrefix(rawTitle);
+    addKey(strippedRaw, issueNumber);
+    const strippedCanonical = stripBracketPrefix(canonicalTitle);
+    addKey(strippedCanonical, issueNumber);
+  }
+
+  return lookup;
+}
+
+function resolveDependsOnEntries({ dependsOn, issueNumberLookup }) {
+  const resolved = [];
+  if (!Array.isArray(dependsOn) || dependsOn.length === 0) {
+    return resolved;
+  }
+
+  for (const entry of dependsOn) {
+    if (typeof entry === "number") {
+      if (Number.isInteger(entry) && entry > 0) {
+        resolved.push(entry);
+      }
+      continue;
+    }
+
+    if (typeof entry !== "string") {
+      continue;
+    }
+
+    const raw = entry.trim();
+    if (!raw) {
+      continue;
+    }
+
+    const cleaned = raw.replace(/[#\s]+/gu, "");
+    if (/^[1-9]\d*$/u.test(cleaned)) {
+      const numeric = Number(cleaned);
+      if (Number.isInteger(numeric) && numeric > 0) {
+        resolved.push(numeric);
+        continue;
+      }
+    }
+
+    const candidates = [
+      raw,
+      buildIssueTitle(raw),
+      stripBracketPrefix(raw),
+      stripBracketPrefix(buildIssueTitle(raw)),
+    ]
+      .filter((value) => isNonEmptyString(value))
+      .map((value) => value.trim().toLowerCase())
+      .filter((value) => value.length > 0);
+
+    let mapped = null;
+    for (const candidate of candidates) {
+      const lookupValue = issueNumberLookup.get(candidate);
+      if (lookupValue === undefined) {
+        continue;
+      }
+      mapped = lookupValue;
+      break;
+    }
+
+    if (Number.isInteger(mapped) && mapped > 0) {
+      resolved.push(mapped);
+      continue;
+    }
+
+    resolved.push(raw);
+  }
+
+  return resolved;
 }
 
 async function readOrchestratorStateFile(statePath) {
@@ -213,6 +464,7 @@ export function buildInternalPlanApplyHandler({
   env = process.env,
   preflightHandler,
   githubClientFactory = createGitHubPlanApplyClient,
+  nowIso = () => new Date().toISOString(),
 } = {}) {
   const resolvedPreflightHandler = preflightHandler ?? buildPreflightHandler({ repoRoot });
 
@@ -231,23 +483,23 @@ export function buildInternalPlanApplyHandler({
     }
 
     const sprint = draft.sprint;
-    if (typeof sprint !== "string" || !VALID_SPRINTS.has(sprint)) {
+    if (!isNonEmptyString(sprint)) {
       reply.code(400);
-      return { error: "body.draft.sprint must be one of M1, M2, M3, M4" };
+      return { error: "body.draft.sprint is required" };
+    }
+
+    let requireVerification = false;
+    if (draft.require_verification !== undefined) {
+      if (typeof draft.require_verification !== "boolean") {
+        reply.code(400);
+        return { error: "body.draft.require_verification must be a boolean" };
+      }
+      requireVerification = draft.require_verification;
     }
 
     if (!Array.isArray(draft.issues) || draft.issues.length === 0) {
       reply.code(400);
       return { error: "body.draft.issues must be a non-empty array" };
-    }
-
-    const normalizedIssues = draft.issues.map(normalizeIssue);
-    for (let index = 0; index < normalizedIssues.length; index += 1) {
-      const validationError = validateDraftIssue(normalizedIssues[index], index);
-      if (validationError) {
-        reply.code(400);
-        return { error: validationError };
-      }
     }
 
     const preflightReply = createReplyRecorder();
@@ -275,6 +527,33 @@ export function buildInternalPlanApplyHandler({
         };
       }
       throw error;
+    }
+
+    let schemaPolicy;
+    try {
+      const schema = parseProjectSchemaPolicyFromBundle(bundle);
+      schemaPolicy = buildPlanApplySchemaPolicy(schema);
+    } catch (error) {
+      if (error instanceof GitHubPlanApplyError) {
+        reply.code(500);
+        return { error: error.message };
+      }
+      throw error;
+    }
+
+    const normalizedSprint = sprint.trim();
+    if (schemaPolicy.sprintType === "single_select" && !schemaPolicy.sprintOptions.has(normalizedSprint)) {
+      reply.code(400);
+      return { error: `body.draft.sprint must be one of ${[...schemaPolicy.sprintOptions].join(", ")}` };
+    }
+
+    const normalizedIssues = draft.issues.map(normalizeIssue);
+    for (let index = 0; index < normalizedIssues.length; index += 1) {
+      const validationError = validateDraftIssue(normalizedIssues[index], index, schemaPolicy);
+      if (validationError) {
+        reply.code(400);
+        return { error: validationError };
+      }
     }
 
     let targetIdentity;
@@ -325,7 +604,7 @@ export function buildInternalPlanApplyHandler({
 
     for (let index = 0; index < normalizedIssues.length; index += 1) {
       const issue = normalizedIssues[index];
-      const fieldsSet = buildFieldValues({ draftSprint: sprint, issue });
+      const fieldsSet = buildFieldValues({ draftSprint: normalizedSprint, issue });
 
       let createdIssue;
       try {
@@ -366,6 +645,37 @@ export function buildInternalPlanApplyHandler({
         project_item_id: projectItem.project_item_id,
         fields_set: fieldsSet,
       });
+    }
+
+    const issueNumberLookup = buildIssueNumberLookup({ created, issues: normalizedIssues });
+    for (const entry of created) {
+      const issue = normalizedIssues[entry.index];
+      if (!Array.isArray(issue?.depends_on) || issue.depends_on.length === 0) {
+        continue;
+      }
+
+      const resolvedDependsOn = resolveDependsOnEntries({
+        dependsOn: issue.depends_on,
+        issueNumberLookup,
+      });
+      const resolvedValue = formatDependsOnFieldValue(resolvedDependsOn);
+
+      if (resolvedValue === entry.fields_set.DependsOn) {
+        continue;
+      }
+
+      try {
+        await githubClient.updateProjectItemField({
+          projectItemId: entry.project_item_id,
+          field: "DependsOn",
+          value: resolvedValue,
+        });
+      } catch (error) {
+        reply.code(502);
+        return buildPartialFailResponse({ created, index: entry.index, step: "update_depends_on_field", error });
+      }
+
+      entry.fields_set.DependsOn = resolvedValue;
     }
 
     const issuesForScope = created.map((entry) => {
@@ -417,6 +727,7 @@ export function buildInternalPlanApplyHandler({
         ...(state && typeof state === "object" ? state : {}),
         poll_count: Number.isInteger(state?.poll_count) && state.poll_count >= 0 ? state.poll_count : 0,
         items: state?.items && typeof state.items === "object" ? state.items : {},
+        sprint_phase: "PENDING_VERIFICATION",
         sprint_plan: sprintPlan,
         ownership_index: ownershipIndex,
       };
@@ -426,9 +737,39 @@ export function buildInternalPlanApplyHandler({
       return { error: error instanceof Error ? error.message : String(error) };
     }
 
+    if (!requireVerification) {
+      const runnerSprintPlanPath = resolveRunnerSprintPlanPathToken({ env });
+      const runnerLedgerPath = resolveRunnerLedgerPathToken({
+        env,
+        ownerLogin: targetIdentity?.owner_login,
+        repoName: targetIdentity?.repo_name,
+      });
+
+      const generation = await generateRunnerStateFromProjectSprint({
+        repoRoot,
+        sprint: normalizedSprint,
+        githubClient,
+        orchestratorStatePath,
+        nowIso,
+        fs: {
+          mkdir,
+          readFile,
+          rename,
+          writeFile,
+        },
+        runnerSprintPlanPath,
+        runnerLedgerPath,
+      });
+
+      if (!generation.ok) {
+        reply.code(generation.statusCode);
+        return generation.payload;
+      }
+    }
+
     return {
       role: "ORCHESTRATOR",
-      sprint,
+      sprint: normalizedSprint,
       created,
       sprint_plan: sprintPlan,
       ownership_index: ownershipIndex,

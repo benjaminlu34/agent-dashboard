@@ -17,6 +17,8 @@ import {
   kickoffFormEl,
   kickoffGoalEl,
   kickoffMessageEl,
+  kickoffRequireVerificationEl,
+  kickoffRunnerLoopContainerEl,
   kickoffSprintEl,
   kickoffStartLoopButtonEl,
   kickoffStartLoopLabelEl,
@@ -24,6 +26,7 @@ import {
   kickoffStartRunnerLoopButtonEl,
   kickoffStartRunnerLoopLabelEl,
   kickoffStartRunnerLoopSpinnerEl,
+  kickoffStartWorkflowHintEl,
   kickoffStopForceEl,
   kickoffStopOrchestratorsButtonEl,
   kickoffStopOrchestratorsLabelEl,
@@ -35,6 +38,12 @@ import {
   orchestratorSummaryEl,
   runnerCountEl,
   runnerRunsEl,
+  sealControlsEl,
+  sealErrorsContainerEl,
+  sealSprintButtonEl,
+  sealSprintEl,
+  sealSprintLabelEl,
+  sealSprintSpinnerEl,
   settingsBackdropEl,
   settingsCancelButtonEl,
   settingsCloseButtonEl,
@@ -96,6 +105,8 @@ let notificationAudioContext = null;
 let hasOrchestratorSnapshot = false;
 const previousOrchestratorStatusByItemId = new Map();
 let kickoffWasAutoCollapsed = false;
+let latestOrchestratorSnapshot = {};
+let sealIsLoading = false;
 
 function normalizeStatus(value) {
   return String(value ?? "").trim().toUpperCase();
@@ -280,12 +291,20 @@ function detectReviewerNeedsHumanApprovalTransition(orchestrator) {
   return shouldBeep;
 }
 
+function getRunnerRunsObject(runner) {
+  const runnerObj = asObject(runner);
+  if (runnerObj && typeof runnerObj === "object" && "runs" in runnerObj) {
+    return asObject(runnerObj.runs);
+  }
+  return runnerObj;
+}
+
 function deriveTargetFromData(orchestrator, runner, ownerHeader, repoHeader) {
   if (ownerHeader && repoHeader) {
     return `${ownerHeader}/${repoHeader}`;
   }
 
-  const runnerEntries = Object.values(asObject(runner));
+  const runnerEntries = Object.values(getRunnerRunsObject(runner));
   for (const entry of runnerEntries) {
     const prUrl =
       entry?.result?.pr_url ??
@@ -951,6 +970,117 @@ function clearKickoffMessage() {
   kickoffMessageEl.classList.add("hidden");
 }
 
+function setSealLoading(isLoading) {
+  sealIsLoading = Boolean(isLoading);
+  sealSprintButtonEl.disabled = sealIsLoading;
+  sealSprintSpinnerEl.classList.toggle("hidden", !sealIsLoading);
+  sealSprintLabelEl.textContent = sealIsLoading ? "Sealing..." : "Seal Sprint";
+}
+
+function clearSealErrors() {
+  sealErrorsContainerEl.innerHTML = "";
+  sealErrorsContainerEl.classList.add("hidden");
+}
+
+function showSealErrorHtml(title, html) {
+  sealErrorsContainerEl.innerHTML = `
+    <p class="text-xs font-semibold uppercase tracking-[0.16em] text-red-200">${escapeHtml(title)}</p>
+    <div class="mt-2">${html}</div>
+  `;
+  sealErrorsContainerEl.classList.remove("hidden");
+}
+
+function formatSealCyclePath(cycle) {
+  if (!Array.isArray(cycle) || cycle.length === 0) {
+    return "";
+  }
+
+  const numbers = cycle
+    .map((entry) => Number(entry?.issue_number))
+    .filter((value) => Number.isInteger(value) && value > 0);
+
+  if (numbers.length === 0) {
+    return "Dependency cycle detected (unable to resolve issue numbers)";
+  }
+
+  const tokens = numbers.map((number) => `#${number}`);
+  if (tokens.length > 1) {
+    tokens.push(tokens[0]);
+  }
+  return tokens.join(" \u2192 ");
+}
+
+function renderSealValidationFailure(payload, rawResponseBody, statusCode) {
+  const normalizedPayload = asObject(payload);
+  const errorCode = typeof normalizedPayload.error === "string" ? normalizedPayload.error.trim() : "";
+  const errors = Array.isArray(normalizedPayload.errors) ? normalizedPayload.errors : null;
+  const cycles = Array.isArray(normalizedPayload.cycles) ? normalizedPayload.cycles : null;
+  const duplicates = Array.isArray(normalizedPayload.duplicates) ? normalizedPayload.duplicates : null;
+
+  if (errorCode === "dependency_cycle_detected" && cycles && cycles.length > 0) {
+    const cycleLines = cycles
+      .map((cycle) => formatSealCyclePath(cycle))
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    const list = cycleLines.length
+      ? `<ul class="list-disc pl-5 space-y-1 text-sm text-red-200">${cycleLines
+          .map((line) => `<li>${escapeHtml(line)}</li>`)
+          .join("")}</ul>`
+      : `<p class="text-sm text-red-200">Dependency cycle detected.</p>`;
+    showSealErrorHtml("Seal validation failed: dependency cycle detected", list);
+    return;
+  }
+
+  if (errors && errors.length > 0) {
+    const list = `<ul class="list-disc pl-5 space-y-1 text-sm text-red-200">${errors
+      .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+      .filter((entry) => entry.length > 0)
+      .map((entry) => `<li>${escapeHtml(entry)}</li>`)
+      .join("")}</ul>`;
+    showSealErrorHtml("Seal validation failed", list);
+    return;
+  }
+
+  if (errorCode === "duplicate_issue_numbers_in_sprint" && duplicates && duplicates.length > 0) {
+    const label = duplicates
+      .map((entry) => Number(entry))
+      .filter((entry) => Number.isInteger(entry) && entry > 0)
+      .sort((left, right) => left - right)
+      .map((entry) => `#${entry}`)
+      .join(", ");
+    showSealErrorHtml(
+      "Seal validation failed: duplicate issue numbers",
+      `<p class="text-sm text-red-200">${escapeHtml(label || "Duplicate issue numbers detected.")}</p>`,
+    );
+    return;
+  }
+
+  const fallbackMessage =
+    (errorCode && errorCode.length > 0 ? errorCode : rawResponseBody.trim()) ||
+    (Number.isInteger(statusCode) && statusCode > 0 ? `HTTP ${statusCode}` : "Unknown error");
+  showSealErrorHtml("Seal failed", `<p class="text-sm text-red-200">${escapeHtml(fallbackMessage)}</p>`);
+}
+
+function syncStagedCommitUi(orchestrator) {
+  const sprintPhase = normalizeStatus(orchestrator?.sprint_phase);
+  const sprint = deriveSprint(orchestrator);
+  sealSprintEl.textContent = sprint;
+
+  const isPendingVerification = sprintPhase === "PENDING_VERIFICATION";
+  sealControlsEl.classList.toggle("hidden", !isPendingVerification);
+
+  kickoffStartWorkflowHintEl?.classList.toggle("hidden", isPendingVerification);
+  kickoffStartLoopButtonEl.classList.toggle("hidden", isPendingVerification);
+  kickoffRunnerLoopContainerEl?.classList.toggle("hidden", isPendingVerification);
+
+  if (!isPendingVerification) {
+    clearSealErrors();
+    if (sealIsLoading) {
+      setSealLoading(false);
+    }
+  }
+}
+
 function setKickoffLoading(isLoading) {
   const nextLoading = Boolean(isLoading);
   kickoffSubmitButtonEl.disabled = nextLoading;
@@ -1072,12 +1202,13 @@ async function startKickoffLoop() {
   setKickoffLoopLoading(true);
 
   try {
+    const requireVerification = Boolean(kickoffRequireVerificationEl?.checked);
     const response = await fetch("/internal/kickoff/start-loop", {
       method: "POST",
       headers: {
         "content-type": "application/json",
       },
-      body: JSON.stringify({ sprint }),
+      body: JSON.stringify({ sprint, require_verification: requireVerification }),
     });
 
     const rawResponseBody = await response.text();
@@ -1263,6 +1394,71 @@ async function stopOrchestrators() {
   }
 }
 
+async function sealSprint() {
+  if (sealIsLoading) {
+    return;
+  }
+
+  clearSealErrors();
+
+  const sprintFromState = deriveSprint(latestOrchestratorSnapshot);
+  const sprint =
+    sprintFromState && sprintFromState !== "N/A" ? sprintFromState : String(kickoffSprintEl?.value ?? "").trim();
+
+  if (!sprint) {
+    renderSealValidationFailure({ error: "Unable to determine sprint id. Refresh status and try again." }, "", 0);
+    return;
+  }
+
+  setSealLoading(true);
+
+  try {
+    const response = await fetch("/internal/sprint/seal", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ sprint }),
+    });
+
+    const rawResponseBody = await response.text();
+    let payload = {};
+    if (rawResponseBody.trim().length > 0) {
+      try {
+        payload = asObject(JSON.parse(rawResponseBody));
+      } catch {
+        payload = {};
+      }
+    }
+
+    if (!response.ok) {
+      if (response.status === 400) {
+        renderSealValidationFailure(payload, rawResponseBody, response.status);
+        return;
+      }
+      const fallbackMessage =
+        (typeof payload.error === "string" && payload.error.trim().length > 0
+          ? payload.error.trim()
+          : rawResponseBody.trim()) || `HTTP ${response.status}`;
+      throw new Error(fallbackMessage);
+    }
+
+    const planVersion = typeof payload.plan_version === "string" ? payload.plan_version.trim() : "";
+    const suffix = planVersion ? ` (plan_version ${planVersion})` : "";
+    clearSealErrors();
+    showKickoffMessage(`Sprint sealed${suffix}. Refreshing status...`);
+    await loadStatus();
+  } catch (error) {
+    renderSealValidationFailure(
+      { error: `Failed to seal sprint: ${error?.message ?? "Unknown error"}` },
+      "",
+      0,
+    );
+  } finally {
+    setSealLoading(false);
+  }
+}
+
 function clearSettingsFieldValidation() {
   for (const field of Object.values(settingsFieldByName)) {
     field.classList.remove("border-zinc-300", "ring-1", "ring-zinc-300/60");
@@ -1428,7 +1624,11 @@ async function loadStatus() {
     const payload = asObject(await response.json());
     const orchestrator = asObject(payload?.orchestrator);
     const runner = asObject(payload?.runner);
-    const runnerEntries = buildRunnerEntries(runner);
+    latestOrchestratorSnapshot = orchestrator;
+    syncStagedCommitUi(orchestrator);
+
+    const runnerRuns = getRunnerRunsObject(runner);
+    const runnerEntries = buildRunnerEntries(runnerRuns);
     latestRunnerEntries = runnerEntries;
 
     if (detectReviewerNeedsHumanApprovalTransition(orchestrator)) {
@@ -1452,7 +1652,7 @@ async function loadStatus() {
     renderRunner(runnerEntries);
     syncTerminalRuns(runnerEntries);
     renderTerminalHealth(runnerEntries);
-    background.setActivityFromData(orchestrator, runner);
+    background.setActivityFromData(orchestrator, runnerRuns);
     lastRefreshEl.textContent = formatTime(new Date().toISOString());
     clearError();
   } catch (error) {
@@ -1479,6 +1679,7 @@ settingsSoundNeedsHumanApprovalEl?.addEventListener("change", () => {
   }
 });
 kickoffFormEl.addEventListener("submit", submitKickoff);
+sealSprintButtonEl.addEventListener("click", sealSprint);
 kickoffStartLoopButtonEl.addEventListener("click", startKickoffLoop);
 kickoffStartRunnerLoopButtonEl.addEventListener("click", startRunnerLoop);
 kickoffStopOrchestratorsButtonEl.addEventListener("click", stopOrchestrators);

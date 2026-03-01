@@ -34,5 +34,5 @@ class LedgerTests(unittest.TestCase):
 
             with open(path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
-            self.assertIn(run_id, payload)
-
+            self.assertIn("runs", payload)
+            self.assertIn(run_id, payload["runs"])

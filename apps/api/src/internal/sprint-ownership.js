@@ -461,7 +461,6 @@ export function formatScopeSection({ meta, issueNumber }) {
   const touch = Array.isArray(meta?.touch_paths) ? meta.touch_paths : [];
   const owns = Array.isArray(meta?.owns_paths) ? meta.owns_paths : [];
   const conflicts = Array.isArray(meta?.conflicts_with) ? meta.conflicts_with : [];
-  const depends = Array.isArray(meta?.depends_on) ? meta.depends_on : [];
 
   const fmtPaths = (paths) => (paths.length === 0 ? "- (none)" : paths.map((p) => `- \`${p}\``).join("\n"));
   const fmtIssues = (issues) => (issues.length === 0 ? "(none)" : issues.map((n) => `#${n}`).join(", "));
@@ -475,7 +474,6 @@ export function formatScopeSection({ meta, issueNumber }) {
     `Isolation mode: ${meta?.isolation_mode ?? "ISOLATED"}`,
     `Group: ${meta?.group_id ?? "unknown"}`,
     `conflicts_with: ${fmtIssues(conflicts)}`,
-    `depends_on: ${fmtIssues(depends)}`,
     "If you need to modify files outside Allowed touch paths, comment on this issue requesting scope expansion and list the paths.",
   ]
     .filter((line) => line !== "")
