@@ -238,3 +238,148 @@ test("POST /internal/sprint/seal writes runner caches and updates orchestrator s
 
   await app.close();
 });
+
+test("POST /internal/sprint/seal returns 409 when sprint is ACTIVE and runner ledger has runs", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-sprint-seal-active-has-runs-"));
+  await writeBundleFiles(repoRoot);
+
+  await writeFile(
+    join(repoRoot, ".orchestrator-state.benjaminlu34.agent-dashboard.json"),
+    JSON.stringify(
+      {
+        sprint_phase: "ACTIVE",
+        sealed_at: "2026-02-28T11:00:00.000Z",
+        poll_count: 0,
+        items: {},
+      },
+      null,
+      2,
+    ) + "\n",
+    "utf8",
+  );
+  await writeFile(
+    join(repoRoot, ".runner-ledger.benjaminlu34.agent-dashboard.json"),
+    JSON.stringify(
+      {
+        plan_version: "2026-02-28T11:00:00.000Z",
+        runs: {
+          "run-1": {
+            run_id: "run-1",
+            role: "ORCHESTRATOR",
+            status: "running",
+            result: null,
+          },
+        },
+        tasks: {},
+      },
+      null,
+      2,
+    ) + "\n",
+    "utf8",
+  );
+
+  let githubFactoryCalls = 0;
+
+  const app = await buildTestApp({
+    repoRoot,
+    preflightHandler: buildPreflightPass(),
+    githubClientFactory: async () => {
+      githubFactoryCalls += 1;
+      return {
+        async listProjectItems() {
+          throw new Error("should not fetch project items when reseal is rejected");
+        },
+      };
+    },
+    nowIso: () => "2026-02-28T12:00:00.000Z",
+  });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/internal/sprint/seal",
+    payload: { sprint: "M1-20260228" },
+  });
+
+  assert.equal(response.statusCode, 409);
+  assert.deepEqual(response.json(), {
+    error: "sprint_already_active",
+    detail: "Runner ledger contains execution runs; reseal is not allowed once execution starts.",
+  });
+  assert.equal(githubFactoryCalls, 0);
+
+  await app.close();
+});
+
+test("POST /internal/sprint/seal allows reseal when sprint is ACTIVE but runner ledger has no runs", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-sprint-seal-active-empty-runs-"));
+  await writeBundleFiles(repoRoot);
+
+  await writeFile(
+    join(repoRoot, ".orchestrator-state.benjaminlu34.agent-dashboard.json"),
+    JSON.stringify(
+      {
+        sprint_phase: "ACTIVE",
+        sealed_at: "2026-02-28T11:00:00.000Z",
+        poll_count: 0,
+        items: {},
+      },
+      null,
+      2,
+    ) + "\n",
+    "utf8",
+  );
+  await writeFile(
+    join(repoRoot, ".runner-ledger.benjaminlu34.agent-dashboard.json"),
+    JSON.stringify(
+      {
+        plan_version: "2026-02-28T11:00:00.000Z",
+        runs: {},
+        tasks: {},
+      },
+      null,
+      2,
+    ) + "\n",
+    "utf8",
+  );
+
+  const planVersion = "2026-02-28T12:00:00.000Z";
+  const app = await buildTestApp({
+    repoRoot,
+    preflightHandler: buildPreflightPass(),
+    githubClientFactory: async () => ({
+      async listProjectItems() {
+        return [
+          {
+            project_item_id: "PVTI_10",
+            issue_number: 10,
+            issue_title: "Task 10",
+            issue_url: "https://github.com/acme/repo/issues/10",
+            fields: { Sprint: "M1-20260228", DependsOn: "" },
+          },
+        ];
+      },
+    }),
+    nowIso: () => planVersion,
+  });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/internal/sprint/seal",
+    payload: { sprint: "M1-20260228" },
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.json(), { status: "SEALED", plan_version: planVersion });
+
+  const ledgerRaw = await readFile(join(repoRoot, ".runner-ledger.benjaminlu34.agent-dashboard.json"), "utf8");
+  const ledger = JSON.parse(ledgerRaw);
+  assert.equal(ledger.plan_version, planVersion);
+  assert.deepEqual(ledger.runs, {});
+
+  const orchestratorRaw = await readFile(join(repoRoot, ".orchestrator-state.benjaminlu34.agent-dashboard.json"), "utf8");
+  const orchestrator = JSON.parse(orchestratorRaw);
+  assert.equal(orchestrator.sprint_phase, "ACTIVE");
+  assert.equal(orchestrator.sealed_at, planVersion);
+
+  await app.close();
+});

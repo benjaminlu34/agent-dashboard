@@ -62,6 +62,31 @@ Goal issue requirements:
 
 Note: Scheduler dispatch is status-driven; the GitHub adapter used for `listProjectItems()` does not currently include issue labels, so labels are not used for dispatch filtering.
 
+## Sprint phases (Staged Commit)
+
+Runner treats the orchestrator state file (`ORCHESTRATOR_STATE_PATH`) as the authority for whether the sprint is sealed and safe to execute.
+
+The orchestrator state machine:
+- `PENDING_VERIFICATION`: Sprint kickoff has provisioned GitHub issues + Project items and written structural metadata, but execution must not start yet.
+  Humans are expected to edit GitHub issues and the Project `DependsOn` field, then Seal the sprint.
+- `ACTIVE`: Sprint is sealed. Runner caches are generated and execution may proceed.
+
+### `plan_version` drift defense (non-negotiable)
+
+Sealing generates a `plan_version` (ISO 8601 timestamp) and writes it into both caches:
+- `RUNNER_SPRINT_PLAN_PATH` → `plan_version`
+- `RUNNER_LEDGER_PATH` → `plan_version`
+
+Runner must fail closed (exit code `2`) if either `plan_version` is missing or the values do not strictly match.
+
+### Runner behavior on unsealed sprint
+
+On startup (before entering the main loop), runner reads `sprint_phase` from `ORCHESTRATOR_STATE_PATH`:
+- If `sprint_phase` is `PENDING_VERIFICATION`:
+  - Log: `Sprint pending verification. Awaiting seal.`
+  - If `RUNNER_VERIFY_POLL_SECONDS > 0`, sleep/poll until the phase becomes `ACTIVE`.
+  - If `RUNNER_VERIFY_POLL_SECONDS == 0`, hard-stop with exit code `2`.
+
 ## Dry-run semantics
 
 In dry-run mode, runner:

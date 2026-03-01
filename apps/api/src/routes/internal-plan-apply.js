@@ -319,6 +319,122 @@ function buildIssueTitle(rawTitle) {
   return `[TASK] ${trimmed}`;
 }
 
+function stripBracketPrefix(value) {
+  if (!isNonEmptyString(value)) {
+    return "";
+  }
+  const trimmed = value.trim();
+  const match = trimmed.match(/^\[[^\]]+\]\s*(.+)$/u);
+  return match?.[1] ? match[1].trim() : "";
+}
+
+function buildIssueNumberLookup({ created, issues }) {
+  const lookup = new Map();
+
+  const addKey = (key, issueNumber) => {
+    if (!isNonEmptyString(key)) {
+      return;
+    }
+    const normalized = key.trim().toLowerCase();
+    if (!normalized) {
+      return;
+    }
+    const existing = lookup.get(normalized);
+    if (existing === undefined) {
+      lookup.set(normalized, issueNumber);
+      return;
+    }
+    if (existing !== issueNumber) {
+      lookup.set(normalized, null);
+    }
+  };
+
+  for (const entry of created ?? []) {
+    const issueNumber = entry?.issue_number;
+    const index = entry?.index;
+    if (!Number.isInteger(issueNumber) || issueNumber <= 0 || !Number.isInteger(index) || index < 0) {
+      continue;
+    }
+
+    const issue = issues?.[index];
+    const rawTitle = isNonEmptyString(issue?.title) ? issue.title.trim() : "";
+    const canonicalTitle = rawTitle ? buildIssueTitle(rawTitle) : "";
+
+    addKey(rawTitle, issueNumber);
+    addKey(canonicalTitle, issueNumber);
+
+    const strippedRaw = stripBracketPrefix(rawTitle);
+    addKey(strippedRaw, issueNumber);
+    const strippedCanonical = stripBracketPrefix(canonicalTitle);
+    addKey(strippedCanonical, issueNumber);
+  }
+
+  return lookup;
+}
+
+function resolveDependsOnEntries({ dependsOn, issueNumberLookup }) {
+  const resolved = [];
+  if (!Array.isArray(dependsOn) || dependsOn.length === 0) {
+    return resolved;
+  }
+
+  for (const entry of dependsOn) {
+    if (typeof entry === "number") {
+      if (Number.isInteger(entry) && entry > 0) {
+        resolved.push(entry);
+      }
+      continue;
+    }
+
+    if (typeof entry !== "string") {
+      continue;
+    }
+
+    const raw = entry.trim();
+    if (!raw) {
+      continue;
+    }
+
+    const cleaned = raw.replace(/[#\s]+/gu, "");
+    if (/^[1-9]\d*$/u.test(cleaned)) {
+      const numeric = Number(cleaned);
+      if (Number.isInteger(numeric) && numeric > 0) {
+        resolved.push(numeric);
+        continue;
+      }
+    }
+
+    const candidates = [
+      raw,
+      buildIssueTitle(raw),
+      stripBracketPrefix(raw),
+      stripBracketPrefix(buildIssueTitle(raw)),
+    ]
+      .filter((value) => isNonEmptyString(value))
+      .map((value) => value.trim().toLowerCase())
+      .filter((value) => value.length > 0);
+
+    let mapped = null;
+    for (const candidate of candidates) {
+      const lookupValue = issueNumberLookup.get(candidate);
+      if (lookupValue === undefined) {
+        continue;
+      }
+      mapped = lookupValue;
+      break;
+    }
+
+    if (Number.isInteger(mapped) && mapped > 0) {
+      resolved.push(mapped);
+      continue;
+    }
+
+    resolved.push(raw);
+  }
+
+  return resolved;
+}
+
 async function readOrchestratorStateFile(statePath) {
   try {
     const raw = await readFile(statePath, "utf8");
@@ -529,6 +645,37 @@ export function buildInternalPlanApplyHandler({
         project_item_id: projectItem.project_item_id,
         fields_set: fieldsSet,
       });
+    }
+
+    const issueNumberLookup = buildIssueNumberLookup({ created, issues: normalizedIssues });
+    for (const entry of created) {
+      const issue = normalizedIssues[entry.index];
+      if (!Array.isArray(issue?.depends_on) || issue.depends_on.length === 0) {
+        continue;
+      }
+
+      const resolvedDependsOn = resolveDependsOnEntries({
+        dependsOn: issue.depends_on,
+        issueNumberLookup,
+      });
+      const resolvedValue = formatDependsOnFieldValue(resolvedDependsOn);
+
+      if (resolvedValue === entry.fields_set.DependsOn) {
+        continue;
+      }
+
+      try {
+        await githubClient.updateProjectItemField({
+          projectItemId: entry.project_item_id,
+          field: "DependsOn",
+          value: resolvedValue,
+        });
+      } catch (error) {
+        reply.code(502);
+        return buildPartialFailResponse({ created, index: entry.index, step: "update_depends_on_field", error });
+      }
+
+      entry.fields_set.DependsOn = resolvedValue;
     }
 
     const issuesForScope = created.map((entry) => {

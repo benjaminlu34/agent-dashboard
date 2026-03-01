@@ -693,6 +693,376 @@ test("POST /internal/plan-apply auto-seals runner caches when require_verificati
   assert.deepEqual(ledger.runs, {});
 });
 
+test("POST /internal/plan-apply resolves title depends_on entries into issue numbers before auto-seal", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-plan-apply-auto-seal-depends-on-"));
+  await writeBundleFiles(repoRoot);
+
+  const graphqlCalls = [];
+  const graphqlEndpoint = "https://example.test/graphql";
+  const restEndpoint = "https://example.test/rest";
+  const planVersion = "2026-02-28T12:00:00.000Z";
+  let issueCounter = 0;
+  const createdIssues = [];
+  const dependsByProjectItemId = new Map();
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    const href = String(url);
+    const method = typeof options.method === "string" ? options.method.toUpperCase() : "GET";
+    const payload = typeof options.body === "string" ? JSON.parse(options.body) : null;
+
+    if (href === graphqlEndpoint) {
+      graphqlCalls.push(payload);
+      const query = typeof payload?.query === "string" ? payload.query : "";
+
+      if (query.includes("projectsV2")) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              data: {
+                user: {
+                  repository: {
+                    id: "R_repo",
+                    labels: { nodes: [] },
+                  },
+                  projectsV2: {
+                    nodes: [
+                      {
+                        id: "PVT_project",
+                        number: 1,
+                        title: "Codex Task Board",
+                        fields: {
+                          nodes: [
+                            {
+                              __typename: "ProjectV2SingleSelectField",
+                              id: "field_status",
+                              name: "Status",
+                              dataType: "SINGLE_SELECT",
+                              options: [
+                                { id: "opt_backlog", name: "Backlog" },
+                                { id: "opt_ready", name: "Ready" },
+                              ],
+                            },
+                            {
+                              __typename: "ProjectV2SingleSelectField",
+                              id: "field_size",
+                              name: "Size",
+                              dataType: "SINGLE_SELECT",
+                              options: [
+                                { id: "opt_s", name: "S" },
+                                { id: "opt_m", name: "M" },
+                                { id: "opt_l", name: "L" },
+                              ],
+                            },
+                            {
+                              __typename: "ProjectV2SingleSelectField",
+                              id: "field_area",
+                              name: "Area",
+                              dataType: "SINGLE_SELECT",
+                              options: [
+                                { id: "opt_api", name: "api" },
+                                { id: "opt_docs", name: "docs" },
+                              ],
+                            },
+                            {
+                              __typename: "ProjectV2SingleSelectField",
+                              id: "field_priority",
+                              name: "Priority",
+                              dataType: "SINGLE_SELECT",
+                              options: [
+                                { id: "opt_p0", name: "P0" },
+                                { id: "opt_p1", name: "P1" },
+                                { id: "opt_p2", name: "P2" },
+                              ],
+                            },
+                            {
+                              __typename: "ProjectV2Field",
+                              id: "field_sprint",
+                              name: "Sprint",
+                              dataType: "TEXT",
+                            },
+                            {
+                              __typename: "ProjectV2Field",
+                              id: "field_depends",
+                              name: "DependsOn",
+                              dataType: "TEXT",
+                            },
+                          ],
+                        },
+                      },
+                    ],
+                  },
+                },
+              },
+            };
+          },
+        };
+      }
+
+      if (query.includes("createIssue")) {
+        issueCounter += 1;
+        const number = 900 + issueCounter;
+        createdIssues.push({
+          number,
+          title: payload?.variables?.title ?? "",
+          url: `https://github.com/benjaminlu34/agent-dashboard/issues/${number}`,
+        });
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              data: {
+                createIssue: {
+                  issue: {
+                    id: `I_kw_test_${number}`,
+                    number,
+                    url: `https://github.com/benjaminlu34/agent-dashboard/issues/${number}`,
+                  },
+                },
+              },
+            };
+          },
+        };
+      }
+
+      if (query.includes("addProjectV2ItemById")) {
+        const projectItemId = `PVTI_test_${issueCounter}`;
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              data: {
+                addProjectV2ItemById: {
+                  item: {
+                    id: projectItemId,
+                  },
+                },
+              },
+            };
+          },
+        };
+      }
+
+      if (query.includes("updateProjectV2ItemFieldValue")) {
+        const vars = payload?.variables ?? {};
+        const itemId = vars.itemId;
+        if (typeof itemId === "string" && itemId) {
+          if (typeof vars.fieldId === "string" && vars.fieldId === "field_depends" && typeof vars.textValue === "string") {
+            dependsByProjectItemId.set(itemId, vars.textValue);
+          }
+
+          for (const key of Object.keys(vars)) {
+            if (!key.startsWith("fieldId")) {
+              continue;
+            }
+            const suffix = key.slice("fieldId".length);
+            if (vars[key] !== "field_depends") {
+              continue;
+            }
+            const textKey = `textValue${suffix}`;
+            if (typeof vars[textKey] === "string") {
+              dependsByProjectItemId.set(itemId, vars[textKey]);
+            }
+          }
+        }
+
+        const data = {};
+        for (const key of Object.keys(vars)) {
+          if (!key.startsWith("fieldId")) {
+            continue;
+          }
+          const suffix = key.slice("fieldId".length);
+          data[`f${suffix}`] = { projectV2Item: { id: "PVTI_updated" } };
+        }
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { data };
+          },
+        };
+      }
+
+      if (query.includes("items(first: 100") && query.includes("... on ProjectV2")) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              data: {
+                node: {
+                  items: {
+                    pageInfo: { hasNextPage: false, endCursor: null },
+                    nodes: createdIssues.map((issue, index) => {
+                      const projectItemId = `PVTI_test_${index + 1}`;
+                      const dependsValue = dependsByProjectItemId.get(projectItemId) ?? "";
+                      return {
+                        id: projectItemId,
+                        content: {
+                          number: issue.number,
+                          title: issue.title,
+                          url: issue.url,
+                          repository: {
+                            name: "agent-dashboard",
+                            owner: { login: "benjaminlu34" },
+                          },
+                        },
+                        fieldValues: {
+                          nodes: [
+                            {
+                              text: "M1",
+                              field: { name: "Sprint" },
+                            },
+                            {
+                              text: dependsValue,
+                              field: { name: "DependsOn" },
+                            },
+                            {
+                              name: "P1",
+                              field: { name: "Priority" },
+                            },
+                          ],
+                        },
+                      };
+                    }),
+                  },
+                },
+              },
+            };
+          },
+        };
+      }
+
+      throw new Error(`unexpected GraphQL request: ${query}`);
+    }
+
+    if (href.startsWith(restEndpoint)) {
+      if (method === "PATCH" && href.includes("/issues/")) {
+        const match = href.match(/\/issues\/(\d+)$/u);
+        const issueNumber = match ? Number(match[1]) : 0;
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              number: issueNumber,
+              html_url: `https://github.com/benjaminlu34/agent-dashboard/issues/${issueNumber}`,
+              node_id: `I_kw_rest_${issueNumber}`,
+            };
+          },
+        };
+      }
+      throw new Error(`unexpected REST request: ${method} ${href}`);
+    }
+
+    throw new Error(`unexpected fetch url: ${href}`);
+  };
+
+  const githubClientFactory = async ({ repoRoot: root, projectIdentity }) => {
+    const client = await createGitHubPlanApplyClient({
+      repoRoot: root,
+      projectIdentity,
+      githubToken: "test-token",
+      graphqlEndpoint,
+      restEndpoint,
+    });
+
+    return {
+      ...client,
+      async listRepoDirectory() {
+        throw new Error("repo scan disabled for test");
+      },
+    };
+  };
+
+  const app = buildApp();
+  await registerInternalPlanApplyRoute(app, {
+    repoRoot,
+    env: {},
+    preflightHandler: buildPreflightPass(),
+    githubClientFactory,
+    nowIso: () => planVersion,
+  });
+
+  const reply = buildReply();
+  let result;
+  try {
+    result = await app.handler(
+      {
+        body: {
+          role: "ORCHESTRATOR",
+          draft: {
+            sprint: "M1",
+            require_verification: false,
+            issues: [
+              {
+                title: "[TASK] Base task",
+                goal: "Base goal.",
+                non_goals: ["None"],
+                acceptance_criteria: ["Done"],
+                files_likely_touched: ["apps/api/src/routes/internal-plan-apply.js"],
+                definition_of_done: ["Sealed."],
+                size: "S",
+                area: "api",
+                priority: "P1",
+                initial_status: "Backlog",
+              },
+              {
+                title: "[TASK] Dependent task",
+                goal: "Dependent goal.",
+                non_goals: ["None"],
+                acceptance_criteria: ["Done"],
+                files_likely_touched: ["apps/api/src/routes/internal-plan-apply.js"],
+                definition_of_done: ["Sealed."],
+                size: "S",
+                area: "api",
+                priority: "P1",
+                initial_status: "Backlog",
+                depends_on: ["[TASK] Base task"],
+              },
+            ],
+          },
+        },
+      },
+      reply,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(reply.statusCode, 200);
+  assert.equal(result.status, "APPLIED");
+
+  const updateCalls = graphqlCalls.filter(
+    (entry) => typeof entry?.query === "string" && entry.query.includes("updateProjectV2ItemFieldValue"),
+  );
+  const dependsOnUpdates = updateCalls.filter((entry) => {
+    const vars = entry?.variables ?? {};
+    if (typeof vars.fieldId === "string") {
+      return vars.fieldId === "field_depends";
+    }
+    return Object.keys(vars).some((key) => key.startsWith("fieldId") && vars[key] === "field_depends");
+  });
+  assert.ok(dependsOnUpdates.length >= 1);
+
+  const dependentIssueNumber = createdIssues.find((issue) => issue.title === "[TASK] Dependent task")?.number;
+  const baseIssueNumber = createdIssues.find((issue) => issue.title === "[TASK] Base task")?.number;
+  assert.ok(Number.isInteger(dependentIssueNumber));
+  assert.ok(Number.isInteger(baseIssueNumber));
+
+  const planRaw = await readFile(join(repoRoot, ".runner-sprint-plan.json"), "utf8");
+  const plan = JSON.parse(planRaw);
+  const dependentTask = plan.tasks.find((task) => task.issue_number === dependentIssueNumber);
+  const baseTask = plan.tasks.find((task) => task.issue_number === baseIssueNumber);
+  assert.ok(dependentTask);
+  assert.ok(baseTask);
+  assert.deepEqual(dependentTask.depends_on, [baseTask.project_item_id]);
+});
+
 test("POST /internal/plan-apply returns PARTIAL_FAIL shape when a later issue fails", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-plan-apply-partial-fail-"));
   await writeBundleFiles(repoRoot);

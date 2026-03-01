@@ -275,6 +275,14 @@ function parseProjectItemFields(fieldValuesNodes) {
   return fields;
 }
 
+function parseProjectItemFieldValueByName(value) {
+  const optionName = value?.name;
+  if (isNonEmptyString(optionName)) {
+    return optionName;
+  }
+  return typeof value?.text === "string" ? value.text : "";
+}
+
 function requireOptionId(fieldsByName, fieldName, optionName) {
   const field = fieldsByName[fieldName];
   if (!field) {
@@ -828,6 +836,38 @@ export async function createGitHubPlanApplyClient({
                           }
                         }
                       }
+                      statusValue: fieldValueByName(name: "Status") {
+                        ... on ProjectV2ItemFieldSingleSelectValue {
+                          name
+                        }
+                        ... on ProjectV2ItemFieldTextValue {
+                          text
+                        }
+                      }
+                      sprintValue: fieldValueByName(name: "Sprint") {
+                        ... on ProjectV2ItemFieldSingleSelectValue {
+                          name
+                        }
+                        ... on ProjectV2ItemFieldTextValue {
+                          text
+                        }
+                      }
+                      priorityValue: fieldValueByName(name: "Priority") {
+                        ... on ProjectV2ItemFieldSingleSelectValue {
+                          name
+                        }
+                        ... on ProjectV2ItemFieldTextValue {
+                          text
+                        }
+                      }
+                      dependsOnValue: fieldValueByName(name: "DependsOn") {
+                        ... on ProjectV2ItemFieldSingleSelectValue {
+                          name
+                        }
+                        ... on ProjectV2ItemFieldTextValue {
+                          text
+                        }
+                      }
                       fieldValues(first: 50) {
                         nodes {
                           ... on ProjectV2ItemFieldSingleSelectValue {
@@ -870,14 +910,27 @@ export async function createGitHubPlanApplyClient({
             continue;
           }
 
-	          items.push({
-	            project_item_id: node.id,
-	            issue_number: issueNumber,
-	            issue_title: isNonEmptyString(node?.content?.title) ? node.content.title.trim() : "",
-	            issue_url: issueUrl,
-	            fields: parseProjectItemFields(node?.fieldValues?.nodes),
-	          });
-	        }
+          const fields = parseProjectItemFields(node?.fieldValues?.nodes);
+          const overrides = {
+            Status: parseProjectItemFieldValueByName(node?.statusValue),
+            Sprint: parseProjectItemFieldValueByName(node?.sprintValue),
+            Priority: parseProjectItemFieldValueByName(node?.priorityValue),
+            DependsOn: parseProjectItemFieldValueByName(node?.dependsOnValue),
+          };
+          for (const [fieldName, value] of Object.entries(overrides)) {
+            if (isNonEmptyString(value)) {
+              fields[fieldName] = value;
+            }
+          }
+
+          items.push({
+            project_item_id: node.id,
+            issue_number: issueNumber,
+            issue_title: isNonEmptyString(node?.content?.title) ? node.content.title.trim() : "",
+            issue_url: issueUrl,
+            fields,
+          });
+        }
 
         if (!connection?.pageInfo?.hasNextPage) {
           break;

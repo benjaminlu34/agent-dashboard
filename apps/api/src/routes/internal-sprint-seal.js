@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -69,6 +70,42 @@ function parseProjectIdentityPolicyFromBundle(bundle) {
   } catch {
     throw new GitHubPlanApplyError("invalid project identity policy JSON");
   }
+}
+
+async function readJsonObjectOrNull(path) {
+  try {
+    const raw = await readFile(path, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+    return parsed;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return null;
+    }
+    if (error instanceof SyntaxError) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function normalizeSprintPhase(value) {
+  if (!isNonEmptyString(value)) {
+    return "";
+  }
+  return value.trim().toUpperCase();
+}
+
+function extractLedgerRunsObject(ledger) {
+  if (!ledger || typeof ledger !== "object" || Array.isArray(ledger)) {
+    return null;
+  }
+  if ("runs" in ledger) {
+    return ledger.runs && typeof ledger.runs === "object" && !Array.isArray(ledger.runs) ? ledger.runs : null;
+  }
+  return ledger;
 }
 
 export function buildInternalSprintSealHandler({
@@ -150,17 +187,6 @@ export function buildInternalSprintSealHandler({
       throw error;
     }
 
-    let githubClient;
-    try {
-      githubClient = await githubClientFactory({ repoRoot, projectIdentity });
-    } catch (error) {
-      if (error instanceof GitHubPlanApplyError) {
-        reply.code(502);
-        return { error: error.message };
-      }
-      throw error;
-    }
-
     const orchestratorStatePath = resolveOrchestratorStatePath({
       repoRoot,
       env,
@@ -174,6 +200,40 @@ export function buildInternalSprintSealHandler({
       ownerLogin: targetIdentity?.owner_login,
       repoName: targetIdentity?.repo_name,
     });
+
+    const state = await readJsonObjectOrNull(orchestratorStatePath);
+    const phase = normalizeSprintPhase(state?.sprint_phase);
+    if (phase === "ACTIVE") {
+      const ledgerAbsPath = resolve(repoRoot, runnerLedgerPath);
+      const ledger = await readJsonObjectOrNull(ledgerAbsPath);
+      const runs = extractLedgerRunsObject(ledger);
+      if (!runs) {
+        reply.code(409);
+        return {
+          error: "sprint_already_active",
+          detail: "Runner ledger is missing or invalid; refusing to reseal an active sprint.",
+        };
+      }
+
+      if (Object.keys(runs).length > 0) {
+        reply.code(409);
+        return {
+          error: "sprint_already_active",
+          detail: "Runner ledger contains execution runs; reseal is not allowed once execution starts.",
+        };
+      }
+    }
+
+    let githubClient;
+    try {
+      githubClient = await githubClientFactory({ repoRoot, projectIdentity });
+    } catch (error) {
+      if (error instanceof GitHubPlanApplyError) {
+        reply.code(502);
+        return { error: error.message };
+      }
+      throw error;
+    }
 
     const generation = await generateRunnerStateFromProjectSprint({
       repoRoot,
