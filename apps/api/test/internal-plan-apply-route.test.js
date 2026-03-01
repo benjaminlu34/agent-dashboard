@@ -1684,3 +1684,362 @@ test("GitHub plan apply client batches Sprint and DependsOn text field mutations
     .find((suffix) => variables[`fieldId${suffix}`] === "field_depends");
   assert.equal(variables[`textValue${dependsIndex}`], "42, Bootstrap infra");
 });
+
+test("GitHub plan apply client auto-creates missing issue labels before createIssue", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-plan-apply-client-create-missing-label-"));
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const body = typeof options.body === "string" ? JSON.parse(options.body) : null;
+    calls.push({ url: String(url), body });
+
+    if (!String(url).includes("/graphql") || typeof body?.query !== "string") {
+      throw new Error(`unexpected fetch call: ${String(url)}`);
+    }
+
+    if (body.query.includes("projectsV2")) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            data: {
+              user: {
+                repository: {
+                  id: "R_repo",
+                  labels: {
+                    nodes: [],
+                    pageInfo: {
+                      hasNextPage: false,
+                      endCursor: null,
+                    },
+                  },
+                },
+                projectsV2: {
+                  nodes: [
+                    {
+                      id: "PVT_project",
+                      number: 1,
+                      title: "Codex Task Board",
+                      fields: {
+                        nodes: [
+                          {
+                            __typename: "ProjectV2SingleSelectField",
+                            id: "field_status",
+                            name: "Status",
+                            dataType: "SINGLE_SELECT",
+                            options: [{ id: "opt_backlog", name: "Backlog" }],
+                          },
+                          {
+                            __typename: "ProjectV2SingleSelectField",
+                            id: "field_size",
+                            name: "Size",
+                            dataType: "SINGLE_SELECT",
+                            options: [{ id: "opt_s", name: "S" }],
+                          },
+                          {
+                            __typename: "ProjectV2SingleSelectField",
+                            id: "field_area",
+                            name: "Area",
+                            dataType: "SINGLE_SELECT",
+                            options: [{ id: "opt_api", name: "api" }],
+                          },
+                          {
+                            __typename: "ProjectV2SingleSelectField",
+                            id: "field_priority",
+                            name: "Priority",
+                            dataType: "SINGLE_SELECT",
+                            options: [{ id: "opt_p0", name: "P0" }],
+                          },
+                          {
+                            __typename: "ProjectV2Field",
+                            id: "field_sprint",
+                            name: "Sprint",
+                            dataType: "TEXT",
+                          },
+                          {
+                            __typename: "ProjectV2Field",
+                            id: "field_depends",
+                            name: "DependsOn",
+                            dataType: "TEXT",
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          };
+        },
+      };
+    }
+
+    if (body.query.includes("createLabel")) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            data: {
+              createLabel: {
+                label: {
+                  id: "L_meta_sprint_goal",
+                  name: "meta:sprint-goal",
+                },
+              },
+            },
+          };
+        },
+      };
+    }
+
+    if (body.query.includes("createIssue")) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            data: {
+              createIssue: {
+                issue: {
+                  id: "I_kw_test_101",
+                  number: 101,
+                  url: "https://github.com/benjaminlu34/agent-dashboard/issues/101",
+                },
+              },
+            },
+          };
+        },
+      };
+    }
+
+    throw new Error(`unexpected GraphQL query: ${body.query}`);
+  };
+
+  try {
+    const client = await createGitHubPlanApplyClient({
+      repoRoot,
+      projectIdentity: {
+        owner_login: "benjaminlu34",
+        owner_type: "user",
+        project_name: "Codex Task Board",
+        repository_name: "agent-dashboard",
+      },
+      githubToken: "test-token",
+      graphqlEndpoint: "https://example.test/graphql",
+      restEndpoint: "https://example.test/rest",
+    });
+
+    const created = await client.createIssue({
+      title: "[TASK] Label autocreate",
+      body: "Issue body",
+      labels: ["meta:sprint-goal"],
+    });
+
+    assert.equal(created.issue_number, 101);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const createLabelCalls = calls.filter(
+    (call) => call.url.includes("/graphql") && typeof call?.body?.query === "string" && call.body.query.includes("createLabel"),
+  );
+  assert.equal(createLabelCalls.length, 1);
+
+  const createIssueCall = calls.find(
+    (call) => call.url.includes("/graphql") && typeof call?.body?.query === "string" && call.body.query.includes("createIssue"),
+  );
+  assert.deepEqual(createIssueCall?.body?.variables?.labelIds, ["L_meta_sprint_goal"]);
+});
+
+test("GitHub plan apply client recovers when createLabel races with existing label", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-plan-apply-client-create-label-race-"));
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const body = typeof options.body === "string" ? JSON.parse(options.body) : null;
+    calls.push({ url: String(url), body });
+
+    if (!String(url).includes("/graphql") || typeof body?.query !== "string") {
+      throw new Error(`unexpected fetch call: ${String(url)}`);
+    }
+
+    if (body.query.includes("projectsV2")) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            data: {
+              user: {
+                repository: {
+                  id: "R_repo",
+                  labels: {
+                    nodes: [],
+                    pageInfo: {
+                      hasNextPage: false,
+                      endCursor: null,
+                    },
+                  },
+                },
+                projectsV2: {
+                  nodes: [
+                    {
+                      id: "PVT_project",
+                      number: 1,
+                      title: "Codex Task Board",
+                      fields: {
+                        nodes: [
+                          {
+                            __typename: "ProjectV2SingleSelectField",
+                            id: "field_status",
+                            name: "Status",
+                            dataType: "SINGLE_SELECT",
+                            options: [{ id: "opt_backlog", name: "Backlog" }],
+                          },
+                          {
+                            __typename: "ProjectV2SingleSelectField",
+                            id: "field_size",
+                            name: "Size",
+                            dataType: "SINGLE_SELECT",
+                            options: [{ id: "opt_s", name: "S" }],
+                          },
+                          {
+                            __typename: "ProjectV2SingleSelectField",
+                            id: "field_area",
+                            name: "Area",
+                            dataType: "SINGLE_SELECT",
+                            options: [{ id: "opt_api", name: "api" }],
+                          },
+                          {
+                            __typename: "ProjectV2SingleSelectField",
+                            id: "field_priority",
+                            name: "Priority",
+                            dataType: "SINGLE_SELECT",
+                            options: [{ id: "opt_p0", name: "P0" }],
+                          },
+                          {
+                            __typename: "ProjectV2Field",
+                            id: "field_sprint",
+                            name: "Sprint",
+                            dataType: "TEXT",
+                          },
+                          {
+                            __typename: "ProjectV2Field",
+                            id: "field_depends",
+                            name: "DependsOn",
+                            dataType: "TEXT",
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          };
+        },
+      };
+    }
+
+    if (body.query.includes("createLabel")) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            errors: [{ message: "Name has already been taken" }],
+          };
+        },
+      };
+    }
+
+    if (body.query.includes("labels(first: 100, after: $cursor)")) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            data: {
+              user: {
+                repository: {
+                  labels: {
+                    nodes: [{ id: "L_meta_sprint_goal_existing", name: "meta:sprint-goal" }],
+                    pageInfo: {
+                      hasNextPage: false,
+                      endCursor: null,
+                    },
+                  },
+                },
+              },
+            },
+          };
+        },
+      };
+    }
+
+    if (body.query.includes("createIssue")) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            data: {
+              createIssue: {
+                issue: {
+                  id: "I_kw_test_102",
+                  number: 102,
+                  url: "https://github.com/benjaminlu34/agent-dashboard/issues/102",
+                },
+              },
+            },
+          };
+        },
+      };
+    }
+
+    throw new Error(`unexpected GraphQL query: ${body.query}`);
+  };
+
+  try {
+    const client = await createGitHubPlanApplyClient({
+      repoRoot,
+      projectIdentity: {
+        owner_login: "benjaminlu34",
+        owner_type: "user",
+        project_name: "Codex Task Board",
+        repository_name: "agent-dashboard",
+      },
+      githubToken: "test-token",
+      graphqlEndpoint: "https://example.test/graphql",
+      restEndpoint: "https://example.test/rest",
+    });
+
+    const created = await client.createIssue({
+      title: "[TASK] Label race recovery",
+      body: "Issue body",
+      labels: ["meta:sprint-goal"],
+    });
+
+    assert.equal(created.issue_number, 102);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const refreshCalls = calls.filter(
+    (call) =>
+      call.url.includes("/graphql") &&
+      typeof call?.body?.query === "string" &&
+      call.body.query.includes("labels(first: 100, after: $cursor)") &&
+      !call.body.query.includes("projectsV2"),
+  );
+  assert.equal(refreshCalls.length, 1);
+
+  const createIssueCall = calls.find(
+    (call) => call.url.includes("/graphql") && typeof call?.body?.query === "string" && call.body.query.includes("createIssue"),
+  );
+  assert.deepEqual(createIssueCall?.body?.variables?.labelIds, ["L_meta_sprint_goal_existing"]);
+});

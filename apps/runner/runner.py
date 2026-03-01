@@ -3461,22 +3461,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         preflight_status = _run_preflight_or_exit()
         if preflight_status != 0:
             return preflight_status
-        if not config.dry_run:
-            ledger = RunLedger(configured_ledger_path)
 
         kickoff_run_id = f"kickoff-{uuid4()}"
-        if ledger:
-            ledger.upsert(
-                LedgerEntry(
-                    run_id=kickoff_run_id,
-                    role="ORCHESTRATOR",
-                    intent_hash=f"kickoff:{config.orchestrator_sprint}",
-                    received_at=_utc_now_iso(),
-                    status="queued",
-                    result=None,
-                )
-            )
-            ledger.mark_running(kickoff_run_id)
 
         def _mark_kickoff_result(*, status: str, summary: str, errors: Optional[List[Dict[str, Any]]] = None, details: Optional[Dict[str, Any]] = None) -> None:
             if not ledger:

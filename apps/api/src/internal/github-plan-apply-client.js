@@ -454,15 +454,134 @@ export async function createGitHubPlanApplyClient({
   }
 
   const labelIdByName = {};
+  function cacheLabelIdByName(name, id) {
+    if (!isNonEmptyString(name) || !isNonEmptyString(id)) {
+      return;
+    }
+    labelIdByName[name.trim()] = id;
+    const lower = name.trim().toLowerCase();
+    if (lower) {
+      labelIdByName[lower] = id;
+    }
+  }
+
+  function resolveCachedLabelId(name) {
+    if (!isNonEmptyString(name)) {
+      return "";
+    }
+    const trimmed = name.trim();
+    return labelIdByName[trimmed] ?? labelIdByName[trimmed.toLowerCase()] ?? "";
+  }
+
   for (const node of allLabelNodes) {
-    if (!isNonEmptyString(node?.name) || !isNonEmptyString(node?.id)) {
-      continue;
+    cacheLabelIdByName(node?.name, node?.id);
+  }
+
+  async function refreshRepositoryLabelCache() {
+    let cursor = null;
+
+    do {
+      const data = await requestGraphql({
+        token: githubToken,
+        endpoint: graphqlEndpoint,
+        query: `
+          query($ownerLogin: String!, $repoName: String!, $cursor: String) {
+            ${ownerNode}(login: $ownerLogin) {
+              repository(name: $repoName) {
+                labels(first: 100, after: $cursor) {
+                  nodes {
+                    id
+                    name
+                  }
+                  pageInfo {
+                    hasNextPage
+                    endCursor
+                  }
+                }
+              }
+            }
+          }
+        `,
+        variables: {
+          ownerLogin,
+          repoName: repositoryName,
+          cursor,
+        },
+      });
+
+      const connection = data?.[ownerNode]?.repository?.labels;
+      const nodes = connection?.nodes ?? [];
+      for (const node of nodes) {
+        cacheLabelIdByName(node?.name, node?.id);
+      }
+
+      if (!connection?.pageInfo?.hasNextPage) {
+        break;
+      }
+      cursor = connection?.pageInfo?.endCursor ?? null;
+    } while (isNonEmptyString(cursor));
+  }
+
+  function isLabelAlreadyExistsError(error) {
+    if (!(error instanceof GitHubPlanApplyError) || !isNonEmptyString(error.message)) {
+      return false;
     }
-    labelIdByName[node.name] = node.id;
-    const lower = node.name.trim().toLowerCase();
-    if (lower && !labelIdByName[lower]) {
-      labelIdByName[lower] = node.id;
+    return /already exists|has already been taken/iu.test(error.message);
+  }
+
+  async function createMissingLabel({ name, color = "ffffff" }) {
+    if (!isNonEmptyString(name)) {
+      throw new GitHubPlanApplyError("label name is required");
     }
+
+    try {
+      const data = await requestGraphql({
+        token: githubToken,
+        endpoint: graphqlEndpoint,
+        query: `
+          mutation($repositoryId: ID!, $name: String!, $color: String!) {
+            createLabel(input: { repositoryId: $repositoryId, name: $name, color: $color }) {
+              label {
+                id
+                name
+              }
+            }
+          }
+        `,
+        variables: {
+          repositoryId,
+          name: name.trim(),
+          color,
+        },
+      });
+
+      const created = data?.createLabel?.label;
+      if (!isNonEmptyString(created?.id) || !isNonEmptyString(created?.name)) {
+        throw new GitHubPlanApplyError(`failed to create label: ${name.trim()}`);
+      }
+
+      cacheLabelIdByName(created.name, created.id);
+      return created.id;
+    } catch (error) {
+      if (!isLabelAlreadyExistsError(error)) {
+        throw error;
+      }
+
+      await refreshRepositoryLabelCache();
+      const existing = resolveCachedLabelId(name);
+      if (isNonEmptyString(existing)) {
+        return existing;
+      }
+      throw new GitHubPlanApplyError(`label already exists but could not be resolved: ${name.trim()}`);
+    }
+  }
+
+  async function resolveLabelId(name) {
+    const cached = resolveCachedLabelId(name);
+    if (isNonEmptyString(cached)) {
+      return cached;
+    }
+    return await createMissingLabel({ name });
   }
 
   const project = projectNumber !== null
@@ -606,7 +725,7 @@ export async function createGitHubPlanApplyClient({
       const labelIds = [];
       for (const label of Array.isArray(labels) ? labels : []) {
         const key = label.trim();
-        const id = labelIdByName[key] ?? labelIdByName[key.toLowerCase()];
+        const id = await resolveLabelId(key);
         if (!isNonEmptyString(id)) {
           throw new GitHubPlanApplyError(`label not found: ${key}`);
         }
