@@ -4,6 +4,7 @@ import test from "node:test";
 import Fastify from "fastify";
 
 import { registerInternalLogsRoute } from "../src/routes/internal-logs.js";
+import { FakeRedisSub } from "./helpers/fake-redis.js";
 
 test("GET /internal/logs/:runId returns empty transcript when no events exist", async () => {
   const app = Fastify({ logger: false });
@@ -91,6 +92,40 @@ test("POST /internal/logs/events returns 409 when preflight gate fails", async (
   assert.equal(response.statusCode, 409);
   assert.equal(response.json().status, "FAIL");
   assert.equal(Array.isArray(response.json().errors), true);
+
+  await app.close();
+});
+
+test("Redis Pub/Sub telemetry ingestion appends transcript events", async () => {
+  const app = Fastify({ logger: false });
+  const redisSub = new FakeRedisSub();
+  await registerInternalLogsRoute(app, {
+    redisSub,
+    preflightHandler: async () => ({
+      status: "PASS",
+      errors: [],
+    }),
+  });
+
+  redisSub.emitPMessage({
+    channel: "telemetry:events:run-sub-1",
+    message: JSON.stringify({
+      run_id: "run-sub-1",
+      role: "EXECUTOR",
+      section: "SYSTEM OBSERVATION",
+      content: "Hello from pubsub",
+      created_at: "2026-02-28T12:00:00.000Z",
+    }),
+  });
+
+  const snapshot = await app.inject({
+    method: "GET",
+    url: "/internal/logs/run-sub-1",
+  });
+  assert.equal(snapshot.statusCode, 200);
+  const payload = snapshot.json();
+  assert.equal(payload.role, "EXECUTOR");
+  assert.match(payload.logs, /Hello from pubsub/);
 
   await app.close();
 });

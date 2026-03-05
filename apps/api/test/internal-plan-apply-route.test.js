@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { registerInternalPlanApplyRoute } from "../src/routes/internal-plan-apply.js";
 import { createGitHubPlanApplyClient } from "../src/internal/github-plan-apply-client.js";
+import { FakeRedis } from "./helpers/fake-redis.js";
 
 function buildReply() {
   return {
@@ -45,6 +46,13 @@ async function writeBundleFiles(repoRoot) {
   await writeFile(join(repoRoot, "AGENTS.md"), "root governance\n", "utf8");
   await writeFile(join(repoRoot, "agents/ORCHESTRATOR.md"), "orchestrator overlay\n", "utf8");
   await writeFile(
+    join(repoRoot, ".agent-swarm.yml"),
+    ["version: \"1.0\"", "target:", "  owner: \"benjaminlu34\"", "  repo: \"agent-dashboard\"", "  project_v2_number: null", ""].join(
+      "\n",
+    ),
+    "utf8",
+  );
+  await writeFile(
     join(repoRoot, "policy/github-project.json"),
     '{"owner_login":"benjaminlu34","owner_type":"user","project_name":"Codex Task Board","repository_name":"agent-dashboard"}\n',
     "utf8",
@@ -79,6 +87,7 @@ async function writeBundleFiles(repoRoot) {
 test("POST /internal/plan-apply provisions project fields via batched GraphQL mutations and freezes orchestrator state when require_verification=true", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-plan-apply-pass-"));
   await writeBundleFiles(repoRoot);
+  const redis = new FakeRedis();
 
   const graphqlCalls = [];
   const graphqlEndpoint = "https://example.test/graphql";
@@ -293,6 +302,7 @@ test("POST /internal/plan-apply provisions project fields via batched GraphQL mu
     env: {},
     preflightHandler: buildPreflightPass(),
     githubClientFactory,
+    redis,
   });
 
   const reply = buildReply();
@@ -365,9 +375,9 @@ test("POST /internal/plan-apply provisions project fields via batched GraphQL mu
   const dependsSuffix = suffixes.find((suffix) => updateVars[`fieldId${suffix}`] === "field_depends");
   assert.equal(updateVars[`textValue${dependsSuffix}`], "42, Bootstrap infra");
 
-  const statePath = join(repoRoot, ".orchestrator-state.benjaminlu34.agent-dashboard.json");
-  const state = JSON.parse(await readFile(statePath, "utf8"));
-  assert.equal(state.sprint_phase, "PENDING_VERIFICATION");
+  const repoKey = "benjaminlu34.agent-dashboard";
+  const root = await redis.hgetall(`orchestrator:state:${repoKey}:root`);
+  assert.equal(root.sprint_phase, "PENDING_VERIFICATION");
 
   await assert.rejects(readFile(join(repoRoot, ".runner-ledger.benjaminlu34.agent-dashboard.json"), "utf8"), /ENOENT/);
   await assert.rejects(readFile(join(repoRoot, ".runner-sprint-plan.json"), "utf8"), /ENOENT/);
@@ -376,6 +386,7 @@ test("POST /internal/plan-apply provisions project fields via batched GraphQL mu
 test("POST /internal/plan-apply auto-seals runner caches when require_verification=false", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-plan-apply-auto-seal-"));
   await writeBundleFiles(repoRoot);
+  const redis = new FakeRedis();
 
   const graphqlCalls = [];
   const graphqlEndpoint = "https://example.test/graphql";
@@ -638,6 +649,7 @@ test("POST /internal/plan-apply auto-seals runner caches when require_verificati
     preflightHandler: buildPreflightPass(),
     githubClientFactory,
     nowIso: () => planVersion,
+    redis,
   });
 
   const reply = buildReply();
@@ -676,10 +688,10 @@ test("POST /internal/plan-apply auto-seals runner caches when require_verificati
   assert.equal(reply.statusCode, 200);
   assert.equal(result.status, "APPLIED");
 
-  const statePath = join(repoRoot, ".orchestrator-state.benjaminlu34.agent-dashboard.json");
-  const state = JSON.parse(await readFile(statePath, "utf8"));
-  assert.equal(state.sprint_phase, "ACTIVE");
-  assert.equal(state.sealed_at, planVersion);
+  const repoKey = "benjaminlu34.agent-dashboard";
+  const root = await redis.hgetall(`orchestrator:state:${repoKey}:root`);
+  assert.equal(root.sprint_phase, "ACTIVE");
+  assert.equal(root.sealed_at, planVersion);
 
   const planRaw = await readFile(join(repoRoot, ".runner-sprint-plan.json"), "utf8");
   const plan = JSON.parse(planRaw);
@@ -687,15 +699,16 @@ test("POST /internal/plan-apply auto-seals runner caches when require_verificati
   assert.equal(plan.sprint, "M1");
   assert.equal(Array.isArray(plan.tasks), true);
 
-  const ledgerRaw = await readFile(join(repoRoot, ".runner-ledger.benjaminlu34.agent-dashboard.json"), "utf8");
-  const ledger = JSON.parse(ledgerRaw);
-  assert.equal(ledger.plan_version, planVersion);
-  assert.deepEqual(ledger.runs, {});
+  const ledger = await redis.hgetall(`orchestrator:ledger:${repoKey}`);
+  assert.equal(ledger["__meta__:plan_version"], planVersion);
+  const runKeys = Object.keys(ledger).filter((key) => !key.startsWith("__meta__:") && !key.startsWith("__task__:"));
+  assert.deepEqual(runKeys, []);
 });
 
 test("POST /internal/plan-apply resolves title depends_on entries into issue numbers before auto-seal", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-plan-apply-auto-seal-depends-on-"));
   await writeBundleFiles(repoRoot);
+  const redis = new FakeRedis();
 
   const graphqlCalls = [];
   const graphqlEndpoint = "https://example.test/graphql";
@@ -986,6 +999,7 @@ test("POST /internal/plan-apply resolves title depends_on entries into issue num
     preflightHandler: buildPreflightPass(),
     githubClientFactory,
     nowIso: () => planVersion,
+    redis,
   });
 
   const reply = buildReply();
@@ -1066,6 +1080,7 @@ test("POST /internal/plan-apply resolves title depends_on entries into issue num
 test("POST /internal/plan-apply returns PARTIAL_FAIL shape when a later issue fails", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-plan-apply-partial-fail-"));
   await writeBundleFiles(repoRoot);
+  const redis = new FakeRedis();
 
   let issueCounter = 0;
   const githubClientFactory = async () => ({
@@ -1111,6 +1126,7 @@ test("POST /internal/plan-apply returns PARTIAL_FAIL shape when a later issue fa
     env: {},
     preflightHandler: buildPreflightPass(),
     githubClientFactory,
+    redis,
   });
 
   const reply = buildReply();
@@ -1181,12 +1197,14 @@ test("POST /internal/plan-apply returns PARTIAL_FAIL shape when a later issue fa
 test("POST /internal/plan-apply returns 409 with preflight payload when preflight fails", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-plan-apply-preflight-fail-"));
   await writeBundleFiles(repoRoot);
+  const redis = new FakeRedis();
 
   let githubClientFactoryCalled = false;
   const app = buildApp();
   await registerInternalPlanApplyRoute(app, {
     repoRoot,
     env: {},
+    redis,
     preflightHandler: async () => ({
       role: "ORCHESTRATOR",
       bundle_hash: "bundle-hash",
@@ -1236,6 +1254,7 @@ test("POST /internal/plan-apply returns 409 with preflight payload when prefligh
 test("POST /internal/plan-apply rejects legacy PLANNER role", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-plan-apply-legacy-planner-"));
   await writeBundleFiles(repoRoot);
+  const redis = new FakeRedis();
 
   const app = buildApp();
   await registerInternalPlanApplyRoute(app, {
@@ -1243,6 +1262,7 @@ test("POST /internal/plan-apply rejects legacy PLANNER role", async () => {
     env: {},
     preflightHandler: buildPreflightPass(),
     githubClientFactory: async () => ({}),
+    redis,
   });
 
   const reply = buildReply();
@@ -1266,6 +1286,7 @@ test("POST /internal/plan-apply rejects legacy PLANNER role", async () => {
 test("POST /internal/plan-apply preserves bracket-prefixed titles and passes labels when provided", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-plan-apply-labels-"));
   await writeBundleFiles(repoRoot);
+  const redis = new FakeRedis();
 
   const createdIssues = [];
   const githubClientFactory = async () => ({
@@ -1311,6 +1332,7 @@ test("POST /internal/plan-apply preserves bracket-prefixed titles and passes lab
     env: {},
     preflightHandler: buildPreflightPass(),
     githubClientFactory,
+    redis,
   });
 
   const reply = buildReply();
@@ -1361,26 +1383,24 @@ test("POST /internal/plan-apply preserves bracket-prefixed titles and passes lab
   assert.equal(createdIssues[1].title, "[TASK] Implement kickoff validator");
 });
 
-test("POST /internal/plan-apply writes orchestrator state to repo-scoped path by default", async () => {
+test("POST /internal/plan-apply preserves existing Redis state fields", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-plan-apply-state-scoped-"));
   await writeBundleFiles(repoRoot);
+  const redis = new FakeRedis();
+  const repoKey = "benjaminlu34.agent-dashboard";
+  const rootKey = `orchestrator:state:${repoKey}:root`;
+  const itemsKey = `orchestrator:state:${repoKey}:items`;
 
-  const scopedPath = join(repoRoot, ".orchestrator-state.benjaminlu34.agent-dashboard.json");
-  const defaultPath = join(repoRoot, ".orchestrator-state.json");
-  await writeFile(
-    scopedPath,
-    JSON.stringify(
-      {
-        poll_count: 9,
-        items: {
-          existing: { last_seen_status: "Backlog" },
-        },
-      },
-      null,
-      2,
-    ),
-    "utf8",
-  );
+  const inFlightField = "in_flight:700";
+  const inFlightValue = JSON.stringify({
+    run_id: "00000000-0000-4000-8000-000000000000",
+    role: "EXECUTOR",
+    acquired_at: "2026-02-28T12:00:00.000Z",
+    expires_at: "2026-02-28T13:00:00.000Z",
+  });
+
+  await redis.hset(rootKey, { poll_count: "9", [inFlightField]: inFlightValue });
+  await redis.hset(itemsKey, { existing: JSON.stringify({ last_seen_status: "Backlog" }) });
 
   let issueCounter = 0;
   const githubClientFactory = async () => ({
@@ -1405,6 +1425,7 @@ test("POST /internal/plan-apply writes orchestrator state to repo-scoped path by
     env: {},
     preflightHandler: buildPreflightPass(),
     githubClientFactory,
+    redis,
   });
 
   const reply = buildReply();
@@ -1418,11 +1439,11 @@ test("POST /internal/plan-apply writes orchestrator state to repo-scoped path by
           issues: [
             {
               title: "Scoped state write test",
-              goal: "Ensure plan metadata writes to scoped state file.",
+              goal: "Ensure plan metadata writes to Redis state.",
               non_goals: ["No external integrations"],
               acceptance_criteria: ["Plan apply completes successfully."],
               files_likely_touched: ["apps/api/src/routes/internal-plan-apply.js"],
-              definition_of_done: ["State file includes sprint_plan metadata."],
+              definition_of_done: ["Redis includes sprint_plan metadata."],
               size: "S",
               area: "api",
               priority: "P1",
@@ -1436,23 +1457,30 @@ test("POST /internal/plan-apply writes orchestrator state to repo-scoped path by
 
   assert.equal(reply.statusCode, 200);
   assert.equal(result.status, "APPLIED");
-  const scopedState = JSON.parse(await readFile(scopedPath, "utf8"));
-  assert.equal(scopedState.poll_count, 9);
-  assert.deepEqual(scopedState.items, {
-    existing: { last_seen_status: "Backlog" },
-  });
-  assert.equal(scopedState.sprint_phase, "PENDING_VERIFICATION");
-  assert.equal(typeof scopedState.sprint_plan, "object");
-  assert.equal(Object.keys(scopedState.sprint_plan).length, 1);
-  await assert.rejects(readFile(defaultPath, "utf8"), /ENOENT/);
+
+  const root = await redis.hgetall(rootKey);
+  assert.equal(root.poll_count, "9");
+  assert.equal(root[inFlightField], inFlightValue);
+  assert.equal(root.sprint_phase, "PENDING_VERIFICATION");
+  const sprintPlan = JSON.parse(root.sprint_plan);
+  assert.equal(typeof sprintPlan, "object");
+  assert.equal(Object.keys(sprintPlan).length, 1);
+
+  const items = await redis.hgetall(itemsKey);
+  assert.deepEqual(JSON.parse(items.existing), { last_seen_status: "Backlog" });
+
+  await assert.rejects(readFile(join(repoRoot, ".orchestrator-state.benjaminlu34.agent-dashboard.json"), "utf8"), /ENOENT/);
+  await assert.rejects(readFile(join(repoRoot, ".orchestrator-state.json"), "utf8"), /ENOENT/);
 });
 
-test("POST /internal/plan-apply respects ORCHESTRATOR_STATE_PATH override", async () => {
+test("POST /internal/plan-apply ignores ORCHESTRATOR_STATE_PATH for runtime state", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-plan-apply-state-override-"));
   await writeBundleFiles(repoRoot);
+  const redis = new FakeRedis();
 
   const customPath = join(repoRoot, "tmp", "custom-orchestrator.json");
-  const scopedPath = join(repoRoot, ".orchestrator-state.benjaminlu34.agent-dashboard.json");
+  const repoKey = "benjaminlu34.agent-dashboard";
+  const rootKey = `orchestrator:state:${repoKey}:root`;
 
   let issueCounter = 0;
   const githubClientFactory = async () => ({
@@ -1479,6 +1507,7 @@ test("POST /internal/plan-apply respects ORCHESTRATOR_STATE_PATH override", asyn
     },
     preflightHandler: buildPreflightPass(),
     githubClientFactory,
+    redis,
   });
 
   const reply = buildReply();
@@ -1492,11 +1521,11 @@ test("POST /internal/plan-apply respects ORCHESTRATOR_STATE_PATH override", asyn
           issues: [
             {
               title: "State override write test",
-              goal: "Ensure explicit env override is honored.",
+              goal: "Ensure runtime state writes to Redis, not disk.",
               non_goals: ["No runner changes"],
-              acceptance_criteria: ["Plan apply writes to the override path."],
+              acceptance_criteria: ["Plan apply does not write orchestrator state JSON to disk."],
               files_likely_touched: ["apps/api/src/routes/internal-plan-apply.js"],
-              definition_of_done: ["Custom orchestrator state path contains sprint_plan."],
+              definition_of_done: ["Redis orchestrator root contains sprint_plan."],
               size: "S",
               area: "api",
               priority: "P1",
@@ -1510,11 +1539,15 @@ test("POST /internal/plan-apply respects ORCHESTRATOR_STATE_PATH override", asyn
 
   assert.equal(reply.statusCode, 200);
   assert.equal(result.status, "APPLIED");
-  const customState = JSON.parse(await readFile(customPath, "utf8"));
-  assert.equal(customState.sprint_phase, "PENDING_VERIFICATION");
-  assert.equal(typeof customState.sprint_plan, "object");
-  assert.equal(Object.keys(customState.sprint_plan).length, 1);
-  await assert.rejects(readFile(scopedPath, "utf8"), /ENOENT/);
+
+  const root = await redis.hgetall(rootKey);
+  assert.equal(root.sprint_phase, "PENDING_VERIFICATION");
+  const sprintPlan = JSON.parse(root.sprint_plan);
+  assert.equal(typeof sprintPlan, "object");
+  assert.equal(Object.keys(sprintPlan).length, 1);
+
+  await assert.rejects(readFile(customPath, "utf8"), /ENOENT/);
+  await assert.rejects(readFile(join(repoRoot, ".orchestrator-state.benjaminlu34.agent-dashboard.json"), "utf8"), /ENOENT/);
 });
 
 test("GitHub plan apply client batches Sprint and DependsOn text field mutations into one GraphQL request", async () => {
