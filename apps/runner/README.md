@@ -5,6 +5,7 @@ Python-based runner that consumes `apps/orchestrator` JSONL `RUN_INTENT` lines a
 ## Requirements
 
 - Python 3.12+
+- Redis 7+ reachable via `REDIS_URL` (default `redis://localhost:6379/0`)
 - Backend running (`pnpm dev`)
 - Codex CLI configured with `github` and `github_projects` MCP servers (`codex mcp list`)
 
@@ -16,6 +17,7 @@ Required:
 Optional:
 - `BACKEND_BASE_URL` (default `http://localhost:4000`)
 - `BACKEND_TIMEOUT_S` (default `120`)
+- `REDIS_URL` (default `redis://localhost:6379/0`)
 - `RUNNER_MAX_EXECUTORS` (default `3`)
 - `RUNNER_MAX_REVIEWERS` (default `2`)
 - `RUNNER_READY_BUFFER` (default `2`) - minimum number of `Ready` items runner tries to maintain via promotion
@@ -36,6 +38,22 @@ Optional:
 Target repo identity config (`TARGET_*`) is passed through to `apps/orchestrator` and the backend via env.
 
 ## Run
+
+Start Redis locally before running the backend or runner:
+
+```bash
+sudo apt update
+sudo apt install -y redis-server
+sudo service redis-server start
+```
+
+Check status:
+
+```bash
+sudo service redis-server status
+```
+
+If you use `redis-server --port 6379`, Redis runs only for the current shell session. Using `sudo service redis-server start` runs it as a background service.
 
 Dry run (no backend write endpoints; does not execute worker intents):
 

@@ -11,6 +11,7 @@ This guide covers the fastest setup path using the local dashboard.
    - Node.js 18+
    - Python 3.12+
    - `pnpm`
+   - Redis 7+ reachable at `REDIS_URL` (default `redis://localhost:6379/0`)
    - A GitHub Personal Access Token (PAT) with `repo` and `project` scopes
 
 2. **Installation**
@@ -20,13 +21,35 @@ This guide covers the fastest setup path using the local dashboard.
    pip install -r apps/runner/requirements.txt
    ```
 
-3. **Start the control plane**
+3. **Install and start Redis**
+
+   ```bash
+   sudo apt update
+   sudo apt install -y redis-server
+   sudo service redis-server start
+   ```
+
+   Check status:
+
+   ```bash
+   sudo service redis-server status
+   ```
+
+   Use the default connection string unless you are running Redis elsewhere:
+
+   ```bash
+   export REDIS_URL=redis://localhost:6379/0
+   ```
+
+   If you start Redis with `redis-server --port 6379`, it only stays up for that shell session. Using `sudo service redis-server start` runs it in the background.
+
+4. **Start the control plane**
 
    ```bash
    pnpm dev
    ```
 
-4. **Configure via GUI**
+5. **Configure via GUI**
 
    - Open `http://localhost:4000` in your browser.
    - Click **Settings** in the header.
@@ -41,7 +64,7 @@ This guide covers the fastest setup path using the local dashboard.
      - **Important:** Do not paste full URLs into these fields.
    - Click **Save Settings**.
 
-5. **Run preflight checks**
+6. **Run preflight checks**
 
    Open a new terminal tab in the same repo and run:
 
@@ -57,7 +80,7 @@ This guide covers the fastest setup path using the local dashboard.
 
    If the template is missing, `pnpm doctor` prints exact remediation commands you can run.
 
-6. **Initialize sprint and start kickoff loop in the dashboard**
+7. **Initialize sprint and start kickoff loop in the dashboard**
 
    - In the dashboard, use the **Initialize Sprint** section.
    - Enter your high-level sprint objective in the textarea.
@@ -87,7 +110,7 @@ This guide covers the fastest setup path using the local dashboard.
    { "status": "STARTED", "message": "Kickoff loop started.", "pid": 12345, "sprint": "M1", "started_at": "..." }
    ```
 
-7. **(Optional) Dry run the runner**
+8. **(Optional) Dry run the runner**
 
    ```bash
    pnpm runner:dry
@@ -95,7 +118,7 @@ This guide covers the fastest setup path using the local dashboard.
 
    This executes a safe run without modifying the target repository.
 
-8. **CLI fallback for live workflow execution**
+9. **CLI fallback for live workflow execution**
 
    ```bash
    python3 -m apps.runner --kickoff --sprint M1 --goal-file ./goal.txt --loop
@@ -103,7 +126,7 @@ This guide covers the fastest setup path using the local dashboard.
 
    Use this only if you do not start from the GUI button in step 6.
 
-9. **Monitor execution**
+10. **Monitor execution**
 
    Keep the dashboard open at `http://localhost:4000` to watch the live queue and execution states.
 
@@ -120,3 +143,6 @@ This guide covers the fastest setup path using the local dashboard.
 
 - **Doctor fails on auth**
   Verify your PAT is valid and includes the required OAuth scopes: `repo` and `project`.
+
+- **`pnpm dev` fails with `connect ECONNREFUSED 127.0.0.1:6379`**
+  Redis is not running or `REDIS_URL` is pointing at the wrong instance. Start Redis first, then retry `pnpm dev`.
