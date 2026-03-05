@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readdir, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -257,6 +257,58 @@ test("orchestrator CLI prints end-of-sprint summary and exits 0 when sprint is c
   assert.match(result.stderr, /"type":"DISPATCH_SUMMARY"/);
   assert.match(result.stderr, /"type":"END_OF_SPRINT_SUMMARY"/);
   assert.match(result.stderr, /Awaiting Humans|awaiting_humans/);
+});
+
+test("orchestrator CLI preserves sprint seal metadata in state file", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "orchestrator-cli-preserve-phase-"));
+  const statePath = join(tempDir, "state.json");
+  const itemsPath = join(tempDir, "items.json");
+
+  await writeFile(
+    itemsPath,
+    JSON.stringify([
+      { issue_number: 7, project_item_id: "PVTI_7", fields: { Sprint: "M1", Status: "Backlog" } },
+    ]),
+    "utf8",
+  );
+  await writeFile(
+    statePath,
+    `${JSON.stringify(
+      {
+        poll_count: 11,
+        items: {},
+        sprint_plan: {},
+        ownership_index: {},
+        sprint_phase: "ACTIVE",
+        sealed_at: "2026-03-01T14:56:37.764Z",
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+
+  const result = await withPreflightServer({ status: "PASS" }, async (baseUrl) =>
+    runNodeProcess({
+      args: ["apps/orchestrator/src/cli.js", "--once"],
+      env: {
+        ...process.env,
+        ORCHESTRATOR_SPRINT: "M1",
+        ORCHESTRATOR_ITEMS_FILE: itemsPath,
+        ORCHESTRATOR_STATE_PATH: statePath,
+        ORCHESTRATOR_BACKEND_BASE_URL: baseUrl,
+        TARGET_OWNER_LOGIN: "o",
+        TARGET_OWNER_TYPE: "user",
+        TARGET_REPO_NAME: "r",
+        TARGET_PROJECT_NAME: "Codex Task Board",
+      },
+    }),
+  );
+
+  assert.equal(result.code, 0);
+  const persistedState = JSON.parse(await readFile(statePath, "utf8"));
+  assert.equal(persistedState.sprint_phase, "ACTIVE");
+  assert.equal(persistedState.sealed_at, "2026-03-01T14:56:37.764Z");
 });
 
 test("mergeRunnerManagedStateFields preserves newer runner feedback in same status epoch", () => {

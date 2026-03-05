@@ -16,12 +16,15 @@ DEFAULT_BACKEND_BASE_URL = "http://localhost:4000"
 DEFAULT_AGENT_SWARM_CONFIG_PATH = ".agent-swarm.yml"
 DEFAULT_LEDGER_PATH = "./.runner-ledger.json"
 DEFAULT_ORCHESTRATOR_STATE_PATH = "./.orchestrator-state.json"
+DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 
 
 @dataclass(frozen=True)
 class RunnerConfig:
     backend_base_url: str
     backend_timeout_s: float
+    redis_url: str
+    repo_key: str
     orchestrator_sprint: str
     runner_max_executors: int
     runner_max_reviewers: int
@@ -137,6 +140,40 @@ def _read_target_repo_identity_from_agent_swarm(cwd: Path) -> Optional[tuple[str
     return owner_token, repo_token
 
 
+def _require_repo_key_from_agent_swarm(cwd: Path) -> str:
+    if yaml is None:
+        raise ValueError("PyYAML is required to parse .agent-swarm.yml")
+
+    config_path = cwd / DEFAULT_AGENT_SWARM_CONFIG_PATH
+    try:
+        raw = config_path.read_text(encoding="utf8")
+    except FileNotFoundError:
+        raise ValueError("Missing target.owner/target.repo in .agent-swarm.yml; cannot derive Redis repo_key") from None
+
+    try:
+        parsed = yaml.safe_load(raw) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Invalid {DEFAULT_AGENT_SWARM_CONFIG_PATH}: {exc}") from None
+
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Invalid {DEFAULT_AGENT_SWARM_CONFIG_PATH}: root must be a mapping")
+
+    target = parsed.get("target")
+    if not isinstance(target, dict):
+        raise ValueError("Missing target.owner/target.repo in .agent-swarm.yml; cannot derive Redis repo_key")
+
+    owner = target.get("owner")
+    repo = target.get("repo")
+    if not isinstance(owner, str) or not owner.strip():
+        raise ValueError("Missing target.owner/target.repo in .agent-swarm.yml; cannot derive Redis repo_key")
+    if not isinstance(repo, str) or not repo.strip():
+        raise ValueError("Missing target.owner/target.repo in .agent-swarm.yml; cannot derive Redis repo_key")
+
+    owner_token = _sanitize_state_path_token(owner)
+    repo_token = _sanitize_state_path_token(repo)
+    return f"{owner_token}.{repo_token}"
+
+
 def _resolve_repo_scoped_state_defaults(cwd: Path) -> tuple[str, str]:
     identity = _read_target_repo_identity_from_agent_swarm(cwd)
     if identity is None:
@@ -187,6 +224,8 @@ def load_config(
     backend_base_url = resolved_env.get("BACKEND_BASE_URL", DEFAULT_BACKEND_BASE_URL).strip() or DEFAULT_BACKEND_BASE_URL
     backend_base_url = backend_base_url.rstrip("/")
     backend_timeout_s = _parse_positive_float(resolved_env, "BACKEND_TIMEOUT_S", 120.0)
+    redis_url = resolved_env.get("REDIS_URL", DEFAULT_REDIS_URL).strip() or DEFAULT_REDIS_URL
+    repo_key = _require_repo_key_from_agent_swarm(resolved_cwd)
     if orchestrator_sprint_override is not None:
         orchestrator_sprint = orchestrator_sprint_override.strip()
         if not orchestrator_sprint:
@@ -229,6 +268,8 @@ def load_config(
     return RunnerConfig(
         backend_base_url=backend_base_url,
         backend_timeout_s=backend_timeout_s,
+        redis_url=redis_url,
+        repo_key=repo_key,
         orchestrator_sprint=orchestrator_sprint,
         runner_max_executors=runner_max_executors,
         runner_max_reviewers=runner_max_reviewers,

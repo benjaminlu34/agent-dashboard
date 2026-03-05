@@ -194,3 +194,63 @@ test("assertZeroLinkedPullRequests throws when auto-close keyword targets the is
     },
   );
 });
+
+test("assertZeroLinkedPullRequests fails closed on malformed marker block", async () => {
+  await assert.rejects(
+    () =>
+      assertZeroLinkedPullRequests({
+        githubClient: {
+          async listPullRequests() {
+            return [
+              {
+                number: 13,
+                html_url: "https://github.com/org/repo/pull/13",
+                body: ["Refs #12", "<!-- EXECUTOR_RUN_V1", "issue: 12"].join("\n"),
+              },
+            ];
+          },
+        },
+        issueNumber: 12,
+        projectItemId: "PVTI_12",
+      }),
+    (error) => {
+      assert.equal(error instanceof ExecutorPrLinkageError, true);
+      assert.equal(error.message, "malformed executor marker block");
+      assert.equal(error.details?.ambiguous, true);
+      return true;
+    },
+  );
+});
+
+test("assertZeroLinkedPullRequests fails closed when marker run_id is missing", async () => {
+  await assert.rejects(
+    () =>
+      assertZeroLinkedPullRequests({
+        githubClient: {
+          async listPullRequests() {
+            return [
+              {
+                number: 14,
+                html_url: "https://github.com/org/repo/pull/14",
+                body: [
+                  "Refs #12",
+                  "<!-- EXECUTOR_RUN_V1",
+                  "issue: 12",
+                  "project_item_id: PVTI_12",
+                  "-->",
+                ].join("\n"),
+              },
+            ];
+          },
+        },
+        issueNumber: 12,
+        projectItemId: "PVTI_12",
+      }),
+    (error) => {
+      assert.equal(error instanceof ExecutorPrLinkageError, true);
+      assert.equal(error.message, "invalid executor marker run_id");
+      assert.equal(error.details?.ambiguous, true);
+      return true;
+    },
+  );
+});

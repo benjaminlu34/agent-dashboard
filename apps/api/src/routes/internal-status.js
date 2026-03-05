@@ -1,128 +1,122 @@
-import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import YAML from "yaml";
+import { requireRepoKeyFromAgentSwarm } from "../internal/repo-key.js";
 
 const MODULE_DIRNAME = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../../");
-const AGENT_SWARM_CONFIG_PATH = ".agent-swarm.yml";
-const DEFAULT_ORCHESTRATOR_STATE_PATH = "./.orchestrator-state.json";
-const DEFAULT_RUNNER_LEDGER_PATH = "./.runner-ledger.json";
 
-function hasNonEmptyString(value) {
-  return typeof value === "string" && value.trim().length > 0;
-}
-
-function sanitizeStatePathToken(value) {
-  return String(value).trim().replace(/[^A-Za-z0-9._-]/g, "_");
-}
-
-function resolveDefaultStatePaths(targetIdentity) {
-  const owner = targetIdentity?.owner;
-  const repo = targetIdentity?.repo;
-  if (!hasNonEmptyString(owner) || !hasNonEmptyString(repo)) {
-    return {
-      orchestrator: DEFAULT_ORCHESTRATOR_STATE_PATH,
-      runner: DEFAULT_RUNNER_LEDGER_PATH,
-    };
+function safeJsonParse(value, fallback) {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return fallback;
   }
-
-  const ownerToken = sanitizeStatePathToken(owner);
-  const repoToken = sanitizeStatePathToken(repo);
-  return {
-    orchestrator: `./.orchestrator-state.${ownerToken}.${repoToken}.json`,
-    runner: `./.runner-ledger.${ownerToken}.${repoToken}.json`,
-  };
-}
-
-async function readTargetIdentityFromAgentSwarm({ repoRoot }) {
-  const configPath = resolve(repoRoot, AGENT_SWARM_CONFIG_PATH);
-  let rawConfig;
   try {
-    rawConfig = await readFile(configPath, "utf8");
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return null;
-    }
-    throw error;
-  }
-
-  let parsed;
-  try {
-    parsed = YAML.parse(rawConfig) ?? {};
-  } catch {
-    return null;
-  }
-
-  const owner = parsed?.target?.owner;
-  const repo = parsed?.target?.repo;
-  if (!hasNonEmptyString(owner) || !hasNonEmptyString(repo)) {
-    return null;
-  }
-
-  return {
-    owner: owner.trim(),
-    repo: repo.trim(),
-  };
-}
-
-function resolveStatePaths({ repoRoot, env, targetIdentity }) {
-  const defaultPaths = resolveDefaultStatePaths(targetIdentity);
-
-  const orchestratorPath = hasNonEmptyString(env?.ORCHESTRATOR_STATE_PATH)
-    ? env.ORCHESTRATOR_STATE_PATH.trim()
-    : defaultPaths.orchestrator;
-  const runnerPath = hasNonEmptyString(env?.RUNNER_LEDGER_PATH) ? env.RUNNER_LEDGER_PATH.trim() : defaultPaths.runner;
-
-  return {
-    orchestratorPath: resolve(repoRoot, orchestratorPath),
-    runnerPath: resolve(repoRoot, runnerPath),
-  };
-}
-
-async function readJsonObjectOrEmpty(filePath) {
-  try {
-    const raw = await readFile(filePath, "utf8");
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (error) {
-      if (error instanceof SyntaxError) {
-        return {};
-      }
-      throw error;
-    }
+    const parsed = JSON.parse(value);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return {};
+      return fallback;
     }
     return parsed;
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return {};
-    }
-    throw error;
+  } catch {
+    return fallback;
   }
 }
 
-export function buildInternalStatusHandler({ repoRoot = DEFAULT_REPO_ROOT, env = process.env } = {}) {
-  return async function internalStatusHandler(_request, reply) {
-    const targetIdentity = await readTargetIdentityFromAgentSwarm({ repoRoot });
-    const { orchestratorPath, runnerPath } = resolveStatePaths({
-      repoRoot,
-      env,
-      targetIdentity,
-    });
+function toNonNegativeInt(value, fallback = 0) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    return fallback;
+  }
+  return parsed;
+}
 
-    const [orchestrator, runner] = await Promise.all([
-      readJsonObjectOrEmpty(orchestratorPath),
-      readJsonObjectOrEmpty(runnerPath),
+export function buildInternalStatusHandler({ repoRoot = DEFAULT_REPO_ROOT, redis } = {}) {
+  return async function internalStatusHandler(_request, reply) {
+    const redisClient = redis ?? _request?.redis;
+    if (!redisClient) {
+      reply.code(500);
+      return { error: "redis client is not configured" };
+    }
+
+    let repoKeyResult;
+    try {
+      repoKeyResult = await requireRepoKeyFromAgentSwarm({ repoRoot });
+    } catch (error) {
+      reply.code(500);
+      return { error: error instanceof Error ? error.message : "unable to resolve repo key" };
+    }
+
+    const { repoKey, targetIdentity } = repoKeyResult;
+    reply.header("x-target-owner", targetIdentity.owner);
+    reply.header("x-target-repo", targetIdentity.repo);
+
+    const rootKey = `orchestrator:state:${repoKey}:root`;
+    const itemsKey = `orchestrator:state:${repoKey}:items`;
+    const ledgerKey = `orchestrator:ledger:${repoKey}`;
+
+    const [root, itemsRaw, ledgerRaw] = await Promise.all([
+      redisClient.hgetall(rootKey),
+      redisClient.hgetall(itemsKey),
+      redisClient.hgetall(ledgerKey),
     ]);
 
-    if (hasNonEmptyString(targetIdentity?.owner) && hasNonEmptyString(targetIdentity?.repo)) {
-      reply.header("x-target-owner", targetIdentity.owner);
-      reply.header("x-target-repo", targetIdentity.repo);
+    const rootEmpty = !root || typeof root !== "object" || Object.keys(root).length === 0;
+    const items = {};
+    if (itemsRaw && typeof itemsRaw === "object") {
+      for (const [projectItemId, raw] of Object.entries(itemsRaw)) {
+        const parsed = safeJsonParse(raw, null);
+        if (parsed) {
+          items[projectItemId] = parsed;
+        }
+      }
     }
+
+    const rootPollCount = toNonNegativeInt(root?.poll_count, 0);
+    const sprintPlan = safeJsonParse(root?.sprint_plan, {});
+    const ownershipIndex = safeJsonParse(root?.ownership_index, {});
+
+    const orchestrator =
+      rootEmpty && Object.keys(items).length === 0
+        ? {}
+        : {
+            poll_count: rootPollCount,
+            sprint_phase: typeof root?.sprint_phase === "string" ? root.sprint_phase : "",
+            sealed_at: typeof root?.sealed_at === "string" ? root.sealed_at : "",
+            daemon_status: typeof root?.daemon_status === "string" ? root.daemon_status : "",
+            daemon_mode: typeof root?.daemon_mode === "string" ? root.daemon_mode : "",
+            daemon_pid: typeof root?.daemon_pid === "string" ? root.daemon_pid : "",
+            daemon_started_at: typeof root?.daemon_started_at === "string" ? root.daemon_started_at : "",
+            daemon_heartbeat_at: typeof root?.daemon_heartbeat_at === "string" ? root.daemon_heartbeat_at : "",
+            sprint_plan: sprintPlan,
+            ownership_index: ownershipIndex,
+            items,
+          };
+
+    const runs = {};
+    let planVersion = "";
+    if (ledgerRaw && typeof ledgerRaw === "object") {
+      for (const [key, raw] of Object.entries(ledgerRaw)) {
+        if (key.startsWith("__meta__:")) {
+          if (key === "__meta__:plan_version") {
+            planVersion = typeof raw === "string" ? raw : "";
+          }
+          continue;
+        }
+        if (key.startsWith("__task__:")) {
+          continue;
+        }
+        const parsed = safeJsonParse(raw, null);
+        if (parsed) {
+          runs[key] = parsed;
+        }
+      }
+    }
+    const runner =
+      Object.keys(runs).length === 0 && !planVersion
+        ? {}
+        : {
+            plan_version: planVersion,
+            runs,
+          };
 
     return {
       orchestrator,

@@ -5,13 +5,13 @@ from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
 
-from apps.runner.runner import (
+from apps.runner.promotion import (
     MalformedSprintDataError,
-    Runner,
     SanitizationRegenExhaustedError,
     SanitizationRegenHandoffRequestedError,
-    _maybe_autopromote_ready,
+    maybe_autopromote_ready,
 )
+from apps.runner.supervisor import _transition_executor_failure_to_blocked
 
 
 class _BackendStub:
@@ -49,7 +49,7 @@ class RunnerPromotionAndRecoveryTests(unittest.TestCase):
             ],
         }
 
-        _maybe_autopromote_ready(
+        maybe_autopromote_ready(
             summary=summary,
             sprint_plan=None,
             backend=backend,
@@ -103,7 +103,7 @@ class RunnerPromotionAndRecoveryTests(unittest.TestCase):
             },
         }
 
-        _maybe_autopromote_ready(
+        maybe_autopromote_ready(
             summary=summary,
             sprint_plan=sprint_plan,
             backend=backend,
@@ -161,7 +161,7 @@ class RunnerPromotionAndRecoveryTests(unittest.TestCase):
             },
         }
 
-        _maybe_autopromote_ready(
+        maybe_autopromote_ready(
             summary=summary,
             sprint_plan=sprint_plan,
             backend=backend,
@@ -209,7 +209,7 @@ class RunnerPromotionAndRecoveryTests(unittest.TestCase):
             },
         }
 
-        _maybe_autopromote_ready(
+        maybe_autopromote_ready(
             summary=summary,
             sprint_plan=sprint_plan,
             backend=backend,
@@ -258,7 +258,7 @@ class RunnerPromotionAndRecoveryTests(unittest.TestCase):
             },
         }
 
-        _maybe_autopromote_ready(
+        maybe_autopromote_ready(
             summary=summary,
             sprint_plan=sprint_plan,
             backend=backend,
@@ -304,7 +304,7 @@ class RunnerPromotionAndRecoveryTests(unittest.TestCase):
             },
         }
 
-        _maybe_autopromote_ready(
+        maybe_autopromote_ready(
             summary=summary,
             sprint_plan=sprint_plan,
             backend=backend,
@@ -354,7 +354,7 @@ class RunnerPromotionAndRecoveryTests(unittest.TestCase):
         }
         stderr_buffer = StringIO()
         with redirect_stderr(stderr_buffer):
-            _maybe_autopromote_ready(
+            maybe_autopromote_ready(
                 summary=summary,
                 sprint_plan=sprint_plan,
                 backend=backend,
@@ -424,7 +424,7 @@ class RunnerPromotionAndRecoveryTests(unittest.TestCase):
             stderr_buffer = StringIO()
             with redirect_stderr(stderr_buffer):
                 with self.assertRaises(SanitizationRegenHandoffRequestedError) as ctx:
-                    _maybe_autopromote_ready(
+                    maybe_autopromote_ready(
                         summary=summary,
                         sprint_plan=sprint_plan,
                         backend=backend,
@@ -493,7 +493,7 @@ class RunnerPromotionAndRecoveryTests(unittest.TestCase):
         stderr_buffer = StringIO()
         with redirect_stderr(stderr_buffer):
             with self.assertRaises(SanitizationRegenExhaustedError) as ctx:
-                _maybe_autopromote_ready(
+                maybe_autopromote_ready(
                     summary=summary,
                     sprint_plan=sprint_plan,
                     backend=backend,
@@ -550,7 +550,7 @@ class RunnerPromotionAndRecoveryTests(unittest.TestCase):
         stderr_buffer = StringIO()
         with redirect_stderr(stderr_buffer):
             with self.assertRaises(MalformedSprintDataError):
-                _maybe_autopromote_ready(
+                maybe_autopromote_ready(
                     summary=summary,
                     sprint_plan=sprint_plan,
                     backend=backend,
@@ -620,7 +620,7 @@ class RunnerPromotionAndRecoveryTests(unittest.TestCase):
         }
         stderr_buffer = StringIO()
         with redirect_stderr(stderr_buffer):
-            _maybe_autopromote_ready(
+            maybe_autopromote_ready(
                 summary=summary,
                 sprint_plan=sprint_plan,
                 backend=backend,
@@ -643,41 +643,21 @@ class RunnerPromotionAndRecoveryTests(unittest.TestCase):
 
     def test_executor_failure_moves_in_progress_item_to_blocked(self) -> None:
         backend = _BackendStub()
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            state_path = f"{tmp_dir}/orchestrator-state.json"
-            with open(state_path, "w", encoding="utf-8") as handle:
-                json.dump(
-                    {
-                        "poll_count": 10,
-                        "items": {
-                            "PVTI_44": {
-                                "last_seen_issue_number": 44,
-                                "last_seen_status": "In Progress",
-                                "last_dispatched_role": "EXECUTOR",
-                                "last_run_id": "run-44",
-                            }
-                        },
-                    },
-                    handle,
-                )
-
-            runner = Runner(
-                backend=backend,
-                ledger=None,
-                dry_run=False,
-                codex_bin="codex",
-                codex_mcp_args="mcp-server",
-                codex_tools_call_timeout_s=600.0,
-                orchestrator_state_path=state_path,
-                review_stall_polls=50,
-                blocked_retry_minutes=15,
-                watchdog_timeout_s=900,
-            )
-            runner._transition_executor_failure_to_blocked(
-                run_id="run-44",
-                failure_classification="ITEM_STOP",
-                failure_message="mcp call timed out",
-            )
+        items = {
+            "PVTI_44": {
+                "last_seen_issue_number": 44,
+                "last_seen_status": "In Progress",
+                "last_dispatched_role": "EXECUTOR",
+                "last_run_id": "run-44",
+            }
+        }
+        _transition_executor_failure_to_blocked(
+            backend=backend,
+            items=items,
+            run_id="run-44",
+            failure_classification="ITEM_STOP",
+            failure_message="mcp call timed out",
+        )
 
         self.assertEqual(len(backend.calls), 1)
         path, body = backend.calls[0]
@@ -691,41 +671,21 @@ class RunnerPromotionAndRecoveryTests(unittest.TestCase):
 
     def test_executor_fixup_failure_moves_in_review_item_to_blocked(self) -> None:
         backend = _BackendStub()
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            state_path = f"{tmp_dir}/orchestrator-state.json"
-            with open(state_path, "w", encoding="utf-8") as handle:
-                json.dump(
-                    {
-                        "poll_count": 11,
-                        "items": {
-                            "PVTI_55": {
-                                "last_seen_issue_number": 55,
-                                "last_seen_status": "In Review",
-                                "last_dispatched_role": "EXECUTOR",
-                                "last_run_id": "run-55",
-                            }
-                        },
-                    },
-                    handle,
-                )
-
-            runner = Runner(
-                backend=backend,
-                ledger=None,
-                dry_run=False,
-                codex_bin="codex",
-                codex_mcp_args="mcp-server",
-                codex_tools_call_timeout_s=600.0,
-                orchestrator_state_path=state_path,
-                review_stall_polls=50,
-                blocked_retry_minutes=15,
-                watchdog_timeout_s=900,
-            )
-            runner._transition_executor_failure_to_blocked(
-                run_id="run-55",
-                failure_classification="ITEM_STOP",
-                failure_message="executor fixup failed",
-            )
+        items = {
+            "PVTI_55": {
+                "last_seen_issue_number": 55,
+                "last_seen_status": "In Review",
+                "last_dispatched_role": "EXECUTOR",
+                "last_run_id": "run-55",
+            }
+        }
+        _transition_executor_failure_to_blocked(
+            backend=backend,
+            items=items,
+            run_id="run-55",
+            failure_classification="ITEM_STOP",
+            failure_message="executor fixup failed",
+        )
 
         self.assertEqual(len(backend.calls), 1)
         path, body = backend.calls[0]

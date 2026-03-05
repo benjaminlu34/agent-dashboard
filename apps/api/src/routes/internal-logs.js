@@ -428,6 +428,70 @@ export function buildInternalLogsStreamHandler({ transcriptStore }) {
 export async function registerInternalLogsRoute(fastify, options = {}) {
   const transcriptStore = options.transcriptStore ?? createLiveTranscriptStore();
   const preflightCache = new Map();
+  const redisSub = options.redisSub ?? fastify.redisSub;
+
+  if (
+    redisSub &&
+    typeof redisSub.psubscribe === "function" &&
+    typeof redisSub.on === "function" &&
+    !redisSub.__agent_dashboard_telemetry_ingest_started
+  ) {
+    redisSub.__agent_dashboard_telemetry_ingest_started = true;
+
+    const pattern = "telemetry:events:*";
+    try {
+      await redisSub.psubscribe(pattern);
+      redisSub.on("pmessage", (_pattern, _channel, message) => {
+        if (typeof message !== "string" || message.trim().length === 0) {
+          return;
+        }
+
+        let payload;
+        try {
+          payload = JSON.parse(message);
+        } catch {
+          return;
+        }
+
+        const runId = parseRunId(payload?.run_id ?? payload?.runId);
+        if (!runId) {
+          return;
+        }
+
+        const role = parseRole(payload?.role);
+        if (!role) {
+          return;
+        }
+
+        const section = parseSection(payload?.section ?? "SYSTEM OBSERVATION");
+        if (!section) {
+          return;
+        }
+
+        const content = clipContent(payload?.content);
+        if (!content) {
+          return;
+        }
+
+        transcriptStore.append({
+          runId,
+          role,
+          section,
+          content,
+          createdAt: payload?.created_at ?? payload?.createdAt,
+        });
+      });
+    } catch (error) {
+      try {
+        fastify.log.warn(
+          { err: error instanceof Error ? error : String(error) },
+          "telemetry pubsub subscription failed",
+        );
+      } catch {
+        // best-effort
+      }
+    }
+  }
 
   fastify.get("/internal/logs/stream/:runId", buildInternalLogsStreamHandler({ transcriptStore }));
   fastify.get("/internal/logs/:runId", buildInternalLogsSnapshotHandler({ transcriptStore }));

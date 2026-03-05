@@ -1,61 +1,95 @@
-import tempfile
-import threading
-import time
 import unittest
 
-from apps.runner.runner import Runner
+from apps.runner.in_flight import acquire_in_flight_lock, release_in_flight_lock
 
-
-class _BackendStub:
-    def __init__(self) -> None:
-        self.base_url = "http://localhost:4000"
-
-    def get_agent_context(self, role: str):
-        return {"role": role, "files": []}
-
-    def post_json(self, path: str, *, body):
-        return {"ok": True}
-
-
-def _build_runner(*, state_path: str) -> Runner:
-    return Runner(
-        backend=_BackendStub(),
-        ledger=None,
-        dry_run=False,
-        codex_bin="codex",
-        codex_mcp_args="mcp-server",
-        codex_tools_call_timeout_s=1.0,
-        orchestrator_state_path=state_path,
-        review_stall_polls=50,
-        blocked_retry_minutes=15,
-        watchdog_timeout_s=900,
-    )
+from .fake_redis import FakeRedis
 
 
 class RunnerInFlightGateTests(unittest.TestCase):
     def test_reserve_blocks_until_release(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            runner = _build_runner(state_path=f"{tmp_dir}/orchestrator-state.json")
+        redis = FakeRedis()
+        repo_key = "example.repo"
 
-            runner._reserve_issue_slot(issue_number=42, run_id="run-1", role="EXECUTOR")
+        self.assertTrue(
+            acquire_in_flight_lock(
+                redis_client=redis,
+                repo_key=repo_key,
+                issue_number=42,
+                run_id="run-1",
+                role="EXECUTOR",
+                ttl_s=60,
+            )
+        )
 
-            acquired = threading.Event()
+        self.assertFalse(
+            acquire_in_flight_lock(
+                redis_client=redis,
+                repo_key=repo_key,
+                issue_number=42,
+                run_id="run-2",
+                role="REVIEWER",
+                ttl_s=60,
+            )
+        )
 
-            def reserve_second() -> None:
-                runner._reserve_issue_slot(issue_number=42, run_id="run-2", role="REVIEWER")
-                acquired.set()
+        release_in_flight_lock(redis_client=redis, repo_key=repo_key, issue_number=42, run_id="run-1")
 
-            thread = threading.Thread(target=reserve_second, daemon=True)
-            thread.start()
+        self.assertTrue(
+            acquire_in_flight_lock(
+                redis_client=redis,
+                repo_key=repo_key,
+                issue_number=42,
+                run_id="run-2",
+                role="REVIEWER",
+                ttl_s=60,
+            )
+        )
 
-            # The second reservation must not acquire until the first is released.
-            time.sleep(0.2)
-            self.assertFalse(acquired.is_set())
+        release_in_flight_lock(redis_client=redis, repo_key=repo_key, issue_number=42, run_id="run-2")
 
-            runner._release_issue_slot(issue_number=42, run_id="run-1")
+    def test_acquire_fails_closed_when_eval_unavailable(self) -> None:
+        redis = FakeRedis()
+        repo_key = "example.repo"
+        redis.eval = None  # type: ignore[attr-defined]
 
-            thread.join(timeout=2.0)
-            self.assertTrue(acquired.is_set())
+        self.assertFalse(
+            acquire_in_flight_lock(
+                redis_client=redis,
+                repo_key=repo_key,
+                issue_number=42,
+                run_id="run-1",
+                role="EXECUTOR",
+                ttl_s=60,
+            )
+        )
 
-            runner._release_issue_slot(issue_number=42, run_id="run-2")
+    def test_acquire_fails_closed_when_eval_errors(self) -> None:
+        redis = FakeRedis()
+        repo_key = "example.repo"
 
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("eval failed")
+
+        redis.eval = _boom  # type: ignore[method-assign]
+
+        self.assertFalse(
+            acquire_in_flight_lock(
+                redis_client=redis,
+                repo_key=repo_key,
+                issue_number=42,
+                run_id="run-1",
+                role="EXECUTOR",
+                ttl_s=60,
+            )
+        )
+
+    def test_release_ignores_eval_errors(self) -> None:
+        redis = FakeRedis()
+        repo_key = "example.repo"
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("eval failed")
+
+        redis.eval = _boom  # type: ignore[method-assign]
+
+        release_in_flight_lock(redis_client=redis, repo_key=repo_key, issue_number=42, run_id="run-1")

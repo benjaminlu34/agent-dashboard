@@ -3,7 +3,7 @@ import unittest
 from apps.runner.http_client import HttpError
 from apps.runner.intents import IntentError
 from apps.runner.codex_worker import CodexWorkerError
-from apps.runner.runner import classify_failure
+from apps.runner.failure import classify_failure
 
 
 class FailureClassificationTests(unittest.TestCase):

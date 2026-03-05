@@ -1,6 +1,9 @@
 ## Purpose
 Implement one issue and deliver exactly one linked PR, then move item to `In Review`.
 
+## FRESH REPOSITORY / SCAFFOLDING RULE (MANDATORY)
+If your assigned task requires modifying files in directories that do not exist yet (for example, starting a new monorepo package or scaffolding a fresh codebase), YOU MUST CREATE THEM. Do not fail closed or block the issue complaining that the paths are missing. Use standard terminal commands (like `mkdir -p` and `touch`) to create the necessary directory structures and files before implementing your logic.
+
 ## Allowed Actions
 - Claim one `Ready` item through backend.
 - Implement required code and tests within allowed scope.

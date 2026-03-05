@@ -2,6 +2,7 @@ import Fastify from "fastify";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import fastifyStatic from "@fastify/static";
+import Redis from "ioredis";
 
 import { registerInternalPreflightRoute } from "./routes/internal-preflight.js";
 import { registerInternalRunRoute } from "./routes/internal-run.js";
@@ -20,10 +21,36 @@ import { registerInternalLogsRoute } from "./routes/internal-logs.js";
 const MODULE_DIRNAME = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../");
 
-export async function buildApp({ repoRoot = DEFAULT_REPO_ROOT, logger = true } = {}) {
+export async function buildApp({
+  repoRoot = DEFAULT_REPO_ROOT,
+  logger = true,
+  redisUrl = process.env.REDIS_URL || "redis://localhost:6379/0",
+  redis,
+  redisSub,
+} = {}) {
   const app = Fastify({ logger });
 
-  const routeOptions = { repoRoot };
+  const redisClient = redis ?? new Redis(redisUrl);
+  const redisSubClient = redisSub ?? new Redis(redisUrl);
+
+  app.decorate("redis", redisClient);
+  app.decorate("redisSub", redisSubClient);
+  app.decorateRequest("redis", null);
+
+  app.addHook("onRequest", async (request) => {
+    request.redis = redisClient;
+  });
+
+  app.addHook("onClose", async () => {
+    try {
+      await redisClient.quit();
+    } catch {}
+    try {
+      await redisSubClient.quit();
+    } catch {}
+  });
+
+  const routeOptions = { repoRoot, redis: redisClient, redisSub: redisSubClient };
   await registerInternalPreflightRoute(app, routeOptions);
   await registerInternalRunRoute(app, routeOptions);
   await registerInternalPlanApplyRoute(app, routeOptions);
@@ -33,13 +60,7 @@ export async function buildApp({ repoRoot = DEFAULT_REPO_ROOT, logger = true } =
   await registerInternalExecutorClaimReadyItemRoute(app, routeOptions);
   await registerInternalReviewerResolveLinkedPrRoute(app, routeOptions);
   await registerInternalMetadataRoute(app, routeOptions);
-  await registerInternalStatusRoute(app, {
-    repoRoot,
-    env: {
-      ORCHESTRATOR_STATE_PATH: process.env.ORCHESTRATOR_STATE_PATH,
-      RUNNER_LEDGER_PATH: process.env.RUNNER_LEDGER_PATH,
-    },
-  });
+  await registerInternalStatusRoute(app, routeOptions);
   await registerInternalConfigRoute(app, routeOptions);
   await registerInternalKickoffRoute(app, routeOptions);
   await registerInternalLogsRoute(app, routeOptions);

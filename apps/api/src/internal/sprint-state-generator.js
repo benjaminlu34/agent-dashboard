@@ -1,13 +1,28 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
 import { sanitizeDependencyGraph } from "../../../orchestrator/src/sanitize-dependency-graph.js";
+import { orchestratorLedgerKey, orchestratorRootKey } from "./redis-keys.js";
 
 const RUNNER_SPRINT_PLAN_PATH = "./.runner-sprint-plan.json";
-const RUNNER_LEDGER_PATH = "./.runner-ledger.json";
 
 function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function safeJsonParseOrNull(raw) {
+  if (!isNonEmptyString(raw)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
 function parseDependsOnIssueNumbers(rawValue) {
@@ -112,22 +127,6 @@ function detectCycles({ tasks, dependenciesByTaskId }) {
   return resolved.length > 0 ? resolved : null;
 }
 
-async function readJsonObjectOrEmpty(path, { readFileImpl = readFile } = {}) {
-  try {
-    const raw = await readFileImpl(path, "utf8");
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return {};
-    }
-    return parsed;
-  } catch (error) {
-    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-      return {};
-    }
-    throw error;
-  }
-}
-
 async function atomicWriteJson({
   path,
   tmpPath,
@@ -154,20 +153,26 @@ function normalizeSprintField(value) {
   return isNonEmptyString(value) ? value.trim() : "";
 }
 
+function isSprintGoalTitle(value) {
+  if (!isNonEmptyString(value)) {
+    return false;
+  }
+  return value.trimStart().toUpperCase().startsWith("[SPRINT GOAL]");
+}
+
 export async function generateRunnerStateFromProjectSprint({
   repoRoot,
   sprint,
   githubClient,
-  orchestratorStatePath,
+  redis,
+  repoKey,
   nowIso = () => new Date().toISOString(),
   fs = {
     mkdir,
-    readFile,
     rename,
     writeFile,
   },
   runnerSprintPlanPath = RUNNER_SPRINT_PLAN_PATH,
-  runnerLedgerPath = RUNNER_LEDGER_PATH,
 } = {}) {
   if (!isNonEmptyString(sprint)) {
     return { ok: false, statusCode: 400, payload: { error: "body.sprint is required" } };
@@ -175,8 +180,11 @@ export async function generateRunnerStateFromProjectSprint({
   if (!githubClient || typeof githubClient.listProjectItems !== "function") {
     return { ok: false, statusCode: 500, payload: { error: "githubClient.listProjectItems is required" } };
   }
-  if (!isNonEmptyString(orchestratorStatePath)) {
-    return { ok: false, statusCode: 500, payload: { error: "orchestratorStatePath is required" } };
+  if (!redis || typeof redis.hgetall !== "function" || typeof redis.pipeline !== "function") {
+    return { ok: false, statusCode: 500, payload: { error: "redis client is required" } };
+  }
+  if (!isNonEmptyString(repoKey)) {
+    return { ok: false, statusCode: 500, payload: { error: "repoKey is required" } };
   }
 
   const normalizedSprint = sprint.trim();
@@ -196,12 +204,13 @@ export async function generateRunnerStateFromProjectSprint({
     const itemSprint = normalizeSprintField(item?.fields?.Sprint);
     return itemSprint === normalizedSprint;
   });
+  const executableSprintItems = sprintItems.filter((item) => !isSprintGoalTitle(item?.issue_title));
 
   const taskByIssueNumber = new Map();
   const duplicateIssueNumbers = new Set();
   const tasks = [];
 
-  for (const item of sprintItems) {
+  for (const item of executableSprintItems) {
     const issueNumber = item?.issue_number;
     const projectItemId = item?.project_item_id;
     if (!Number.isInteger(issueNumber) || issueNumber <= 0 || !isNonEmptyString(projectItemId)) {
@@ -245,7 +254,7 @@ export async function generateRunnerStateFromProjectSprint({
   const dependenciesByTaskId = new Map();
   const danglingErrors = [];
 
-  for (const item of sprintItems) {
+  for (const item of executableSprintItems) {
     const issueNumber = item?.issue_number;
     const projectItemId = item?.project_item_id;
     if (!Number.isInteger(issueNumber) || issueNumber <= 0 || !isNonEmptyString(projectItemId)) {
@@ -305,15 +314,19 @@ export async function generateRunnerStateFromProjectSprint({
 
   const planVersion = nowIso();
 
-  const orchestratorState = await readJsonObjectOrEmpty(orchestratorStatePath, { readFileImpl: fs.readFile });
-  const sprintPlanMeta =
-    orchestratorState?.sprint_plan && typeof orchestratorState.sprint_plan === "object"
-      ? orchestratorState.sprint_plan
-      : undefined;
-  const ownershipIndex =
-    orchestratorState?.ownership_index && typeof orchestratorState.ownership_index === "object"
-      ? orchestratorState.ownership_index
-      : undefined;
+  let sprintPlanMeta;
+  let ownershipIndex;
+  try {
+    const root = await redis.hgetall(orchestratorRootKey(repoKey));
+    sprintPlanMeta = safeJsonParseOrNull(root?.sprint_plan);
+    ownershipIndex = safeJsonParseOrNull(root?.ownership_index);
+  } catch (error) {
+    return {
+      ok: false,
+      statusCode: 502,
+      payload: { error: error instanceof Error ? error.message : String(error) },
+    };
+  }
 
   const orderedTasks = tasks.slice().sort((left, right) => left.issue_number - right.issue_number);
   for (const task of orderedTasks) {
@@ -334,37 +347,14 @@ export async function generateRunnerStateFromProjectSprint({
     ...(ownershipIndex ? { ownership_index: ownershipIndex } : {}),
   };
 
-  const ledgerTasks = {};
-  for (const task of orderedTasks) {
-    ledgerTasks[task.project_item_id] = {
-      last_activity_at: planVersion,
-    };
-  }
-
-  const ledgerPayload = {
-    plan_version: planVersion,
-    runs: {},
-    tasks: ledgerTasks,
-  };
-
   const sprintPlanPath = resolve(repoRoot, runnerSprintPlanPath);
   const sprintPlanTmpPath = `${sprintPlanPath}.tmp-${process.pid}`;
-  const ledgerPath = resolve(repoRoot, runnerLedgerPath);
-  const ledgerTmpPath = `${ledgerPath}.tmp-${process.pid}`;
 
   try {
     await atomicWriteJson({
       path: sprintPlanPath,
       tmpPath: sprintPlanTmpPath,
       payload: planPayload,
-      writeFileImpl: fs.writeFile,
-      renameImpl: fs.rename,
-      mkdirImpl: fs.mkdir,
-    });
-    await atomicWriteJson({
-      path: ledgerPath,
-      tmpPath: ledgerTmpPath,
-      payload: ledgerPayload,
       writeFileImpl: fs.writeFile,
       renameImpl: fs.rename,
       mkdirImpl: fs.mkdir,
@@ -378,19 +368,23 @@ export async function generateRunnerStateFromProjectSprint({
   }
 
   try {
-    const nextState = {
-      ...(orchestratorState && typeof orchestratorState === "object" ? orchestratorState : {}),
+    const rootKey = orchestratorRootKey(repoKey);
+    const ledgerKey = orchestratorLedgerKey(repoKey);
+    const pipeline = redis.pipeline();
+    pipeline.hset(rootKey, {
       sprint_phase: "ACTIVE",
       sealed_at: planVersion,
-    };
-    await atomicWriteJson({
-      path: orchestratorStatePath,
-      tmpPath: `${orchestratorStatePath}.tmp-${process.pid}`,
-      payload: nextState,
-      writeFileImpl: fs.writeFile,
-      renameImpl: fs.rename,
-      mkdirImpl: fs.mkdir,
     });
+    pipeline.del(ledgerKey);
+    pipeline.hset(ledgerKey, "__meta__:plan_version", planVersion);
+    for (const task of orderedTasks) {
+      pipeline.hset(
+        ledgerKey,
+        `__task__:${task.project_item_id}`,
+        JSON.stringify({ last_activity_at: planVersion }),
+      );
+    }
+    await pipeline.exec();
   } catch (error) {
     return {
       ok: false,

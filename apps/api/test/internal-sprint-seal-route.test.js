@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { registerInternalSprintSealRoute } from "../src/routes/internal-sprint-seal.js";
+import { FakeRedis } from "./helpers/fake-redis.js";
 
 function buildPreflightPass() {
   return async () => ({
@@ -23,6 +24,13 @@ async function writeBundleFiles(repoRoot) {
   await mkdir(join(repoRoot, "policy"), { recursive: true });
   await writeFile(join(repoRoot, "AGENTS.md"), "root governance\n", "utf8");
   await writeFile(join(repoRoot, "agents/ORCHESTRATOR.md"), "orchestrator overlay\n", "utf8");
+  await writeFile(
+    join(repoRoot, ".agent-swarm.yml"),
+    ["version: \"1.0\"", "target:", "  owner: \"benjaminlu34\"", "  repo: \"agent-dashboard\"", "  project_v2_number: null", ""].join(
+      "\n",
+    ),
+    "utf8",
+  );
   await writeFile(
     join(repoRoot, "policy/github-project.json"),
     '{"owner_login":"benjaminlu34","owner_type":"user","project_name":"Codex Task Board","repository_name":"agent-dashboard"}\n',
@@ -60,10 +68,12 @@ async function buildTestApp(options) {
 test("POST /internal/sprint/seal returns 400 for dangling DependsOn references", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-sprint-seal-dangling-"));
   await writeBundleFiles(repoRoot);
+  const redis = new FakeRedis();
 
   const app = await buildTestApp({
     repoRoot,
     preflightHandler: buildPreflightPass(),
+    redis,
     githubClientFactory: async () => ({
       async listProjectItems() {
         return [
@@ -105,10 +115,12 @@ test("POST /internal/sprint/seal returns 400 for dangling DependsOn references",
 test("POST /internal/sprint/seal returns 400 when DependsOn introduces a cycle", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-sprint-seal-cycle-"));
   await writeBundleFiles(repoRoot);
+  const redis = new FakeRedis();
 
   const app = await buildTestApp({
     repoRoot,
     preflightHandler: buildPreflightPass(),
+    redis,
     githubClientFactory: async () => ({
       async listProjectItems() {
         return [
@@ -162,12 +174,14 @@ test("POST /internal/sprint/seal returns 400 when DependsOn introduces a cycle",
 test("POST /internal/sprint/seal writes runner caches and updates orchestrator state", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-sprint-seal-success-"));
   await writeBundleFiles(repoRoot);
+  const redis = new FakeRedis();
 
   const planVersion = "2026-02-28T12:00:00.000Z";
 
   const app = await buildTestApp({
     repoRoot,
     preflightHandler: buildPreflightPass(),
+    redis,
     githubClientFactory: async () => ({
       async listProjectItems() {
         return [
@@ -220,18 +234,24 @@ test("POST /internal/sprint/seal writes runner caches and updates orchestrator s
     ],
   );
 
-  const ledgerRaw = await readFile(join(repoRoot, ".runner-ledger.benjaminlu34.agent-dashboard.json"), "utf8");
-  const ledger = JSON.parse(ledgerRaw);
-  assert.equal(ledger.plan_version, planVersion);
-  assert.deepEqual(ledger.runs, {});
-  assert.equal(ledger.tasks.PVTI_10.last_activity_at, planVersion);
-  assert.equal(ledger.tasks.PVTI_20.last_activity_at, planVersion);
-  assert.equal(ledger.tasks.PVTI_30.last_activity_at, planVersion);
+  const repoKey = "benjaminlu34.agent-dashboard";
+  const ledger = await redis.hgetall(`orchestrator:ledger:${repoKey}`);
+  assert.equal(ledger["__meta__:plan_version"], planVersion);
+  const runKeys = Object.keys(ledger).filter((key) => !key.startsWith("__meta__:") && !key.startsWith("__task__:"));
+  assert.deepEqual(runKeys, []);
+  assert.equal(JSON.parse(ledger["__task__:PVTI_10"]).last_activity_at, planVersion);
+  assert.equal(JSON.parse(ledger["__task__:PVTI_20"]).last_activity_at, planVersion);
+  assert.equal(JSON.parse(ledger["__task__:PVTI_30"]).last_activity_at, planVersion);
 
-  const orchestratorRaw = await readFile(join(repoRoot, ".orchestrator-state.benjaminlu34.agent-dashboard.json"), "utf8");
-  const orchestrator = JSON.parse(orchestratorRaw);
-  assert.equal(orchestrator.sprint_phase, "ACTIVE");
-  assert.equal(orchestrator.sealed_at, planVersion);
+  const root = await redis.hgetall(`orchestrator:state:${repoKey}:root`);
+  assert.equal(root.sprint_phase, "ACTIVE");
+  assert.equal(root.sealed_at, planVersion);
+
+  await assert.rejects(readFile(join(repoRoot, ".runner-ledger.benjaminlu34.agent-dashboard.json"), "utf8"), /ENOENT/);
+  await assert.rejects(
+    readFile(join(repoRoot, ".orchestrator-state.benjaminlu34.agent-dashboard.json"), "utf8"),
+    /ENOENT/,
+  );
 
   await assert.rejects(readFile(join(repoRoot, ".runner-sprint-plan.json.tmp"), "utf8"), /ENOENT/);
   await assert.rejects(readFile(join(repoRoot, ".runner-ledger.benjaminlu34.agent-dashboard.json.tmp"), "utf8"), /ENOENT/);
@@ -242,47 +262,24 @@ test("POST /internal/sprint/seal writes runner caches and updates orchestrator s
 test("POST /internal/sprint/seal returns 409 when sprint is ACTIVE and runner ledger has runs", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-sprint-seal-active-has-runs-"));
   await writeBundleFiles(repoRoot);
-
-  await writeFile(
-    join(repoRoot, ".orchestrator-state.benjaminlu34.agent-dashboard.json"),
-    JSON.stringify(
-      {
-        sprint_phase: "ACTIVE",
-        sealed_at: "2026-02-28T11:00:00.000Z",
-        poll_count: 0,
-        items: {},
-      },
-      null,
-      2,
-    ) + "\n",
-    "utf8",
-  );
-  await writeFile(
-    join(repoRoot, ".runner-ledger.benjaminlu34.agent-dashboard.json"),
-    JSON.stringify(
-      {
-        plan_version: "2026-02-28T11:00:00.000Z",
-        runs: {
-          "run-1": {
-            run_id: "run-1",
-            role: "ORCHESTRATOR",
-            status: "running",
-            result: null,
-          },
-        },
-        tasks: {},
-      },
-      null,
-      2,
-    ) + "\n",
-    "utf8",
-  );
+  const redis = new FakeRedis();
+  const repoKey = "benjaminlu34.agent-dashboard";
+  await redis.hset(`orchestrator:state:${repoKey}:root`, {
+    sprint_phase: "ACTIVE",
+    sealed_at: "2026-02-28T11:00:00.000Z",
+    poll_count: "0",
+  });
+  await redis.hset(`orchestrator:ledger:${repoKey}`, {
+    "__meta__:plan_version": "2026-02-28T11:00:00.000Z",
+    "run-1": JSON.stringify({ run_id: "run-1", role: "ORCHESTRATOR", status: "running", result: null }),
+  });
 
   let githubFactoryCalls = 0;
 
   const app = await buildTestApp({
     repoRoot,
     preflightHandler: buildPreflightPass(),
+    redis,
     githubClientFactory: async () => {
       githubFactoryCalls += 1;
       return {
@@ -313,39 +310,22 @@ test("POST /internal/sprint/seal returns 409 when sprint is ACTIVE and runner le
 test("POST /internal/sprint/seal allows reseal when sprint is ACTIVE but runner ledger has no runs", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-sprint-seal-active-empty-runs-"));
   await writeBundleFiles(repoRoot);
-
-  await writeFile(
-    join(repoRoot, ".orchestrator-state.benjaminlu34.agent-dashboard.json"),
-    JSON.stringify(
-      {
-        sprint_phase: "ACTIVE",
-        sealed_at: "2026-02-28T11:00:00.000Z",
-        poll_count: 0,
-        items: {},
-      },
-      null,
-      2,
-    ) + "\n",
-    "utf8",
-  );
-  await writeFile(
-    join(repoRoot, ".runner-ledger.benjaminlu34.agent-dashboard.json"),
-    JSON.stringify(
-      {
-        plan_version: "2026-02-28T11:00:00.000Z",
-        runs: {},
-        tasks: {},
-      },
-      null,
-      2,
-    ) + "\n",
-    "utf8",
-  );
+  const redis = new FakeRedis();
+  const repoKey = "benjaminlu34.agent-dashboard";
+  await redis.hset(`orchestrator:state:${repoKey}:root`, {
+    sprint_phase: "ACTIVE",
+    sealed_at: "2026-02-28T11:00:00.000Z",
+    poll_count: "0",
+  });
+  await redis.hset(`orchestrator:ledger:${repoKey}`, {
+    "__meta__:plan_version": "2026-02-28T11:00:00.000Z",
+  });
 
   const planVersion = "2026-02-28T12:00:00.000Z";
   const app = await buildTestApp({
     repoRoot,
     preflightHandler: buildPreflightPass(),
+    redis,
     githubClientFactory: async () => ({
       async listProjectItems() {
         return [
@@ -371,15 +351,14 @@ test("POST /internal/sprint/seal allows reseal when sprint is ACTIVE but runner 
   assert.equal(response.statusCode, 200);
   assert.deepEqual(response.json(), { status: "SEALED", plan_version: planVersion });
 
-  const ledgerRaw = await readFile(join(repoRoot, ".runner-ledger.benjaminlu34.agent-dashboard.json"), "utf8");
-  const ledger = JSON.parse(ledgerRaw);
-  assert.equal(ledger.plan_version, planVersion);
-  assert.deepEqual(ledger.runs, {});
+  const ledger = await redis.hgetall(`orchestrator:ledger:${repoKey}`);
+  assert.equal(ledger["__meta__:plan_version"], planVersion);
+  const runKeys = Object.keys(ledger).filter((key) => !key.startsWith("__meta__:") && !key.startsWith("__task__:"));
+  assert.deepEqual(runKeys, []);
 
-  const orchestratorRaw = await readFile(join(repoRoot, ".orchestrator-state.benjaminlu34.agent-dashboard.json"), "utf8");
-  const orchestrator = JSON.parse(orchestratorRaw);
-  assert.equal(orchestrator.sprint_phase, "ACTIVE");
-  assert.equal(orchestrator.sealed_at, planVersion);
+  const root = await redis.hgetall(`orchestrator:state:${repoKey}:root`);
+  assert.equal(root.sprint_phase, "ACTIVE");
+  assert.equal(root.sealed_at, planVersion);
 
   await app.close();
 });

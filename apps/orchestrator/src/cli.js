@@ -275,6 +275,8 @@ export function mergeRunnerManagedStateFields({ nextState, diskState }) {
   if (!nextState || typeof nextState !== "object") {
     return nextState;
   }
+  const diskRoot = diskState && typeof diskState === "object" ? diskState : {};
+  const nextRoot = nextState && typeof nextState === "object" ? nextState : {};
   const nextItems = nextState.items && typeof nextState.items === "object" ? nextState.items : {};
   const diskItems = diskState?.items && typeof diskState.items === "object" ? diskState.items : {};
   const mergedItems = { ...nextItems };
@@ -342,6 +344,8 @@ export function mergeRunnerManagedStateFields({ nextState, diskState }) {
   }
 
   return {
+    ...diskRoot,
+    ...nextRoot,
     poll_count: Number.isInteger(nextState.poll_count) ? nextState.poll_count : 0,
     items: mergedItems,
     sprint_plan: sprintPlan && typeof sprintPlan === "object" ? sprintPlan : {},
@@ -438,6 +442,7 @@ async function readStateFile(statePath) {
     }
 
     return {
+      ...parsed,
       poll_count: Number.isInteger(parsed.poll_count) && parsed.poll_count >= 0 ? parsed.poll_count : 0,
       items: parsed.items && typeof parsed.items === "object" ? parsed.items : {},
       sprint_plan: parsed.sprint_plan && typeof parsed.sprint_plan === "object" ? parsed.sprint_plan : {},

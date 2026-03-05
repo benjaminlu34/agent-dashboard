@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { buildApp } from "../src/index.js";
+import { FakeRedis, FakeRedisSub } from "./helpers/fake-redis.js";
 
 async function writeFixtureFiles(repoRoot) {
   await mkdir(join(repoRoot, "agents"), { recursive: true });
@@ -14,6 +15,13 @@ async function writeFixtureFiles(repoRoot) {
 
   await writeFile(join(repoRoot, "AGENTS.md"), "root governance\n", "utf8");
   await writeFile(join(repoRoot, "agents/ORCHESTRATOR.md"), "orchestrator overlay\n", "utf8");
+  await writeFile(
+    join(repoRoot, ".agent-swarm.yml"),
+    ["version: \"1.0\"", "target:", "  owner: \"test-owner\"", "  repo: \"test-repo\"", "  project_v2_number: null", "auth:", "  github_token_env: \"GITHUB_TOKEN\"", ""].join(
+      "\n",
+    ),
+    "utf8",
+  );
   await writeFile(
     join(repoRoot, "policy/github-project.json"),
     '{"owner_login":"benjaminlu34","owner_type":"user","project_name":"Codex Task Board"}\n',
@@ -34,7 +42,12 @@ test("buildApp registers routes and GET /internal/agent-context returns 200 for 
   const repoRoot = await mkdtemp(join(tmpdir(), "api-index-route-"));
   await writeFixtureFiles(repoRoot);
 
-  const app = await buildApp({ repoRoot, logger: false });
+  const app = await buildApp({
+    repoRoot,
+    logger: false,
+    redis: new FakeRedis(),
+    redisSub: new FakeRedisSub(),
+  });
 
   const response = await app.inject({
     method: "GET",
@@ -76,8 +89,8 @@ test("buildApp registers routes and GET /internal/agent-context returns 200 for 
   });
   assert.equal(configResponse.statusCode, 200);
   assert.deepEqual(configResponse.json(), {
-    targetOwner: "",
-    targetRepo: "",
+    targetOwner: "test-owner",
+    targetRepo: "test-repo",
     projectNumber: null,
     maxExecutors: null,
     maxReviewers: null,

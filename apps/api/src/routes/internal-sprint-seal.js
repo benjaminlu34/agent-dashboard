@@ -1,10 +1,11 @@
-import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { AgentContextBundleError, loadAgentContextBundle } from "../internal/agent-context-loader.js";
 import { readAgentSwarmTarget } from "../internal/agent-swarm-config.js";
 import { createGitHubPlanApplyClient, GitHubPlanApplyError } from "../internal/github-plan-apply-client.js";
+import { requireRepoKeyFromAgentSwarm } from "../internal/repo-key.js";
+import { orchestratorLedgerKey, orchestratorRootKey } from "../internal/redis-keys.js";
 import { generateRunnerStateFromProjectSprint } from "../internal/sprint-state-generator.js";
 import { resolveTargetIdentity, TargetIdentityError } from "../internal/target-identity.js";
 import { buildPreflightHandler } from "./internal-preflight.js";
@@ -72,25 +73,6 @@ function parseProjectIdentityPolicyFromBundle(bundle) {
   }
 }
 
-async function readJsonObjectOrNull(path) {
-  try {
-    const raw = await readFile(path, "utf8");
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return null;
-    }
-    return parsed;
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return null;
-    }
-    if (error instanceof SyntaxError) {
-      return null;
-    }
-    throw error;
-  }
-}
-
 function normalizeSprintPhase(value) {
   if (!isNonEmptyString(value)) {
     return "";
@@ -98,19 +80,10 @@ function normalizeSprintPhase(value) {
   return value.trim().toUpperCase();
 }
 
-function extractLedgerRunsObject(ledger) {
-  if (!ledger || typeof ledger !== "object" || Array.isArray(ledger)) {
-    return null;
-  }
-  if ("runs" in ledger) {
-    return ledger.runs && typeof ledger.runs === "object" && !Array.isArray(ledger.runs) ? ledger.runs : null;
-  }
-  return ledger;
-}
-
 export function buildInternalSprintSealHandler({
   repoRoot = DEFAULT_REPO_ROOT,
   env = process.env,
+  redis,
   preflightHandler,
   githubClientFactory = createGitHubPlanApplyClient,
   nowIso = () => new Date().toISOString(),
@@ -118,6 +91,21 @@ export function buildInternalSprintSealHandler({
   const resolvedPreflightHandler = preflightHandler ?? buildPreflightHandler({ repoRoot });
 
   return async function internalSprintSealHandler(request, reply) {
+    const redisClient = redis ?? request?.redis;
+    if (!redisClient) {
+      reply.code(500);
+      return { error: "redis client is not configured" };
+    }
+
+    let repoKeyResult;
+    try {
+      repoKeyResult = await requireRepoKeyFromAgentSwarm({ repoRoot });
+    } catch (error) {
+      reply.code(500);
+      return { error: error instanceof Error ? error.message : "unable to resolve repo key" };
+    }
+    const { repoKey } = repoKeyResult;
+
     const body = request?.body;
     const sprint = body?.sprint;
 
@@ -187,27 +175,14 @@ export function buildInternalSprintSealHandler({
       throw error;
     }
 
-    const orchestratorStatePath = resolveOrchestratorStatePath({
-      repoRoot,
-      env,
-      ownerLogin: targetIdentity?.owner_login,
-      repoName: targetIdentity?.repo_name,
-    });
-
     const runnerSprintPlanPath = resolveRunnerSprintPlanPathToken({ env });
-    const runnerLedgerPath = resolveRunnerLedgerPathToken({
-      env,
-      ownerLogin: targetIdentity?.owner_login,
-      repoName: targetIdentity?.repo_name,
-    });
 
-    const state = await readJsonObjectOrNull(orchestratorStatePath);
-    const phase = normalizeSprintPhase(state?.sprint_phase);
+    const root = await redisClient.hgetall(orchestratorRootKey(repoKey));
+    const phase = normalizeSprintPhase(root?.sprint_phase);
     if (phase === "ACTIVE") {
-      const ledgerAbsPath = resolve(repoRoot, runnerLedgerPath);
-      const ledger = await readJsonObjectOrNull(ledgerAbsPath);
-      const runs = extractLedgerRunsObject(ledger);
-      if (!runs) {
+      const ledger = await redisClient.hgetall(orchestratorLedgerKey(repoKey));
+      const planVersion = typeof ledger?.["__meta__:plan_version"] === "string" ? ledger["__meta__:plan_version"] : "";
+      if (!planVersion) {
         reply.code(409);
         return {
           error: "sprint_already_active",
@@ -215,7 +190,10 @@ export function buildInternalSprintSealHandler({
         };
       }
 
-      if (Object.keys(runs).length > 0) {
+      const runEntries = Object.entries(ledger).filter(
+        ([key]) => !key.startsWith("__meta__:") && !key.startsWith("__task__:"),
+      );
+      if (runEntries.length > 0) {
         reply.code(409);
         return {
           error: "sprint_already_active",
@@ -239,10 +217,10 @@ export function buildInternalSprintSealHandler({
       repoRoot,
       sprint: normalizedSprint,
       githubClient,
-      orchestratorStatePath,
+      redis: redisClient,
+      repoKey,
       nowIso,
       runnerSprintPlanPath,
-      runnerLedgerPath,
     });
 
     if (!generation.ok) {

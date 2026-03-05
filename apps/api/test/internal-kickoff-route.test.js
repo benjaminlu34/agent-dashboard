@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import { registerInternalKickoffRoute } from "../src/routes/internal-kickoff.js";
+import { FakeRedis } from "./helpers/fake-redis.js";
 
 function buildReply() {
   return {
@@ -31,11 +32,24 @@ function getPostHandler(app, path) {
   return handler;
 }
 
+async function writeAgentSwarm(repoRoot, { owner = "acme", repo = "project-x" } = {}) {
+  await writeFile(
+    join(repoRoot, ".agent-swarm.yml"),
+    ["target:", `  owner: ${owner}`, `  repo: ${repo}`].join("\n"),
+    "utf8",
+  );
+  return `${owner}.${repo}`;
+}
+
 test("POST /internal/kickoff returns 400 when goal is missing", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-kickoff-400-"));
+  const repoKey = await writeAgentSwarm(repoRoot);
+
+  const redis = new FakeRedis();
   const app = buildApp();
   await registerInternalKickoffRoute(app, {
     repoRoot,
+    redis,
     preflightCheck: async () => ({ statusCode: 200, payload: { status: "PASS" } }),
   });
 
@@ -51,13 +65,20 @@ test("POST /internal/kickoff returns 400 when goal is missing", async () => {
 
   assert.equal(reply.statusCode, 400);
   assert.deepEqual(result, { error: "body.goal must be a non-empty string" });
+
+  const root = await redis.hgetall(`orchestrator:state:${repoKey}:root`);
+  assert.equal(Object.keys(root).length, 0);
 });
 
 test("POST /internal/kickoff returns 409 when preflight fails", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-kickoff-409-"));
+  await writeAgentSwarm(repoRoot);
+
+  const redis = new FakeRedis();
   const app = buildApp();
   await registerInternalKickoffRoute(app, {
     repoRoot,
+    redis,
     preflightCheck: async () => ({
       statusCode: 200,
       payload: {
@@ -77,18 +98,19 @@ test("POST /internal/kickoff returns 409 when preflight fails", async () => {
   assert.equal(Array.isArray(result.errors), true);
 });
 
-test("POST /internal/kickoff writes goal.txt and returns success", async () => {
+test("POST /internal/kickoff stores kickoff_goal in Redis root hash", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-kickoff-200-"));
+  const repoKey = await writeAgentSwarm(repoRoot);
+
+  const redis = new FakeRedis();
   const app = buildApp();
   let requestedRole = "";
   await registerInternalKickoffRoute(app, {
     repoRoot,
+    redis,
     preflightCheck: async ({ role }) => {
       requestedRole = String(role ?? "");
-      return {
-        statusCode: 200,
-        payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] },
-      };
+      return { statusCode: 200, payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] } };
     },
   });
 
@@ -99,20 +121,21 @@ test("POST /internal/kickoff writes goal.txt and returns success", async () => {
 
   assert.equal(reply.statusCode, 200);
   assert.equal(requestedRole, "ORCHESTRATOR");
-  assert.deepEqual(result, {
-    status: "success",
-    message: "Goal Received.",
-  });
+  assert.deepEqual(result, { status: "success", message: "Goal Received." });
 
-  const goalFile = await readFile(join(repoRoot, "goal.txt"), "utf8");
-  assert.equal(goalFile, goal);
+  const stored = await redis.hget(`orchestrator:state:${repoKey}:root`, "kickoff_goal");
+  assert.equal(stored, goal);
 });
 
 test("POST /internal/kickoff/start-loop returns 400 when sprint is missing", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-kickoff-start-loop-400-sprint-"));
+  await writeAgentSwarm(repoRoot);
+
+  const redis = new FakeRedis();
   const app = buildApp();
   await registerInternalKickoffRoute(app, {
     repoRoot,
+    redis,
     preflightCheck: async () => ({ statusCode: 200, payload: { status: "PASS" } }),
   });
 
@@ -124,11 +147,15 @@ test("POST /internal/kickoff/start-loop returns 400 when sprint is missing", asy
   assert.deepEqual(result, { error: "body.sprint must be one of M1, M2, M3, or M4" });
 });
 
-test("POST /internal/kickoff/start-loop returns 400 when goal.txt is missing", async () => {
+test("POST /internal/kickoff/start-loop returns 400 when kickoff goal is missing", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-kickoff-start-loop-400-goal-"));
+  await writeAgentSwarm(repoRoot);
+
+  const redis = new FakeRedis();
   const app = buildApp();
   await registerInternalKickoffRoute(app, {
     repoRoot,
+    redis,
     preflightCheck: async () => ({ statusCode: 200, payload: { status: "PASS" } }),
   });
 
@@ -137,406 +164,114 @@ test("POST /internal/kickoff/start-loop returns 400 when goal.txt is missing", a
   const result = await startLoopHandler({ body: { sprint: "M1" } }, reply);
 
   assert.equal(reply.statusCode, 400);
-  assert.deepEqual(result, { error: "goal.txt is missing or empty; save a kickoff goal first" });
+  assert.deepEqual(result, { error: "kickoff goal is missing; save a kickoff goal first" });
 });
 
-test("POST /internal/kickoff/start-loop returns 409 when preflight fails", async () => {
-  const repoRoot = await mkdtemp(join(tmpdir(), "internal-kickoff-start-loop-409-preflight-"));
-  await writeFile(join(repoRoot, "goal.txt"), "Kick off sprint goals\n", "utf8");
-  const app = buildApp();
-  await registerInternalKickoffRoute(app, {
-    repoRoot,
-    preflightCheck: async () => ({
-      statusCode: 200,
-      payload: {
-        role: "ORCHESTRATOR",
-        status: "FAIL",
-        errors: [{ source: "template", message: "template missing" }],
-      },
-    }),
-  });
-
-  const startLoopHandler = getPostHandler(app, "/internal/kickoff/start-loop");
-  const reply = buildReply();
-  const result = await startLoopHandler({ body: { sprint: "M1" } }, reply);
-
-  assert.equal(reply.statusCode, 409);
-  assert.equal(result.status, "FAIL");
-  assert.equal(Array.isArray(result.errors), true);
-});
-
-test("POST /internal/kickoff/start-loop returns 409 when kickoff loop is already running", async () => {
-  const repoRoot = await mkdtemp(join(tmpdir(), "internal-kickoff-start-loop-409-running-"));
-  await writeFile(join(repoRoot, "goal.txt"), "Kick off sprint goals\n", "utf8");
-  const app = buildApp();
-  let startCalled = false;
-  await registerInternalKickoffRoute(app, {
-    repoRoot,
-    preflightCheck: async () => ({ statusCode: 200, payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] } }),
-    kickoffLoopManager: {
-      getActive: () => ({
-        pid: 1234,
-        sprint: "M2",
-        startedAt: "2026-02-26T09:30:00.000Z",
-      }),
-      start: async () => {
-        startCalled = true;
-        return null;
-      },
-    },
-  });
-
-  const startLoopHandler = getPostHandler(app, "/internal/kickoff/start-loop");
-  const reply = buildReply();
-  const result = await startLoopHandler({ body: { sprint: "M2" } }, reply);
-
-  assert.equal(reply.statusCode, 409);
-  assert.equal(startCalled, false);
-  assert.deepEqual(result, {
-    status: "ALREADY_RUNNING",
-    error: "Kickoff loop is already running for this repo",
-    pid: 1234,
-    sprint: "M2",
-    started_at: "2026-02-26T09:30:00.000Z",
-  });
-});
-
-test("POST /internal/kickoff/start-loop starts kickoff loop and returns 202", async () => {
+test("POST /internal/kickoff/start-loop enqueues START control message and returns 202", async () => {
   const repoRoot = await mkdtemp(join(tmpdir(), "internal-kickoff-start-loop-202-"));
-  await writeFile(join(repoRoot, "goal.txt"), "Kick off sprint goals\n", "utf8");
+  const repoKey = await writeAgentSwarm(repoRoot);
+
+  const redis = new FakeRedis();
+  await redis.hset(`orchestrator:state:${repoKey}:root`, { kickoff_goal: "Kick off sprint goals" });
+
   const app = buildApp();
   let requestedRole = "";
-  let sprintSeenByManager = "";
   await registerInternalKickoffRoute(app, {
     repoRoot,
+    redis,
     preflightCheck: async ({ role }) => {
       requestedRole = String(role ?? "");
       return { statusCode: 200, payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] } };
-    },
-    kickoffLoopManager: {
-      getActive: () => null,
-      start: async ({ sprint }) => {
-        sprintSeenByManager = sprint;
-        return {
-          pid: 9123,
-          sprint,
-          startedAt: "2026-02-26T09:35:00.000Z",
-        };
-      },
     },
   });
 
   const startLoopHandler = getPostHandler(app, "/internal/kickoff/start-loop");
   const reply = buildReply();
-  const result = await startLoopHandler({ body: { sprint: "m3" } }, reply);
+  const result = await startLoopHandler({ body: { sprint: "m3", require_verification: true } }, reply);
 
   assert.equal(reply.statusCode, 202);
   assert.equal(requestedRole, "ORCHESTRATOR");
-  assert.equal(sprintSeenByManager, "M3");
-  assert.deepEqual(result, {
-    status: "STARTED",
-    message: "Kickoff loop started.",
-    pid: 9123,
+  assert.equal(result.status, "ENQUEUED");
+  assert.equal(result.sprint, "M3");
+
+  const controlKey = `orchestrator:control:${repoKey}`;
+  const queued = redis._snapshotList(controlKey);
+  assert.equal(queued.length, 1);
+  const payload = JSON.parse(queued[0]);
+  assert.deepEqual(payload, {
+    command: "START",
+    mode: "KICKOFF",
     sprint: "M3",
-    started_at: "2026-02-26T09:35:00.000Z",
+    require_verification: true,
+    ready_limit: 3,
+    goal: "Kick off sprint goals",
   });
 });
 
-test("POST /internal/runner/start-loop returns 400 when sprint is missing", async () => {
-  const repoRoot = await mkdtemp(join(tmpdir(), "internal-runner-start-loop-400-sprint-"));
+test("POST /internal/runner/start-loop enqueues START RUNNER control message and returns 202", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-runner-start-loop-202-"));
+  const repoKey = await writeAgentSwarm(repoRoot);
+
+  const redis = new FakeRedis();
   const app = buildApp();
   await registerInternalKickoffRoute(app, {
     repoRoot,
-    preflightCheck: async () => ({ statusCode: 200, payload: { status: "PASS" } }),
-  });
-
-  const startLoopHandler = getPostHandler(app, "/internal/runner/start-loop");
-  const reply = buildReply();
-  const result = await startLoopHandler({ body: {} }, reply);
-
-  assert.equal(reply.statusCode, 400);
-  assert.deepEqual(result, { error: "body.sprint must be one of M1, M2, M3, or M4" });
-});
-
-test("POST /internal/runner/start-loop does not require goal.txt", async () => {
-  const repoRoot = await mkdtemp(join(tmpdir(), "internal-runner-start-loop-202-no-goal-"));
-  const app = buildApp();
-  let requestedRole = "";
-  let sprintSeenByManager = "";
-  await registerInternalKickoffRoute(app, {
-    repoRoot,
-    preflightCheck: async ({ role }) => {
-      requestedRole = String(role ?? "");
-      return { statusCode: 200, payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] } };
-    },
-    runnerLoopManager: {
-      getActive: () => null,
-      start: async ({ sprint }) => {
-        sprintSeenByManager = sprint;
-        return {
-          pid: 9021,
-          sprint,
-          startedAt: "2026-02-26T09:45:00.000Z",
-        };
-      },
-    },
-  });
-
-  const startLoopHandler = getPostHandler(app, "/internal/runner/start-loop");
-  const reply = buildReply();
-  const result = await startLoopHandler({ body: { sprint: "m4" } }, reply);
-
-  assert.equal(reply.statusCode, 202);
-  assert.equal(requestedRole, "ORCHESTRATOR");
-  assert.equal(sprintSeenByManager, "M4");
-  assert.deepEqual(result, {
-    status: "STARTED",
-    message: "Runner loop started.",
-    pid: 9021,
-    sprint: "M4",
-    started_at: "2026-02-26T09:45:00.000Z",
-  });
-});
-
-test("POST /internal/runner/start-loop returns 409 when preflight fails", async () => {
-  const repoRoot = await mkdtemp(join(tmpdir(), "internal-runner-start-loop-409-preflight-"));
-  const app = buildApp();
-  await registerInternalKickoffRoute(app, {
-    repoRoot,
-    preflightCheck: async () => ({
-      statusCode: 200,
-      payload: {
-        role: "ORCHESTRATOR",
-        status: "FAIL",
-        errors: [{ source: "template", message: "template missing" }],
-      },
-    }),
-  });
-
-  const startLoopHandler = getPostHandler(app, "/internal/runner/start-loop");
-  const reply = buildReply();
-  const result = await startLoopHandler({ body: { sprint: "M1" } }, reply);
-
-  assert.equal(reply.statusCode, 409);
-  assert.equal(result.status, "FAIL");
-  assert.equal(Array.isArray(result.errors), true);
-});
-
-test("POST /internal/runner/start-loop returns 409 when runner loop is already running", async () => {
-  const repoRoot = await mkdtemp(join(tmpdir(), "internal-runner-start-loop-409-running-"));
-  const app = buildApp();
-  let startCalled = false;
-  await registerInternalKickoffRoute(app, {
-    repoRoot,
+    redis,
     preflightCheck: async () => ({ statusCode: 200, payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] } }),
-    runnerLoopManager: {
-      getActive: () => ({
-        pid: 5678,
-        sprint: "M2",
-        startedAt: "2026-02-26T09:50:00.000Z",
-      }),
-      start: async () => {
-        startCalled = true;
-        return null;
-      },
-    },
   });
 
   const startLoopHandler = getPostHandler(app, "/internal/runner/start-loop");
   const reply = buildReply();
   const result = await startLoopHandler({ body: { sprint: "M2" } }, reply);
 
-  assert.equal(reply.statusCode, 409);
-  assert.equal(startCalled, false);
-  assert.deepEqual(result, {
-    status: "ALREADY_RUNNING",
-    error: "Runner loop is already running for this repo",
-    pid: 5678,
-    sprint: "M2",
-    started_at: "2026-02-26T09:50:00.000Z",
-  });
+  assert.equal(reply.statusCode, 202);
+  assert.equal(result.status, "ENQUEUED");
+  assert.equal(result.sprint, "M2");
+
+  const queued = redis._snapshotList(`orchestrator:control:${repoKey}`);
+  assert.equal(queued.length, 1);
+  assert.deepEqual(JSON.parse(queued[0]), { command: "START", mode: "RUNNER", sprint: "M2" });
 });
 
-test("POST /internal/runner/stop-loop returns 200 NOT_RUNNING when loop is not running", async () => {
-  const repoRoot = await mkdtemp(join(tmpdir(), "internal-runner-stop-loop-200-not-running-"));
+test("POST /internal/kickoff/stop-loop enqueues STOP and returns 202", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-kickoff-stop-loop-202-"));
+  const repoKey = await writeAgentSwarm(repoRoot);
+
+  const redis = new FakeRedis();
   const app = buildApp();
   await registerInternalKickoffRoute(app, {
     repoRoot,
-    preflightCheck: async () => ({ statusCode: 200, payload: { role: "ORCHESTRATOR", status: "FAIL", errors: [] } }),
-    runnerLoopManager: {
-      stop: async () => ({ status: "NOT_RUNNING" }),
-    },
-  });
-
-  const stopLoopHandler = getPostHandler(app, "/internal/runner/stop-loop");
-  const reply = buildReply();
-  const result = await stopLoopHandler({ body: {} }, reply);
-
-  assert.equal(reply.statusCode, 200);
-  assert.deepEqual(result, { status: "NOT_RUNNING" });
-});
-
-test("POST /internal/runner/stop-loop marks running ledger entries failed", async () => {
-  const repoRoot = await mkdtemp(join(tmpdir(), "internal-runner-stop-loop-ledger-cleanup-"));
-  const app = buildApp();
-
-  await writeFile(
-    join(repoRoot, ".agent-swarm.yml"),
-    ["version: \"1.0\"", "target:", "  owner: acme", "  repo: project-x"].join("\n") + "\n",
-    "utf8",
-  );
-  await writeFile(
-    join(repoRoot, ".runner-ledger.acme.project-x.json"),
-    JSON.stringify(
-      {
-        "run-1": {
-          run_id: "run-1",
-          role: "ORCHESTRATOR",
-          status: "running",
-          result: null,
-        },
-        "run-2": {
-          run_id: "run-2",
-          role: "EXECUTOR",
-          status: "succeeded",
-          result: {
-            status: "succeeded",
-            summary: "done",
-            errors: [],
-          },
-        },
-      },
-      null,
-      2,
-    ) + "\n",
-    "utf8",
-  );
-
-  await registerInternalKickoffRoute(app, {
-    repoRoot,
-    preflightCheck: async () => ({ statusCode: 200, payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] } }),
-    runnerLoopManager: {
-      stop: async () => ({ status: "NOT_RUNNING" }),
-    },
-  });
-
-  const stopLoopHandler = getPostHandler(app, "/internal/runner/stop-loop");
-  const reply = buildReply();
-  const result = await stopLoopHandler({ body: {} }, reply);
-
-  assert.equal(reply.statusCode, 200);
-  assert.deepEqual(result, { status: "NOT_RUNNING" });
-
-  const ledgerRaw = await readFile(join(repoRoot, ".runner-ledger.acme.project-x.json"), "utf8");
-  const ledger = JSON.parse(ledgerRaw);
-  assert.equal(ledger["run-1"].status, "failed");
-  assert.equal(ledger["run-1"].result.status, "failed");
-  assert.equal(ledger["run-1"].result.error_code, "runner_loop_stopped");
-  assert.equal(Array.isArray(ledger["run-1"].result.errors), true);
-  assert.equal(ledger["run-2"].status, "succeeded");
-});
-
-test("POST /internal/runner/stop-loop marks running ledger entries failed in structured sprint ledger format", async () => {
-  const repoRoot = await mkdtemp(join(tmpdir(), "internal-runner-stop-loop-ledger-structured-"));
-  const app = buildApp();
-
-  await writeFile(
-    join(repoRoot, ".agent-swarm.yml"),
-    ["version: \"1.0\"", "target:", "  owner: acme", "  repo: project-x"].join("\n") + "\n",
-    "utf8",
-  );
-  await writeFile(
-    join(repoRoot, ".runner-ledger.acme.project-x.json"),
-    JSON.stringify(
-      {
-        plan_version: "2026-02-28T00:00:00.000Z",
-        runs: {
-          "run-1": {
-            run_id: "run-1",
-            role: "ORCHESTRATOR",
-            status: "running",
-            result: null,
-          },
-          "run-2": {
-            run_id: "run-2",
-            role: "EXECUTOR",
-            status: "succeeded",
-            result: {
-              status: "succeeded",
-              summary: "done",
-              errors: [],
-            },
-          },
-        },
-        tasks: {},
-      },
-      null,
-      2,
-    ) + "\n",
-    "utf8",
-  );
-
-  await registerInternalKickoffRoute(app, {
-    repoRoot,
-    preflightCheck: async () => ({ statusCode: 200, payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] } }),
-    runnerLoopManager: {
-      stop: async () => ({ status: "NOT_RUNNING" }),
-    },
-  });
-
-  const stopLoopHandler = getPostHandler(app, "/internal/runner/stop-loop");
-  const reply = buildReply();
-  const result = await stopLoopHandler({ body: {} }, reply);
-
-  assert.equal(reply.statusCode, 200);
-  assert.deepEqual(result, { status: "NOT_RUNNING" });
-
-  const ledgerRaw = await readFile(join(repoRoot, ".runner-ledger.acme.project-x.json"), "utf8");
-  const ledger = JSON.parse(ledgerRaw);
-  assert.equal(ledger.plan_version, "2026-02-28T00:00:00.000Z");
-  assert.equal(ledger.runs["run-1"].status, "failed");
-  assert.equal(ledger.runs["run-1"].result.status, "failed");
-  assert.equal(ledger.runs["run-1"].result.error_code, "runner_loop_stopped");
-  assert.equal(Array.isArray(ledger.runs["run-1"].result.errors), true);
-  assert.equal(ledger.runs["run-2"].status, "succeeded");
-});
-
-test("POST /internal/kickoff/stop-loop returns 200 STOPPED when loop is stopped", async () => {
-  const repoRoot = await mkdtemp(join(tmpdir(), "internal-kickoff-stop-loop-200-stopped-"));
-  const app = buildApp();
-  await registerInternalKickoffRoute(app, {
-    repoRoot,
-    preflightCheck: async () => ({ statusCode: 200, payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] } }),
-    kickoffLoopManager: {
-      stop: async () => ({ status: "STOPPED" }),
-    },
+    redis,
+    preflightCheck: async () => ({ statusCode: 200, payload: { status: "FAIL" } }),
   });
 
   const stopLoopHandler = getPostHandler(app, "/internal/kickoff/stop-loop");
   const reply = buildReply();
   const result = await stopLoopHandler({ body: {} }, reply);
 
-  assert.equal(reply.statusCode, 200);
-  assert.deepEqual(result, { status: "STOPPED" });
+  assert.equal(reply.statusCode, 202);
+  assert.deepEqual(result, { status: "ENQUEUED" });
+  assert.deepEqual(JSON.parse(redis._snapshotList(`orchestrator:control:${repoKey}`)[0]), { command: "STOP" });
 });
 
-test("POST /internal/runner/stop-loop returns 409 REFUSED when manager refuses to stop", async () => {
-  const repoRoot = await mkdtemp(join(tmpdir(), "internal-runner-stop-loop-409-refused-"));
+test("POST /internal/runner/stop-loop enqueues STOP and returns 202", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-runner-stop-loop-202-"));
+  const repoKey = await writeAgentSwarm(repoRoot);
+
+  const redis = new FakeRedis();
   const app = buildApp();
   await registerInternalKickoffRoute(app, {
     repoRoot,
-    preflightCheck: async () => ({ statusCode: 200, payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] } }),
-    runnerLoopManager: {
-      stop: async () => ({ status: "REFUSED", detail: "pid mismatch" }),
-    },
+    redis,
+    preflightCheck: async () => ({ statusCode: 200, payload: { status: "PASS" } }),
   });
 
   const stopLoopHandler = getPostHandler(app, "/internal/runner/stop-loop");
   const reply = buildReply();
   const result = await stopLoopHandler({ body: {} }, reply);
 
-  assert.equal(reply.statusCode, 409);
-  assert.equal(result.status, "REFUSED");
-  assert.equal(typeof result.error, "string");
-  assert.equal(typeof result.detail, "string");
+  assert.equal(reply.statusCode, 202);
+  assert.deepEqual(result, { status: "ENQUEUED" });
+  assert.deepEqual(JSON.parse(redis._snapshotList(`orchestrator:control:${repoKey}`)[0]), { command: "STOP" });
 });
+

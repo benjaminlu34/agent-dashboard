@@ -1,10 +1,11 @@
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 
 import { AgentContextBundleError, loadAgentContextBundle } from "../internal/agent-context-loader.js";
 import { readAgentSwarmTarget } from "../internal/agent-swarm-config.js";
 import { createGitHubPlanApplyClient, GitHubPlanApplyError } from "../internal/github-plan-apply-client.js";
+import { requireRepoKeyFromAgentSwarm } from "../internal/repo-key.js";
+import { orchestratorRootKey } from "../internal/redis-keys.js";
 import { generateRunnerStateFromProjectSprint } from "../internal/sprint-state-generator.js";
 import { buildPreflightHandler } from "./internal-preflight.js";
 import { resolveTargetIdentity, TargetIdentityError } from "../internal/target-identity.js";
@@ -435,33 +436,10 @@ function resolveDependsOnEntries({ dependsOn, issueNumberLookup }) {
   return resolved;
 }
 
-async function readOrchestratorStateFile(statePath) {
-  try {
-    const raw = await readFile(statePath, "utf8");
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") {
-      return { poll_count: 0, items: {} };
-    }
-    return parsed;
-  } catch (error) {
-    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-      return { poll_count: 0, items: {} };
-    }
-    throw error;
-  }
-}
-
-async function writeOrchestratorStateFile(statePath, state) {
-  const directoryPath = dirname(statePath);
-  await mkdir(directoryPath, { recursive: true });
-  const tempPath = `${statePath}.tmp-${process.pid}`;
-  await writeFile(tempPath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-  await rename(tempPath, statePath);
-}
-
 export function buildInternalPlanApplyHandler({
   repoRoot = DEFAULT_REPO_ROOT,
   env = process.env,
+  redis,
   preflightHandler,
   githubClientFactory = createGitHubPlanApplyClient,
   nowIso = () => new Date().toISOString(),
@@ -469,6 +447,21 @@ export function buildInternalPlanApplyHandler({
   const resolvedPreflightHandler = preflightHandler ?? buildPreflightHandler({ repoRoot });
 
   return async function internalPlanApplyHandler(request, reply) {
+    const redisClient = redis ?? request?.redis;
+    if (!redisClient) {
+      reply.code(500);
+      return { error: "redis client is not configured" };
+    }
+
+    let repoKeyResult;
+    try {
+      repoKeyResult = await requireRepoKeyFromAgentSwarm({ repoRoot });
+    } catch (error) {
+      reply.code(500);
+      return { error: error instanceof Error ? error.message : "unable to resolve repo key" };
+    }
+    const { repoKey } = repoKeyResult;
+
     const role = request?.body?.role;
     const draft = request?.body?.draft;
 
@@ -715,23 +708,12 @@ export function buildInternalPlanApplyHandler({
       }
     }
 
-    const orchestratorStatePath = resolveOrchestratorStatePath({
-      repoRoot,
-      env,
-      ownerLogin: targetIdentity?.owner_login,
-      repoName: targetIdentity?.repo_name,
-    });
     try {
-      const state = await readOrchestratorStateFile(orchestratorStatePath);
-      const next = {
-        ...(state && typeof state === "object" ? state : {}),
-        poll_count: Number.isInteger(state?.poll_count) && state.poll_count >= 0 ? state.poll_count : 0,
-        items: state?.items && typeof state.items === "object" ? state.items : {},
+      await redisClient.hset(orchestratorRootKey(repoKey), {
         sprint_phase: "PENDING_VERIFICATION",
-        sprint_plan: sprintPlan,
-        ownership_index: ownershipIndex,
-      };
-      await writeOrchestratorStateFile(orchestratorStatePath, next);
+        sprint_plan: JSON.stringify(sprintPlan ?? {}),
+        ownership_index: JSON.stringify(ownershipIndex ?? {}),
+      });
     } catch (error) {
       reply.code(502);
       return { error: error instanceof Error ? error.message : String(error) };
@@ -739,26 +721,15 @@ export function buildInternalPlanApplyHandler({
 
     if (!requireVerification) {
       const runnerSprintPlanPath = resolveRunnerSprintPlanPathToken({ env });
-      const runnerLedgerPath = resolveRunnerLedgerPathToken({
-        env,
-        ownerLogin: targetIdentity?.owner_login,
-        repoName: targetIdentity?.repo_name,
-      });
 
       const generation = await generateRunnerStateFromProjectSprint({
         repoRoot,
         sprint: normalizedSprint,
         githubClient,
-        orchestratorStatePath,
+        redis: redisClient,
+        repoKey,
         nowIso,
-        fs: {
-          mkdir,
-          readFile,
-          rename,
-          writeFile,
-        },
         runnerSprintPlanPath,
-        runnerLedgerPath,
       });
 
       if (!generation.ok) {

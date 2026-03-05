@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from dataclasses import dataclass
 import json
 import re
@@ -7,7 +9,6 @@ import shlex
 import subprocess
 import threading
 import time
-import selectors
 from typing import Any, Callable, Dict, Optional
 
 
@@ -31,6 +32,60 @@ class WorkerResult:
 
 
 _MCP_PROTOCOL_VERSION = "2024-11-05"
+
+
+def _codex_mcp_list_output(*, codex_bin: str) -> str:
+    normalized_bin = str(codex_bin or "").strip() or "codex"
+    try:
+        completed = subprocess.run(
+            [normalized_bin, "mcp", "list"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except FileNotFoundError as exc:
+        raise CodexWorkerError(
+            "codex binary not found",
+            code="mcp_stdio_unavailable",
+            details={"codex_bin": normalized_bin},
+        ) from exc
+    except Exception as exc:
+        raise CodexWorkerError(
+            "failed to execute codex mcp list",
+            code="mcp_stdio_unavailable",
+            details={"codex_bin": normalized_bin, "error": str(exc)},
+        ) from exc
+
+    output = completed.stdout or ""
+    if int(completed.returncode or 0) != 0:
+        raise CodexWorkerError(
+            "codex mcp list failed",
+            code="mcp_stdio_unavailable",
+            details={"codex_bin": normalized_bin, "exit_code": completed.returncode, "output": output[:2000]},
+        )
+    return output
+
+
+def assert_codex_github_mcp_available(*, codex_bin: str) -> None:
+    output = _codex_mcp_list_output(codex_bin=codex_bin)
+
+    def has_enabled(name: str) -> bool:
+        for line in output.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.lower().startswith(name.lower()):
+                return "enabled" in stripped.lower()
+        return False
+
+    missing = [name for name in ("github", "github_projects") if not has_enabled(name)]
+    if missing:
+        raise CodexWorkerError(
+            "required codex mcp servers are not enabled",
+            code="codex_mcp_servers_missing",
+            details={"missing": missing, "hint": "Run `codex mcp login github` and ensure GITHUB_PAT is set."},
+        )
 
 
 class _TranscriptWriter:
@@ -79,89 +134,108 @@ class _TranscriptWriter:
         return None
 
 
-class _JsonRpcClient:
-    def __init__(self, proc: subprocess.Popen[str]):
+class _AsyncJsonRpcClient:
+    def __init__(self, proc: asyncio.subprocess.Process):
         self._proc = proc
-        self._lock = threading.Lock()
         self._next_id = 1
+        self._id_lock = asyncio.Lock()
+        self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self._reader_task: Optional[asyncio.Task[None]] = None
 
-    def call(self, method: str, params: Optional[dict[str, Any]] = None, *, timeout_s: float = 120.0) -> dict[str, Any]:
-        request_id = self._reserve_id()
+    async def start(self) -> None:
+        if self._reader_task is not None:
+            return
+        self._reader_task = asyncio.create_task(self._read_stdout(), name="mcp-stdout-reader")
+
+    async def close(self) -> None:
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+            with contextlib.suppress(Exception):
+                await self._reader_task
+        self._fail_all(CodexWorkerError("mcp client closed", code="mcp_disconnected"))
+
+    async def call(self, method: str, params: Optional[dict[str, Any]] = None, *, timeout_s: float = 120.0) -> dict[str, Any]:
+        await self.start()
+        request_id = await self._reserve_id()
         payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}}
-        self._send(payload)
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self._pending[request_id] = future
+        await self._send(payload)
+        try:
+            message = await asyncio.wait_for(future, timeout=timeout_s)
+        except asyncio.TimeoutError:
+            self._pending.pop(request_id, None)
+            raise CodexWorkerError("mcp call timed out", code="mcp_timeout", details={"method": method}) from None
 
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            message = self._recv_one(timeout_s=max(0.1, deadline - time.time()))
-            if message is None:
-                continue
-            if message.get("id") != request_id:
-                # Ignore notifications or unrelated responses.
-                continue
-            if "error" in message:
-                raise CodexWorkerError(
-                    "mcp server returned error",
-                    code="mcp_error_response",
-                    details={"method": method, "error": message.get("error")},
-                )
-            result = message.get("result")
-            if not isinstance(result, dict):
-                raise CodexWorkerError(
-                    "mcp server returned invalid result type",
-                    code="mcp_invalid_result",
-                    details={"method": method, "result": result},
-                )
-            return result
+        if message.get("id") != request_id:
+            raise CodexWorkerError("mcp response id mismatch", code="mcp_invalid_result", details={"method": method})
+        if "error" in message:
+            raise CodexWorkerError(
+                "mcp server returned error",
+                code="mcp_error_response",
+                details={"method": method, "error": message.get("error")},
+            )
+        result = message.get("result")
+        if not isinstance(result, dict):
+            raise CodexWorkerError(
+                "mcp server returned invalid result type",
+                code="mcp_invalid_result",
+                details={"method": method, "result": result},
+            )
+        return result
 
-        raise CodexWorkerError("mcp call timed out", code="mcp_timeout", details={"method": method})
-
-    def notify(self, method: str, params: Optional[dict[str, Any]] = None) -> None:
+    async def notify(self, method: str, params: Optional[dict[str, Any]] = None) -> None:
+        await self.start()
         payload = {"jsonrpc": "2.0", "method": method, "params": params or {}}
-        self._send(payload)
+        await self._send(payload)
 
-    def _reserve_id(self) -> int:
-        with self._lock:
+    async def _reserve_id(self) -> int:
+        async with self._id_lock:
             request_id = self._next_id
             self._next_id += 1
             return request_id
 
-    def _send(self, obj: dict[str, Any]) -> None:
+    async def _send(self, obj: dict[str, Any]) -> None:
         if self._proc.stdin is None:
             raise CodexWorkerError("mcp server stdin is not available", code="mcp_stdio_unavailable")
-        self._proc.stdin.write(json.dumps(obj, separators=(",", ":"), ensure_ascii=True) + "\n")
-        self._proc.stdin.flush()
+        self._proc.stdin.write(json.dumps(obj, separators=(",", ":"), ensure_ascii=True).encode("utf-8") + b"\n")
+        await self._proc.stdin.drain()
 
-    def _recv_one(self, *, timeout_s: float) -> Optional[dict[str, Any]]:
-        if self._proc.stdout is None:
-            raise CodexWorkerError("mcp server stdout is not available", code="mcp_stdio_unavailable")
+    def _fail_all(self, error: Exception) -> None:
+        for request_id, future in list(self._pending.items()):
+            self._pending.pop(request_id, None)
+            if future.done():
+                continue
+            future.set_exception(error)
 
-        selector = selectors.DefaultSelector()
-        try:
-            selector.register(self._proc.stdout, selectors.EVENT_READ)
-            ready = selector.select(timeout=timeout_s)
-        finally:
+    async def _read_stdout(self) -> None:
+        stdout = self._proc.stdout
+        if stdout is None:
+            self._fail_all(CodexWorkerError("mcp server stdout is not available", code="mcp_stdio_unavailable"))
+            return
+
+        while True:
+            raw_line = await stdout.readline()
+            if raw_line == b"":
+                self._fail_all(CodexWorkerError("mcp server disconnected unexpectedly (EOF)", code="mcp_disconnected"))
+                return
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
             try:
-                selector.unregister(self._proc.stdout)
-            except Exception:
-                pass
-            selector.close()
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                self._fail_all(CodexWorkerError("mcp server emitted non-json output", code="mcp_invalid_json", details={"line": line}))
+                return
+            if not isinstance(value, dict):
+                self._fail_all(CodexWorkerError("mcp server emitted non-object json", code="mcp_invalid_json", details={"value": value}))
+                return
 
-        if not ready:
-            return None
-
-        raw_line = self._proc.stdout.readline()
-        if raw_line == "":
-            raise CodexWorkerError("mcp server disconnected unexpectedly (EOF)", code="mcp_disconnected")
-        line = raw_line.strip()
-        if not line:
-            return None
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            raise CodexWorkerError("mcp server emitted non-json output", code="mcp_invalid_json", details={"line": line})
-        if not isinstance(value, dict):
-            raise CodexWorkerError("mcp server emitted non-object json", code="mcp_invalid_json", details={"value": value})
-        return value
+            message_id = value.get("id")
+            if isinstance(message_id, int):
+                future = self._pending.pop(message_id, None)
+                if future is not None and not future.done():
+                    future.set_result(value)
 
 
 def _sandbox_for_role(role: str) -> str:
@@ -172,26 +246,14 @@ def _sandbox_for_role(role: str) -> str:
     raise CodexWorkerError("intent role must be EXECUTOR or REVIEWER", code="worker_invalid_intent")
 
 
-def _spawn_codex_mcp_server(*, codex_bin: str, codex_mcp_args: str) -> subprocess.Popen[str]:
+async def _spawn_codex_mcp_server(*, codex_bin: str, codex_mcp_args: str) -> asyncio.subprocess.Process:
     argv = [codex_bin, *shlex.split(codex_mcp_args)]
-    return subprocess.Popen(
-        argv,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
+    return await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
-
-
-def _close_popen_pipes(proc: subprocess.Popen[str]) -> None:
-    for stream in (proc.stdin, proc.stdout, proc.stderr):
-        if stream is None:
-            continue
-        try:
-            stream.close()
-        except Exception:
-            pass
 
 
 _STDERR_ERROR_HINT_RE = re.compile(r"(error|failed|exception|traceback|timeout|refused|unreachable)", re.IGNORECASE)
@@ -320,54 +382,27 @@ def _extract_transcript_observations_from_stderr_line(line: str) -> list[str]:
     return observations
 
 
-class _CodexStderrMonitor:
-    def __init__(self, *, proc: subprocess.Popen[str], transcript_writer: _TranscriptWriter):
-        self._proc = proc
-        self._transcript_writer = transcript_writer
-        self._thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-        self._last_observation = ""
+def _strip_markdown_json_fences(content: str) -> str:
+    raw = str(content or "").strip()
+    raw = re.sub(r"^```(?:json)?\s*\n?", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\n?```\s*$", "", raw).strip()
+    return raw
 
-    def start(self) -> None:
-        stderr = self._proc.stderr
-        if stderr is None:
-            return
-        self._thread = threading.Thread(target=self._run, name="codex-stderr-monitor", daemon=True)
-        self._thread.start()
 
-    def stop(self, *, timeout_s: float = 1.0) -> None:
-        self._stop_event.set()
-        thread = self._thread
-        if thread is None:
-            return
-        thread.join(timeout=timeout_s)
-
-    def _run(self) -> None:
-        stderr = self._proc.stderr
-        if stderr is None:
-            return
-        while not self._stop_event.is_set():
-            try:
-                raw_line = stderr.readline()
-            except Exception:
-                return
-            if raw_line == "":
-                return
-            for observation in _extract_transcript_observations_from_stderr_line(raw_line):
-                if observation == self._last_observation:
-                    continue
-                self._last_observation = observation
-                self._transcript_writer.append_system_observation(observation)
+def _build_worker_result_replay_prompt() -> str:
+    return (
+        "Re-output the final result as JSON only with keys: "
+        "run_id, role, status, outcome, summary, urls, errors, marker_verified. "
+        "No prose. No markdown."
+    )
 
 
 def _extract_worker_result(*, content: str, expected_run_id: str, expected_role: str) -> WorkerResult:
     # Prefer explicit JSON-only output; otherwise scan for a prefixed payload.
-    raw = content.strip()
+    raw = str(content or "").strip()
     if "RUNNER_RESULT_JSON:" in raw:
         raw = raw.split("RUNNER_RESULT_JSON:", 1)[1].strip()
-    # Strip markdown fences like ```json ... ```
-    raw = re.sub(r"^```(?:json)?\s*\n?", "", raw, flags=re.IGNORECASE)
-    raw = re.sub(r"\n?```\s*$", "", raw).strip()
+    raw = _strip_markdown_json_fences(raw)
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -603,7 +638,24 @@ def _build_worker_prompt(*, role_bundle: Dict[str, Any], intent: Dict[str, Any],
     )
 
 
-def run_intent_with_codex_mcp(
+async def _stderr_reader(proc: asyncio.subprocess.Process, transcript_writer: _TranscriptWriter) -> None:
+    stderr = proc.stderr
+    if stderr is None:
+        return
+    last_observation = ""
+    while True:
+        raw_line = await stderr.readline()
+        if raw_line == b"":
+            return
+        line = raw_line.decode("utf-8", errors="replace")
+        for observation in _extract_transcript_observations_from_stderr_line(line):
+            if observation == last_observation:
+                continue
+            last_observation = observation
+            transcript_writer.append_system_observation(observation)
+
+
+async def run_intent_with_codex_mcp_async(
     *,
     codex_bin: str,
     codex_mcp_args: str,
@@ -614,10 +666,7 @@ def run_intent_with_codex_mcp(
     repo_root: Optional[str] = None,
     transcript_event_sink: Optional[Callable[[str, str], None]] = None,
 ) -> WorkerResult:
-    """Execute one intent by spawning `codex mcp-server` and calling the `codex` tool via MCP (stdio).
-
-    This implements line-delimited JSON-RPC 2.0 messages over stdio (MCP stdio transport).
-    """
+    assert_codex_github_mcp_available(codex_bin=codex_bin)
     expected_role = str(intent.get("role") or "").strip().upper()
     expected_run_id = str(intent.get("run_id") or "").strip()
     if expected_role not in ("EXECUTOR", "REVIEWER"):
@@ -631,13 +680,12 @@ def run_intent_with_codex_mcp(
         run_id=expected_run_id,
         transcript_event_sink=transcript_event_sink,
     )
-    proc = _spawn_codex_mcp_server(codex_bin=codex_bin, codex_mcp_args=codex_mcp_args)
-    client = _JsonRpcClient(proc)
-    stderr_monitor = _CodexStderrMonitor(proc=proc, transcript_writer=transcript_writer)
-    stderr_monitor.start()
+    proc = await _spawn_codex_mcp_server(codex_bin=codex_bin, codex_mcp_args=codex_mcp_args)
+    client = _AsyncJsonRpcClient(proc)
+    stderr_task = asyncio.create_task(_stderr_reader(proc, transcript_writer), name="mcp-stderr-reader")
     try:
         transcript_writer.append_system_observation("Initializing Codex MCP session.")
-        init = client.call(
+        init = await client.call(
             "initialize",
             {
                 "protocolVersion": _MCP_PROTOCOL_VERSION,
@@ -653,9 +701,9 @@ def run_intent_with_codex_mcp(
                 details={"expected": _MCP_PROTOCOL_VERSION, "actual": init.get("protocolVersion")},
             )
 
-        client.notify("notifications/initialized", {})
+        await client.notify("notifications/initialized", {})
 
-        tools = client.call("tools/list", {}, timeout_s=30.0).get("tools")
+        tools = (await client.call("tools/list", {}, timeout_s=30.0)).get("tools")
         if not isinstance(tools, list):
             raise CodexWorkerError("mcp tools/list returned invalid tools", code="mcp_invalid_tools")
 
@@ -670,15 +718,13 @@ def run_intent_with_codex_mcp(
         transcript_writer.append_message_to_agent(prompt)
         transcript_writer.append_system_observation("Dispatching task to agent.")
         bundle_instructions = _bundle_to_base_instructions(role_bundle)
-        tool_result = client.call(
+        tool_result = await client.call(
             "tools/call",
             {
                 "name": "codex",
                 "arguments": {
                     "prompt": prompt,
-                    # Inject the bundle verbatim as base instructions.
                     "base-instructions": bundle_instructions,
-                    # Runner-level guardrails (bundle remains source-of-truth).
                     "developer-instructions": (
                         "Treat base-instructions as executable contract. Do not rewrite or summarize it. "
                         "Do not attempt to start the backend server. "
@@ -701,18 +747,16 @@ def run_intent_with_codex_mcp(
         try:
             return _extract_worker_result(content=text, expected_run_id=expected_run_id, expected_role=expected_role)
         except CodexWorkerError:
-            # One strict re-ask to remove ambiguity about output shape.
-            transcript_writer.append_system_observation("Initial agent response was not valid JSON; requesting strict JSON replay.")
-            tool_result_2 = client.call(
+            transcript_writer.append_system_observation(
+                "Initial agent response was not valid JSON; requesting strict JSON replay."
+            )
+            tool_result_2 = await client.call(
                 "tools/call",
                 {
                     "name": "codex-reply",
                     "arguments": {
                         "threadId": thread_id,
-                        "prompt": (
-                            "Re-output the final result as JSON only with keys: run_id, role, status, summary, urls, errors. "
-                            "No prose."
-                        ),
+                        "prompt": _build_worker_result_replay_prompt(),
                     },
                 },
                 timeout_s=180.0,
@@ -724,31 +768,38 @@ def run_intent_with_codex_mcp(
             return _extract_worker_result(content=text2, expected_run_id=expected_run_id, expected_role=expected_role)
     except Exception as exc:
         if isinstance(exc, CodexWorkerError):
-            transcript_writer.append_system_observation(
-                f"Worker failure ({exc.code}): {_clip_text(exc, max_chars=700)}"
-            )
+            transcript_writer.append_system_observation(f"Worker failure ({exc.code}): {_clip_text(exc, max_chars=700)}")
         else:
             transcript_writer.append_system_observation(f"Worker failure: {_clip_text(exc, max_chars=700)}")
         raise
     finally:
-        stderr_monitor.stop(timeout_s=0.5)
-        try:
-            client.call("shutdown", {}, timeout_s=5.0)
-            client.notify("exit", {})
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(Exception):
+            await client.call("shutdown", {}, timeout_s=5.0)
+            await client.notify("exit", {})
+        with contextlib.suppress(Exception):
+            if proc.stdin is not None:
+                proc.stdin.close()
+                with contextlib.suppress(Exception):
+                    await proc.stdin.wait_closed()
+        with contextlib.suppress(Exception):
             proc.terminate()
-            proc.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        except Exception:
-            pass
-        _close_popen_pipes(proc)
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+        if proc.returncode is None:
+            with contextlib.suppress(Exception):
+                proc.kill()
+                await proc.wait()
+        stderr_task.cancel()
+        with contextlib.suppress(Exception):
+            await stderr_task
+        await client.close()
         transcript_writer.close()
 
 
-def generate_json_with_codex_mcp(
+def run_intent_with_codex_mcp(**kwargs: Any) -> WorkerResult:
+    return asyncio.run(run_intent_with_codex_mcp_async(**kwargs))
+
+
+async def generate_json_with_codex_mcp_async(
     *,
     codex_bin: str,
     codex_mcp_args: str,
@@ -762,7 +813,7 @@ def generate_json_with_codex_mcp(
     repo_root: Optional[str] = None,
     transcript_event_sink: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[str, Any]:
-    """Spawn `codex mcp-server` and ask Codex to output a single JSON object (no prose)."""
+    assert_codex_github_mcp_available(codex_bin=codex_bin)
     if not isinstance(prompt, str) or not prompt.strip():
         raise CodexWorkerError("prompt is required", code="codex_invalid_prompt")
     if not isinstance(developer_instructions, str) or not developer_instructions.strip():
@@ -773,13 +824,12 @@ def generate_json_with_codex_mcp(
         run_id=str(run_id or "").strip(),
         transcript_event_sink=transcript_event_sink,
     )
-    proc = _spawn_codex_mcp_server(codex_bin=codex_bin, codex_mcp_args=codex_mcp_args)
-    client = _JsonRpcClient(proc)
-    stderr_monitor = _CodexStderrMonitor(proc=proc, transcript_writer=transcript_writer)
-    stderr_monitor.start()
+    proc = await _spawn_codex_mcp_server(codex_bin=codex_bin, codex_mcp_args=codex_mcp_args)
+    client = _AsyncJsonRpcClient(proc)
+    stderr_task = asyncio.create_task(_stderr_reader(proc, transcript_writer), name="mcp-stderr-reader")
     try:
         transcript_writer.append_system_observation("Initializing Codex MCP session.")
-        init = client.call(
+        init = await client.call(
             "initialize",
             {
                 "protocolVersion": _MCP_PROTOCOL_VERSION,
@@ -795,9 +845,9 @@ def generate_json_with_codex_mcp(
                 details={"expected": _MCP_PROTOCOL_VERSION, "actual": init.get("protocolVersion")},
             )
 
-        client.notify("notifications/initialized", {})
+        await client.notify("notifications/initialized", {})
 
-        tools = client.call("tools/list", {}, timeout_s=30.0).get("tools")
+        tools = (await client.call("tools/list", {}, timeout_s=30.0)).get("tools")
         if not isinstance(tools, list):
             raise CodexWorkerError("mcp tools/list returned invalid tools", code="mcp_invalid_tools")
 
@@ -808,7 +858,7 @@ def generate_json_with_codex_mcp(
         bundle_instructions = _bundle_to_base_instructions(role_bundle)
         transcript_writer.append_message_to_agent(prompt)
         transcript_writer.append_system_observation("Dispatching task to agent.")
-        tool_result = client.call(
+        tool_result = await client.call(
             "tools/call",
             {
                 "name": "codex",
@@ -830,14 +880,15 @@ def generate_json_with_codex_mcp(
         text = _extract_codex_text_from_tool_result(tool_result)
         transcript_writer.append_agent_thinking(_to_transcript_thinking_text(text))
         raw = text.strip()
-        # Strip markdown fences like ```json ... ```
         raw = re.sub(r"^```(?:json)?\s*\n?", "", raw, flags=re.IGNORECASE)
         raw = re.sub(r"\n?```\s*$", "", raw).strip()
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
-            transcript_writer.append_system_observation("Initial agent response was not valid JSON; requesting strict JSON replay.")
-            tool_result_2 = client.call(
+            transcript_writer.append_system_observation(
+                "Initial agent response was not valid JSON; requesting strict JSON replay."
+            )
+            tool_result_2 = await client.call(
                 "tools/call",
                 {
                     "name": "codex-reply",
@@ -853,7 +904,6 @@ def generate_json_with_codex_mcp(
             text2 = _extract_codex_text_from_tool_result(tool_result_2)
             transcript_writer.append_agent_thinking(_to_transcript_thinking_text(text2))
             raw = text2.strip()
-            # Strip markdown fences like ```json ... ```
             raw = re.sub(r"^```(?:json)?\s*\n?", "", raw, flags=re.IGNORECASE)
             raw = re.sub(r"\n?```\s*$", "", raw).strip()
             try:
@@ -867,29 +917,35 @@ def generate_json_with_codex_mcp(
 
         if not isinstance(parsed, dict):
             raise CodexWorkerError("codex kickoff output must be a JSON object", code="worker_invalid_output")
-
         return parsed
     except Exception as exc:
         if isinstance(exc, CodexWorkerError):
-            transcript_writer.append_system_observation(
-                f"Worker failure ({exc.code}): {_clip_text(exc, max_chars=700)}"
-            )
+            transcript_writer.append_system_observation(f"Worker failure ({exc.code}): {_clip_text(exc, max_chars=700)}")
         else:
             transcript_writer.append_system_observation(f"Worker failure: {_clip_text(exc, max_chars=700)}")
         raise
     finally:
-        stderr_monitor.stop(timeout_s=0.5)
-        try:
-            client.call("shutdown", {}, timeout_s=5.0)
-            client.notify("exit", {})
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(Exception):
+            await client.call("shutdown", {}, timeout_s=5.0)
+            await client.notify("exit", {})
+        with contextlib.suppress(Exception):
+            if proc.stdin is not None:
+                proc.stdin.close()
+                with contextlib.suppress(Exception):
+                    await proc.stdin.wait_closed()
+        with contextlib.suppress(Exception):
             proc.terminate()
-            proc.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        except Exception:
-            pass
-        _close_popen_pipes(proc)
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+        if proc.returncode is None:
+            with contextlib.suppress(Exception):
+                proc.kill()
+                await proc.wait()
+        stderr_task.cancel()
+        with contextlib.suppress(Exception):
+            await stderr_task
+        await client.close()
         transcript_writer.close()
+
+
+def generate_json_with_codex_mcp(**kwargs: Any) -> Dict[str, Any]:
+    return asyncio.run(generate_json_with_codex_mcp_async(**kwargs))

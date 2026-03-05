@@ -126,7 +126,7 @@ class KickoffValidationTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "kickoff_title_collision")
 
     def test_apply_dry_run_never_posts(self) -> None:
-        from apps.runner.runner import _apply_kickoff_plan  # pylint: disable=import-outside-toplevel
+        from apps.runner.kickoff_runtime import _apply_kickoff_plan  # pylint: disable=import-outside-toplevel
         import io  # pylint: disable=import-outside-toplevel
         import contextlib  # pylint: disable=import-outside-toplevel
         import tempfile  # pylint: disable=import-outside-toplevel
@@ -150,14 +150,15 @@ class KickoffValidationTests(unittest.TestCase):
                 plan=plan,
                 draft=draft,
                 dry_run=True,
-                sprint_plan_path=plan_path,
                 ready_target=1,
+                sanitization_regen_attempts=2,
+                orchestrator_state_path=plan_path,
             )
         self.assertEqual(result["status"], "DRY_RUN")
         self.assertEqual(backend.post_calls, 0)
 
     def test_apply_fails_when_ready_set_title_missing_mapping(self) -> None:
-        from apps.runner.runner import _apply_kickoff_plan  # pylint: disable=import-outside-toplevel
+        from apps.runner.kickoff_runtime import _apply_kickoff_plan  # pylint: disable=import-outside-toplevel
         import tempfile  # pylint: disable=import-outside-toplevel
 
         class BackendStub:
@@ -179,7 +180,8 @@ class KickoffValidationTests(unittest.TestCase):
                 plan=plan,
                 draft=draft,
                 dry_run=False,
-                sprint_plan_path=plan_path,
                 ready_target=1,
+                sanitization_regen_attempts=2,
+                orchestrator_state_path=plan_path,
             )
         self.assertEqual(ctx.exception.code, "kickoff_ready_set_missing_mapping")

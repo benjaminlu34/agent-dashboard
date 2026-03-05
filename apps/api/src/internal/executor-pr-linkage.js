@@ -1,5 +1,4 @@
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const MARKER_START = "<!-- EXECUTOR_RUN_V1";
 const AUTO_CLOSE_RE = /\b(?:closes|closed|fixes|fixed|resolves|resolved)\s*#(\d+)\b/gi;
 
 export class ExecutorPrLinkageError extends Error {
@@ -38,6 +37,9 @@ function parseMarkerBlock(body) {
 
   const markerMatch = body.match(/<!--\s*EXECUTOR_RUN_V1\s*(?:\r?\n)?([\s\S]*?)\s*-->/);
   if (!markerMatch) {
+    if (/<!--\s*EXECUTOR_RUN_V1/.test(body)) {
+      throw new ExecutorPrLinkageError("malformed executor marker block", { ambiguous: true });
+    }
     return null;
   }
 
@@ -68,14 +70,14 @@ function parseMarkerBlock(body) {
   if (typeof projectItemId !== "string" || projectItemId.length === 0) {
     throw new ExecutorPrLinkageError("invalid executor marker project_item_id", { ambiguous: true });
   }
-  if (typeof runId === "string" && runId.length > 0 && !UUID_RE.test(runId)) {
+  if (typeof runId !== "string" || runId.length === 0 || !UUID_RE.test(runId)) {
     throw new ExecutorPrLinkageError("invalid executor marker run_id", { ambiguous: true });
   }
 
   return {
     issue,
     project_item_id: projectItemId,
-    run_id: typeof runId === "string" && runId.length > 0 ? runId : null,
+    run_id: runId,
   };
 }
 
