@@ -314,6 +314,142 @@ class RunnerCliModeTests(unittest.TestCase):
             self.assertTrue(isinstance(generate_kwargs.get("repo_root"), str))
             self.assertTrue(len(generate_kwargs.get("repo_root")) > 0)
 
+    def test_kickoff_preserves_structured_ledger_fields_when_plan_apply_rewrites_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ledger_path = f"{tmp_dir}/runner-ledger.json"
+            plan_version = "2026-03-01T00:00:00.000Z"
+            config = SimpleNamespace(
+                backend_base_url="http://localhost:4000",
+                backend_timeout_s=120.0,
+                dry_run=False,
+                orchestrator_sprint="M1",
+                codex_bin="codex",
+                codex_mcp_args="mcp-server",
+                codex_tools_call_timeout_s=600.0,
+                sprint_plan_path=f"{tmp_dir}/runner-sprint-plan.json",
+                orchestrator_sanitization_regen_attempts=2,
+                orchestrator_state_path=f"{tmp_dir}/orchestrator-state.json",
+                ledger_path=ledger_path,
+                runner_max_executors=1,
+                runner_max_reviewers=1,
+                review_stall_polls=50,
+                blocked_retry_minutes=15,
+                watchdog_timeout_s=900,
+                once=False,
+            )
+
+            kickoff_payload = {
+                "sprint": "M1",
+                "goal_issue": {
+                    "title": "[SPRINT GOAL] M1: Preserve structured ledger",
+                    "body_markdown": (
+                        "## Goal\nPreserve structured ledger.\n\n"
+                        "## Non-goals\n- None\n\n"
+                        "## Acceptance Criteria\n- [ ] Ledger stays structured\n\n"
+                        "## Files Likely Touched\n- apps/runner/\n\n"
+                        "## Definition of Done\n- [ ] Verified\n"
+                    ),
+                    "labels": ["meta:sprint-goal"],
+                    "fields": {"Sprint": "M1", "Status": "Backlog", "Priority": "P0", "Size": "S", "Area": "docs"},
+                },
+                "tasks": [
+                    {
+                        "title": "[TASK] One",
+                        "body_markdown": (
+                            "## Goal\nDo one.\n\n"
+                            "## Non-goals\n- None\n\n"
+                            "## Acceptance Criteria\n- [ ] Done\n\n"
+                            "## Files Likely Touched\n- apps/runner/\n\n"
+                            "## Definition of Done\n- [ ] Checked\n"
+                        ),
+                        "priority": "P0",
+                        "size": "S",
+                        "area": "runner",
+                        "depends_on_titles": [],
+                        "initial_status": "Backlog",
+                    },
+                    {
+                        "title": "[TASK] Two",
+                        "body_markdown": (
+                            "## Goal\nDo two.\n\n"
+                            "## Non-goals\n- None\n\n"
+                            "## Acceptance Criteria\n- [ ] Done\n\n"
+                            "## Files Likely Touched\n- apps/runner/\n\n"
+                            "## Definition of Done\n- [ ] Checked\n"
+                        ),
+                        "priority": "P1",
+                        "size": "S",
+                        "area": "runner",
+                        "depends_on_titles": [],
+                        "initial_status": "Backlog",
+                    },
+                    {
+                        "title": "[TASK] Three",
+                        "body_markdown": (
+                            "## Goal\nDo three.\n\n"
+                            "## Non-goals\n- None\n\n"
+                            "## Acceptance Criteria\n- [ ] Done\n\n"
+                            "## Files Likely Touched\n- apps/runner/\n\n"
+                            "## Definition of Done\n- [ ] Checked\n"
+                        ),
+                        "priority": "P1",
+                        "size": "S",
+                        "area": "runner",
+                        "depends_on_titles": [],
+                        "initial_status": "Backlog",
+                    },
+                ],
+                "ready_set_titles": ["[TASK] One"],
+                "prioritization_rationale": "Start with a dependency-free P0 task.",
+            }
+
+            class _KickoffBackendStub:
+                def __init__(self, base_url: str, timeout_s: float = 120.0) -> None:
+                    self.base_url = base_url
+                    self.timeout_s = timeout_s
+
+                def preflight_orchestrator(self):
+                    return {"status": "PASS"}
+
+                def get_agent_context(self, role: str):
+                    self.last_role = role
+                    return {"role": role, "files": []}
+
+                def get_project_items_metadata(self, *, role: str, sprint: str):
+                    _ = role
+                    _ = sprint
+                    return {"role": "ORCHESTRATOR", "sprint": "M1", "as_of": "2026-02-27T00:00:00Z", "items": []}
+
+            def _apply_side_effect(**_kwargs: object) -> dict:
+                with open(ledger_path, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        {
+                            "plan_version": plan_version,
+                            "runs": {},
+                            "tasks": {"PVTI_1": {"last_activity_at": plan_version}},
+                        },
+                        handle,
+                    )
+                return {"status": "APPLIED", "promoted": []}
+
+            with patch("apps.runner.runner.load_config", return_value=config):
+                with patch("apps.runner.runner.BackendClient", _KickoffBackendStub):
+                    with patch("apps.runner.runner.generate_json_with_codex_mcp", return_value=kickoff_payload):
+                        with patch("apps.runner.runner._apply_kickoff_plan", side_effect=_apply_side_effect):
+                            exit_code = runner.main(["--kickoff", "--goal", "Ship kickoff", "--sprint", "M1"])
+
+            self.assertEqual(exit_code, 0)
+            with open(ledger_path, "r", encoding="utf-8") as handle:
+                ledger_payload = json.load(handle)
+
+            self.assertEqual(ledger_payload.get("plan_version"), plan_version)
+            self.assertIn("PVTI_1", ledger_payload.get("tasks", {}))
+            self.assertEqual(len(ledger_payload.get("runs", {})), 1)
+            entry = next(iter(ledger_payload["runs"].values()))
+            self.assertEqual(entry.get("role"), "ORCHESTRATOR")
+            self.assertEqual(entry.get("status"), "succeeded")
+            self.assertTrue(str(entry.get("run_id", "")).startswith("kickoff-"))
+
     def test_runner_loop_creates_orchestrator_run_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             ledger_path = f"{tmp_dir}/runner-ledger.json"

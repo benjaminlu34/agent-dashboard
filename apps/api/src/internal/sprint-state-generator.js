@@ -154,6 +154,13 @@ function normalizeSprintField(value) {
   return isNonEmptyString(value) ? value.trim() : "";
 }
 
+function isSprintGoalTitle(value) {
+  if (!isNonEmptyString(value)) {
+    return false;
+  }
+  return value.trimStart().toUpperCase().startsWith("[SPRINT GOAL]");
+}
+
 export async function generateRunnerStateFromProjectSprint({
   repoRoot,
   sprint,
@@ -196,12 +203,13 @@ export async function generateRunnerStateFromProjectSprint({
     const itemSprint = normalizeSprintField(item?.fields?.Sprint);
     return itemSprint === normalizedSprint;
   });
+  const executableSprintItems = sprintItems.filter((item) => !isSprintGoalTitle(item?.issue_title));
 
   const taskByIssueNumber = new Map();
   const duplicateIssueNumbers = new Set();
   const tasks = [];
 
-  for (const item of sprintItems) {
+  for (const item of executableSprintItems) {
     const issueNumber = item?.issue_number;
     const projectItemId = item?.project_item_id;
     if (!Number.isInteger(issueNumber) || issueNumber <= 0 || !isNonEmptyString(projectItemId)) {
@@ -245,7 +253,7 @@ export async function generateRunnerStateFromProjectSprint({
   const dependenciesByTaskId = new Map();
   const danglingErrors = [];
 
-  for (const item of sprintItems) {
+  for (const item of executableSprintItems) {
     const issueNumber = item?.issue_number;
     const projectItemId = item?.project_item_id;
     if (!Number.isInteger(issueNumber) || issueNumber <= 0 || !isNonEmptyString(projectItemId)) {

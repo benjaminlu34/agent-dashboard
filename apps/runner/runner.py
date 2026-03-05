@@ -3463,9 +3463,24 @@ def main(argv: Optional[list[str]] = None) -> int:
             return preflight_status
 
         kickoff_run_id = f"kickoff-{uuid4()}"
+        kickoff_received_at = _utc_now_iso()
+        kickoff_ledger_enabled = not config.dry_run
+        if kickoff_ledger_enabled:
+            kickoff_ledger = RunLedger(configured_ledger_path)
+            kickoff_ledger.upsert(
+                LedgerEntry(
+                    run_id=kickoff_run_id,
+                    role="ORCHESTRATOR",
+                    intent_hash=f"kickoff:{config.orchestrator_sprint}",
+                    received_at=kickoff_received_at,
+                    status="queued",
+                    result=None,
+                )
+            )
+            kickoff_ledger.mark_running(kickoff_run_id)
 
         def _mark_kickoff_result(*, status: str, summary: str, errors: Optional[List[Dict[str, Any]]] = None, details: Optional[Dict[str, Any]] = None) -> None:
-            if not ledger:
+            if not kickoff_ledger_enabled:
                 return
             payload: Dict[str, Any] = {
                 "run_id": kickoff_run_id,
@@ -3478,7 +3493,23 @@ def main(argv: Optional[list[str]] = None) -> int:
             }
             if details:
                 payload["details"] = details
-            ledger.mark_result(kickoff_run_id, status="succeeded" if status == "succeeded" else "failed", result=payload)
+            kickoff_ledger = RunLedger(configured_ledger_path)
+            if not isinstance(kickoff_ledger.get(kickoff_run_id), dict):
+                kickoff_ledger.upsert(
+                    LedgerEntry(
+                        run_id=kickoff_run_id,
+                        role="ORCHESTRATOR",
+                        intent_hash=f"kickoff:{config.orchestrator_sprint}",
+                        received_at=kickoff_received_at,
+                        status="running",
+                        result=None,
+                    )
+                )
+            kickoff_ledger.mark_result(
+                kickoff_run_id,
+                status="succeeded" if status == "succeeded" else "failed",
+                result=payload,
+            )
 
         try:
             sprint = config.orchestrator_sprint
