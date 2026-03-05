@@ -870,8 +870,8 @@ async def generate_json_with_codex_mcp_async(
         text = _extract_codex_text_from_tool_result(tool_result)
         transcript_writer.append_agent_thinking(_to_transcript_thinking_text(text))
         raw = text.strip()
-        raw = re.sub(r"^```(?:json)?\\s*\\n?", "", raw, flags=re.IGNORECASE)
-        raw = re.sub(r"\\n?```\\s*$", "", raw).strip()
+        raw = re.sub(r"^```(?:json)?\s*\n?", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\n?```\s*$", "", raw).strip()
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
@@ -894,8 +894,8 @@ async def generate_json_with_codex_mcp_async(
             text2 = _extract_codex_text_from_tool_result(tool_result_2)
             transcript_writer.append_agent_thinking(_to_transcript_thinking_text(text2))
             raw = text2.strip()
-            raw = re.sub(r"^```(?:json)?\\s*\\n?", "", raw, flags=re.IGNORECASE)
-            raw = re.sub(r"\\n?```\\s*$", "", raw).strip()
+            raw = re.sub(r"^```(?:json)?\s*\n?", "", raw, flags=re.IGNORECASE)
+            raw = re.sub(r"\n?```\s*$", "", raw).strip()
             try:
                 parsed = json.loads(raw)
             except json.JSONDecodeError as exc:
