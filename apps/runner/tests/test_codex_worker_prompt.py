@@ -1,6 +1,13 @@
 import unittest
 
-from apps.runner.codex_worker import CodexWorkerError, _build_worker_prompt, _extract_worker_result, _sandbox_for_role
+from apps.runner.codex_worker import (
+    CodexWorkerError,
+    _build_worker_prompt,
+    _build_worker_result_replay_prompt,
+    _extract_worker_result,
+    _sandbox_for_role,
+    _strip_markdown_json_fences,
+)
 
 
 class CodexWorkerPromptTests(unittest.TestCase):
@@ -75,3 +82,14 @@ class CodexWorkerPromptTests(unittest.TestCase):
             expected_role="REVIEWER",
         )
         self.assertEqual(result.outcome, "PASS")
+
+    def test_strip_markdown_json_fences_removes_wrappers(self) -> None:
+        self.assertEqual(
+            _strip_markdown_json_fences("```json\n{\"ok\":true}\n```"),
+            "{\"ok\":true}",
+        )
+
+    def test_replay_prompt_keeps_required_worker_result_keys(self) -> None:
+        prompt = _build_worker_result_replay_prompt()
+        self.assertIn("outcome", prompt)
+        self.assertIn("marker_verified", prompt)

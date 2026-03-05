@@ -382,14 +382,27 @@ def _extract_transcript_observations_from_stderr_line(line: str) -> list[str]:
     return observations
 
 
-def _extract_worker_result(*, content: str, expected_run_id: str, expected_role: str) -> WorkerResult:
-    # Prefer explicit JSON-only output; otherwise scan for a prefixed payload.
-    raw = content.strip()
-    if "RUNNER_RESULT_JSON:" in raw:
-        raw = raw.split("RUNNER_RESULT_JSON:", 1)[1].strip()
-    # Strip markdown fences like ```json ... ```
+def _strip_markdown_json_fences(content: str) -> str:
+    raw = str(content or "").strip()
     raw = re.sub(r"^```(?:json)?\s*\n?", "", raw, flags=re.IGNORECASE)
     raw = re.sub(r"\n?```\s*$", "", raw).strip()
+    return raw
+
+
+def _build_worker_result_replay_prompt() -> str:
+    return (
+        "Re-output the final result as JSON only with keys: "
+        "run_id, role, status, outcome, summary, urls, errors, marker_verified. "
+        "No prose. No markdown."
+    )
+
+
+def _extract_worker_result(*, content: str, expected_run_id: str, expected_role: str) -> WorkerResult:
+    # Prefer explicit JSON-only output; otherwise scan for a prefixed payload.
+    raw = str(content or "").strip()
+    if "RUNNER_RESULT_JSON:" in raw:
+        raw = raw.split("RUNNER_RESULT_JSON:", 1)[1].strip()
+    raw = _strip_markdown_json_fences(raw)
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -743,10 +756,7 @@ async def run_intent_with_codex_mcp_async(
                     "name": "codex-reply",
                     "arguments": {
                         "threadId": thread_id,
-                        "prompt": (
-                            "Re-output the final result as JSON only with keys: run_id, role, status, summary, urls, errors. "
-                            "No prose."
-                        ),
+                        "prompt": _build_worker_result_replay_prompt(),
                     },
                 },
                 timeout_s=180.0,
@@ -869,9 +879,7 @@ async def generate_json_with_codex_mcp_async(
         thread_id = _extract_thread_id_from_tool_result(tool_result)
         text = _extract_codex_text_from_tool_result(tool_result)
         transcript_writer.append_agent_thinking(_to_transcript_thinking_text(text))
-        raw = text.strip()
-        raw = re.sub(r"^```(?:json)?\\s*\\n?", "", raw, flags=re.IGNORECASE)
-        raw = re.sub(r"\\n?```\\s*$", "", raw).strip()
+        raw = _strip_markdown_json_fences(text)
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
@@ -893,9 +901,7 @@ async def generate_json_with_codex_mcp_async(
             transcript_writer.append_system_observation("Received strict JSON replay from agent.")
             text2 = _extract_codex_text_from_tool_result(tool_result_2)
             transcript_writer.append_agent_thinking(_to_transcript_thinking_text(text2))
-            raw = text2.strip()
-            raw = re.sub(r"^```(?:json)?\\s*\\n?", "", raw, flags=re.IGNORECASE)
-            raw = re.sub(r"\\n?```\\s*$", "", raw).strip()
+            raw = _strip_markdown_json_fences(text2)
             try:
                 parsed = json.loads(raw)
             except json.JSONDecodeError as exc:

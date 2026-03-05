@@ -46,3 +46,50 @@ class RunnerInFlightGateTests(unittest.TestCase):
         )
 
         release_in_flight_lock(redis_client=redis, repo_key=repo_key, issue_number=42, run_id="run-2")
+
+    def test_acquire_fails_closed_when_eval_unavailable(self) -> None:
+        redis = FakeRedis()
+        repo_key = "example.repo"
+        redis.eval = None  # type: ignore[attr-defined]
+
+        self.assertFalse(
+            acquire_in_flight_lock(
+                redis_client=redis,
+                repo_key=repo_key,
+                issue_number=42,
+                run_id="run-1",
+                role="EXECUTOR",
+                ttl_s=60,
+            )
+        )
+
+    def test_acquire_fails_closed_when_eval_errors(self) -> None:
+        redis = FakeRedis()
+        repo_key = "example.repo"
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("eval failed")
+
+        redis.eval = _boom  # type: ignore[method-assign]
+
+        self.assertFalse(
+            acquire_in_flight_lock(
+                redis_client=redis,
+                repo_key=repo_key,
+                issue_number=42,
+                run_id="run-1",
+                role="EXECUTOR",
+                ttl_s=60,
+            )
+        )
+
+    def test_release_ignores_eval_errors(self) -> None:
+        redis = FakeRedis()
+        repo_key = "example.repo"
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("eval failed")
+
+        redis.eval = _boom  # type: ignore[method-assign]
+
+        release_in_flight_lock(redis_client=redis, repo_key=repo_key, issue_number=42, run_id="run-1")
