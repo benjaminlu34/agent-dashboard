@@ -21,6 +21,9 @@ from .state_store import RedisStateStore
 from .telemetry import publish_transcript_event
 from .workspace import setup_worktree, teardown_worktree
 
+_PREEMPTION_POLL_INTERVAL_S = 5.0
+_ACTIVE_TASK_STATUSES = frozenset({"In Progress", "In Review"})
+
 
 def _log_stderr(payload: dict[str, Any]) -> None:
     try:
@@ -44,6 +47,31 @@ def _decode_redis_value(value: Any) -> str:
 
 def _utc_now_iso_ms() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S.", time.gmtime()) + f"{int((time.time() % 1) * 1000):03d}Z"
+
+
+def _stop_process(proc: Any) -> None:
+    proc.terminate()
+    proc.join(timeout=2.0)
+    if proc.is_alive():
+        proc.kill()
+        proc.join(timeout=2.0)
+
+
+def _failure_result(
+    *,
+    summary: str,
+    code: str,
+    message: str,
+    failure_classification: str,
+) -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "summary": summary,
+        "urls": {},
+        "errors": [{"code": code, "message": message}],
+        "failure_classification": failure_classification,
+        "error_code": code,
+    }
 
 
 def _resolve_run_context_by_run_id(items: dict[str, dict[str, Any]], run_id: str) -> Optional[tuple[int, str, str]]:
@@ -399,6 +427,7 @@ def run_supervisor_loop(
         proc = None
         child_result_queue: Any = ctx.Queue(maxsize=1)
         timed_out = False
+        preempted = False
         task_project_item_id = ""
         try:
             existing = ledger.get(intent_obj.run_id)
@@ -439,14 +468,35 @@ def run_supervisor_loop(
                 },
             )
             proc.start()
-            proc.join(timeout=float(watchdog_timeout_s))
-            if proc.is_alive():
+            deadline = time.time() + float(watchdog_timeout_s)
+            while time.time() < deadline and proc.is_alive():
+                proc.join(timeout=_PREEMPTION_POLL_INTERVAL_S)
+                if not proc.is_alive():
+                    break
+                if task_project_item_id:
+                    current_state = state_store.get_item(repo_key, task_project_item_id) or {}
+                    current_status = str(current_state.get("last_seen_status") or "").strip()
+                    if not current_status or current_status not in _ACTIVE_TASK_STATUSES:
+                        preempted = True
+                        _stop_process(proc)
+                        break
+
+            if not preempted and proc.is_alive():
                 timed_out = True
-                proc.terminate()
-                proc.join(timeout=2.0)
-                if proc.is_alive():
-                    proc.kill()
-                    proc.join(timeout=2.0)
+                _stop_process(proc)
+
+            if preempted:
+                ledger.mark_result(
+                    intent_obj.run_id,
+                    status="failed",
+                    result=_failure_result(
+                        summary="worker canceled because the tracked item moved out of scope externally",
+                        code="preempted",
+                        message="tracked item moved to a non-active state or was removed externally",
+                        failure_classification="PREEMPTED",
+                    ),
+                )
+                continue
 
             result_payload = None
             try:
@@ -458,19 +508,12 @@ def run_supervisor_loop(
                 ledger.mark_result(
                     intent_obj.run_id,
                     status="failed",
-                    result={
-                        "status": "failed",
-                        "summary": "worker watchdog timeout" if timed_out else "worker exited unexpectedly",
-                        "urls": {},
-                        "errors": [
-                            {
-                                "code": "watchdog_timeout" if timed_out else "worker_down",
-                                "message": "terminated by watchdog" if timed_out else "child process exited non-zero",
-                            }
-                        ],
-                        "failure_classification": "HARD_STOP",
-                        "error_code": "watchdog_timeout" if timed_out else "worker_down",
-                    },
+                    result=_failure_result(
+                        summary="worker watchdog timeout" if timed_out else "worker exited unexpectedly",
+                        code="watchdog_timeout" if timed_out else "worker_down",
+                        message="terminated by watchdog" if timed_out else "child process exited non-zero",
+                        failure_classification="HARD_STOP",
+                    ),
                 )
                 continue
 
@@ -478,14 +521,12 @@ def run_supervisor_loop(
                 ledger.mark_result(
                     intent_obj.run_id,
                     status="failed",
-                    result={
-                        "status": "failed",
-                        "summary": "worker did not return result",
-                        "urls": {},
-                        "errors": [{"code": "worker_down", "message": "missing IPC result"}],
-                        "failure_classification": "HARD_STOP",
-                        "error_code": "worker_down",
-                    },
+                    result=_failure_result(
+                        summary="worker did not return result",
+                        code="worker_down",
+                        message="missing IPC result",
+                        failure_classification="HARD_STOP",
+                    ),
                 )
                 continue
 

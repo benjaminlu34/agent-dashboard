@@ -32,54 +32,86 @@ class _QueueEmpty:
         raise RuntimeError("empty queue")
 
 
-class _HungChildProcess:
-    def __init__(self) -> None:
+class _QueueMustNotBeRead:
+    def get_nowait(self) -> dict[str, Any]:
+        raise AssertionError("preempted runs must not read child IPC results")
+
+
+class _ChildProcess:
+    def __init__(self, *, survive_terminate: bool) -> None:
         self.started = False
         self.terminate_called = False
         self.kill_called = False
-        self._alive_checks = 0
         self.exitcode = None
+        self._alive = False
+        self.join_timeouts: list[float | None] = []
+        self._survive_terminate = survive_terminate
 
     def start(self) -> None:
         self.started = True
+        self._alive = True
 
-    def join(self, timeout: float | None = None) -> None:  # noqa: ARG002
-        return None
+    def join(self, timeout: float | None = None) -> None:
+        self.join_timeouts.append(timeout)
 
     def is_alive(self) -> bool:
-        self._alive_checks += 1
-        if self._alive_checks in (1, 2):
-            return True
-        return False
+        return self._alive
 
     def terminate(self) -> None:
         self.terminate_called = True
+        if not self._survive_terminate:
+            self._alive = False
 
     def kill(self) -> None:
         self.kill_called = True
+        self._alive = False
         self.exitcode = -9
 
 
 class _FakeSpawnContext:
-    def __init__(self, process: _HungChildProcess) -> None:
+    def __init__(self, process: _ChildProcess, queue: Any) -> None:
         self._process = process
+        self._queue = queue
 
-    def Queue(self, maxsize: int = 1) -> _QueueEmpty:  # noqa: ARG002
-        return _QueueEmpty()
+    def Queue(self, maxsize: int = 1) -> Any:  # noqa: ARG002
+        return self._queue
 
-    def Process(self, *args, **kwargs) -> _HungChildProcess:  # noqa: ANN002, ARG002
+    def Process(self, *args, **kwargs) -> _ChildProcess:  # noqa: ANN002, ARG002
         return self._process
 
 
 class _FakeStateStore:
-    def __init__(self, _redis_client: Any) -> None:
-        return None
+    def __init__(
+        self,
+        initial_items: dict[str, dict[str, Any]] | None = None,
+        polled_items: list[dict[str, Any] | None] | None = None,
+    ) -> None:
+        self._initial_items = initial_items or {}
+        self._polled_items = list(polled_items or [])
+        self.polled_project_item_ids: list[str] = []
 
     def get_all_items(self, _repo_key: str) -> dict[str, dict[str, Any]]:
-        return {}
+        return self._initial_items
+
+    def get_item(self, _repo_key: str, project_item_id: str) -> dict[str, Any] | None:
+        self.polled_project_item_ids.append(project_item_id)
+        if self._polled_items:
+            return self._polled_items.pop(0)
+        return None
 
     def set_item(self, _repo_key: str, _project_item_id: str, _item_dict: dict[str, Any]) -> None:
         return None
+
+
+class _FakeTime:
+    def __init__(self, *, start: float = 100.0, step: float = 0.6) -> None:
+        self._value = start
+        self._step = step
+
+    def __call__(self) -> float:
+        current = self._value
+        self._value += self._step
+        return current
 
 
 @dataclass
@@ -112,58 +144,165 @@ class _LedgerRecorder:
 
 
 class SupervisorFaultInjectionTests(unittest.TestCase):
-    def test_watchdog_escalates_terminate_to_kill(self) -> None:
-        role = "REVIEWER"
+    def _run_supervisor_once(
+        self,
+        *,
+        role: str,
+        run_id: str,
+        issue_number: int,
+        process: _ChildProcess,
+        queue: Any,
+        state_store: _FakeStateStore,
+        watchdog_timeout_s: int,
+    ) -> tuple[_LedgerRecorder, list[tuple[int, str]]]:
         repo_key = "example.repo"
         queue_key = f"orchestrator:queue:intents:{role}:{repo_key}"
-        run_id = "run-timeout-1"
         intent_payload = {
             "type": "RUN_INTENT",
             "role": role,
             "run_id": run_id,
             "endpoint": "/internal/reviewer/resolve-linked-pr",
-            "body": {"role": role, "run_id": run_id, "issue_number": 42},
+            "body": {"role": role, "run_id": run_id, "issue_number": issue_number},
         }
 
         redis_client = _SingleIntentRedis(queue_key=queue_key, intent_payload=intent_payload)
-        hung_process = _HungChildProcess()
-        spawn_context = _FakeSpawnContext(hung_process)
+        spawn_context = _FakeSpawnContext(process, queue)
         ledger = _LedgerRecorder(redis_client, repo_key)
         release_calls: list[tuple[int, str]] = []
 
         with patch("apps.runner.supervisor.create_redis_client", return_value=redis_client):
             with patch("apps.runner.supervisor.BackendClient", return_value=object()):
-                with patch("apps.runner.supervisor.RedisStateStore", return_value=_FakeStateStore(redis_client)):
+                with patch("apps.runner.supervisor.RedisStateStore", return_value=state_store):
                     with patch("apps.runner.supervisor.RunLedger", return_value=ledger):
                         with patch("apps.runner.supervisor.get_context", return_value=spawn_context):
                             with patch("apps.runner.supervisor.acquire_in_flight_lock", return_value=True):
-                                with patch(
-                                    "apps.runner.supervisor.release_in_flight_lock",
-                                    side_effect=lambda **kwargs: release_calls.append(
-                                        (int(kwargs.get("issue_number") or 0), str(kwargs.get("run_id") or ""))
-                                    ),
-                                ):
-                                    with self.assertRaises(KeyboardInterrupt):
-                                        run_supervisor_loop(
-                                            role=role,
-                                            repo_key=repo_key,
-                                            redis_url="redis://localhost:6379/0",
-                                            backend_base_url="http://localhost:4000",
-                                            backend_timeout_s=5.0,
-                                            codex_bin="codex",
-                                            codex_mcp_args="mcp-server",
-                                            codex_tools_call_timeout_s=120.0,
-                                            watchdog_timeout_s=1,
-                                        )
+                                with patch("apps.runner.supervisor.time.time", side_effect=_FakeTime()):
+                                    with patch(
+                                        "apps.runner.supervisor.release_in_flight_lock",
+                                        side_effect=lambda **kwargs: release_calls.append(
+                                            (int(kwargs.get("issue_number") or 0), str(kwargs.get("run_id") or ""))
+                                        ),
+                                    ):
+                                        with self.assertRaises(KeyboardInterrupt):
+                                            run_supervisor_loop(
+                                                role=role,
+                                                repo_key=repo_key,
+                                                redis_url="redis://localhost:6379/0",
+                                                backend_base_url="http://localhost:4000",
+                                                backend_timeout_s=5.0,
+                                                codex_bin="codex",
+                                                codex_mcp_args="mcp-server",
+                                                codex_tools_call_timeout_s=120.0,
+                                                watchdog_timeout_s=watchdog_timeout_s,
+                                            )
 
-        self.assertTrue(hung_process.started)
-        self.assertTrue(hung_process.terminate_called)
-        self.assertTrue(hung_process.kill_called)
-        self.assertEqual(release_calls, [(42, run_id)])
+        return ledger, release_calls
+
+    def test_watchdog_escalates_terminate_to_kill(self) -> None:
+        process = _ChildProcess(survive_terminate=True)
+        state_store = _FakeStateStore()
+
+        ledger, release_calls = self._run_supervisor_once(
+            role="REVIEWER",
+            run_id="11111111-1111-4111-8111-111111111111",
+            issue_number=42,
+            process=process,
+            queue=_QueueEmpty(),
+            state_store=state_store,
+            watchdog_timeout_s=1,
+        )
+
+        self.assertTrue(process.started)
+        self.assertTrue(process.terminate_called)
+        self.assertTrue(process.kill_called)
+        self.assertEqual(release_calls, [(42, "11111111-1111-4111-8111-111111111111")])
+        self.assertEqual(state_store.polled_project_item_ids, [])
 
         self.assertEqual(len(ledger.mark_results), 1)
         mark = ledger.mark_results[0]
-        self.assertEqual(mark.run_id, run_id)
+        self.assertEqual(mark.run_id, "11111111-1111-4111-8111-111111111111")
         self.assertEqual(mark.status, "failed")
         self.assertEqual(mark.result.get("failure_classification"), "HARD_STOP")
         self.assertEqual(mark.result.get("error_code"), "watchdog_timeout")
+
+    def test_preempts_when_item_moves_to_terminal_state(self) -> None:
+        project_item_id = "PVTI_42"
+        initial_items = {
+            project_item_id: {
+                "last_seen_issue_number": 42,
+                "last_seen_status": "In Progress",
+                "last_seen_at": "2026-03-06T00:00:00Z",
+                "status_since_at": "2026-03-06T00:00:00Z",
+            }
+        }
+        state_store = _FakeStateStore(
+            initial_items=initial_items,
+            polled_items=[{"last_seen_status": "Done"}],
+        )
+        process = _ChildProcess(survive_terminate=False)
+
+        ledger, release_calls = self._run_supervisor_once(
+            role="REVIEWER",
+            run_id="22222222-2222-4222-8222-222222222222",
+            issue_number=42,
+            process=process,
+            queue=_QueueMustNotBeRead(),
+            state_store=state_store,
+            watchdog_timeout_s=30,
+        )
+
+        self.assertTrue(process.started)
+        self.assertTrue(process.terminate_called)
+        self.assertFalse(process.kill_called)
+        self.assertEqual(state_store.polled_project_item_ids, [project_item_id])
+        self.assertEqual(release_calls, [(42, "22222222-2222-4222-8222-222222222222")])
+
+        self.assertEqual(len(ledger.mark_results), 1)
+        mark = ledger.mark_results[0]
+        self.assertEqual(mark.run_id, "22222222-2222-4222-8222-222222222222")
+        self.assertEqual(mark.status, "failed")
+        self.assertEqual(mark.result.get("failure_classification"), "PREEMPTED")
+        self.assertEqual(mark.result.get("error_code"), "preempted")
+
+    def test_preempts_when_tracked_item_disappears(self) -> None:
+        project_item_id = "PVTI_42"
+        initial_items = {
+            project_item_id: {
+                "last_seen_issue_number": 42,
+                "last_seen_status": "In Review",
+                "last_seen_at": "2026-03-06T00:00:00Z",
+                "status_since_at": "2026-03-06T00:00:00Z",
+            }
+        }
+        state_store = _FakeStateStore(
+            initial_items=initial_items,
+            polled_items=[None],
+        )
+        process = _ChildProcess(survive_terminate=False)
+
+        ledger, release_calls = self._run_supervisor_once(
+            role="REVIEWER",
+            run_id="33333333-3333-4333-8333-333333333333",
+            issue_number=42,
+            process=process,
+            queue=_QueueMustNotBeRead(),
+            state_store=state_store,
+            watchdog_timeout_s=30,
+        )
+
+        self.assertTrue(process.started)
+        self.assertTrue(process.terminate_called)
+        self.assertFalse(process.kill_called)
+        self.assertEqual(state_store.polled_project_item_ids, [project_item_id])
+        self.assertEqual(release_calls, [(42, "33333333-3333-4333-8333-333333333333")])
+
+        self.assertEqual(len(ledger.mark_results), 1)
+        mark = ledger.mark_results[0]
+        self.assertEqual(mark.run_id, "33333333-3333-4333-8333-333333333333")
+        self.assertEqual(mark.status, "failed")
+        self.assertEqual(mark.result.get("failure_classification"), "PREEMPTED")
+        self.assertEqual(mark.result.get("error_code"), "preempted")
+
+
+if __name__ == "__main__":
+    unittest.main()
