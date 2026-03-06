@@ -6,6 +6,7 @@ import random
 import time
 from dataclasses import asdict
 from multiprocessing import get_context
+from pathlib import Path
 from typing import Any, Optional
 
 from .codex_worker import CodexWorkerError, WorkerResult, run_intent_with_codex_mcp
@@ -18,6 +19,7 @@ from .ledger import LedgerEntry, LedgerError, RunLedger
 from .redis_keys import orchestrator_intents_queue_key
 from .state_store import RedisStateStore
 from .telemetry import publish_transcript_event
+from .workspace import setup_worktree, teardown_worktree
 
 
 def _log_stderr(payload: dict[str, Any]) -> None:
@@ -268,6 +270,7 @@ def _intent_child_main(
         backend = BackendClient(base_url=backend_base_url, timeout_s=backend_timeout_s)
         role = str(intent.get("role") or "").strip().upper()
         run_id = str(intent.get("run_id") or "").strip()
+        repo_root = str(Path(__file__).resolve().parents[2])
         bundle = backend.get_agent_context(role)
 
         def sink(section: str, content: str) -> None:
@@ -281,15 +284,22 @@ def _intent_child_main(
                 content=content,
             )
 
-        result = run_intent_with_codex_mcp(
-            codex_bin=codex_bin,
-            codex_mcp_args=codex_mcp_args,
-            backend_base_url=backend_base_url,
-            role_bundle=bundle,
-            intent=intent,
-            tools_call_timeout_s=codex_tools_call_timeout_s,
-            transcript_event_sink=sink,
-        )
+        worktree_path: Optional[str] = None
+        try:
+            worktree_path = setup_worktree(repo_root=repo_root, run_id=run_id)
+            result = run_intent_with_codex_mcp(
+                codex_bin=codex_bin,
+                codex_mcp_args=codex_mcp_args,
+                backend_base_url=backend_base_url,
+                role_bundle=bundle,
+                intent=intent,
+                tools_call_timeout_s=codex_tools_call_timeout_s,
+                cwd=worktree_path,
+                transcript_event_sink=sink,
+            )
+        finally:
+            if worktree_path:
+                teardown_worktree(repo_root=repo_root, worktree_path=worktree_path)
 
         payload = asdict(result)
         result_queue.put(payload)
