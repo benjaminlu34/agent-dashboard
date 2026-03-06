@@ -3,12 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import re
 from typing import Any, Dict, Optional
 
 
 ALLOWED_ROLES = {"EXECUTOR", "REVIEWER"}
 INTENT_TYPE = "RUN_INTENT"
 RESERVED_RUN_ID_PREFIX = "__"
+RUN_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.IGNORECASE)
 ALLOWED_ENDPOINTS_BY_ROLE = {
     "EXECUTOR": {"/internal/executor/claim-ready-item", "/internal/reviewer/resolve-linked-pr"},
     "REVIEWER": {"/internal/reviewer/resolve-linked-pr"},
@@ -68,6 +70,8 @@ def parse_intent(value: dict[str, Any]) -> RunIntent:
     normalized_run_id = run_id.strip()
     if normalized_run_id.startswith(RESERVED_RUN_ID_PREFIX):
         raise IntentError("intent run_id uses reserved prefix", code="intent_invalid_run_id")
+    if not RUN_ID_RE.fullmatch(normalized_run_id):
+        raise IntentError("intent run_id must be a UUIDv4", code="intent_invalid_run_id")
 
     endpoint = value.get("endpoint")
     if not isinstance(endpoint, str) or not endpoint.strip().startswith("/internal/"):

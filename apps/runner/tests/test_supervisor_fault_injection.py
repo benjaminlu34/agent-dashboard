@@ -204,7 +204,7 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
 
         ledger, release_calls = self._run_supervisor_once(
             role="REVIEWER",
-            run_id="run-timeout-1",
+            run_id="11111111-1111-4111-8111-111111111111",
             issue_number=42,
             process=process,
             queue=_QueueEmpty(),
@@ -215,12 +215,12 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
         self.assertTrue(process.started)
         self.assertTrue(process.terminate_called)
         self.assertTrue(process.kill_called)
-        self.assertEqual(release_calls, [(42, "run-timeout-1")])
+        self.assertEqual(release_calls, [(42, "11111111-1111-4111-8111-111111111111")])
         self.assertEqual(state_store.polled_project_item_ids, [])
 
         self.assertEqual(len(ledger.mark_results), 1)
         mark = ledger.mark_results[0]
-        self.assertEqual(mark.run_id, "run-timeout-1")
+        self.assertEqual(mark.run_id, "11111111-1111-4111-8111-111111111111")
         self.assertEqual(mark.status, "failed")
         self.assertEqual(mark.result.get("failure_classification"), "HARD_STOP")
         self.assertEqual(mark.result.get("error_code"), "watchdog_timeout")
@@ -243,7 +243,7 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
 
         ledger, release_calls = self._run_supervisor_once(
             role="REVIEWER",
-            run_id="run-preempted-done",
+            run_id="22222222-2222-4222-8222-222222222222",
             issue_number=42,
             process=process,
             queue=_QueueMustNotBeRead(),
@@ -255,11 +255,11 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
         self.assertTrue(process.terminate_called)
         self.assertFalse(process.kill_called)
         self.assertEqual(state_store.polled_project_item_ids, [project_item_id])
-        self.assertEqual(release_calls, [(42, "run-preempted-done")])
+        self.assertEqual(release_calls, [(42, "22222222-2222-4222-8222-222222222222")])
 
         self.assertEqual(len(ledger.mark_results), 1)
         mark = ledger.mark_results[0]
-        self.assertEqual(mark.run_id, "run-preempted-done")
+        self.assertEqual(mark.run_id, "22222222-2222-4222-8222-222222222222")
         self.assertEqual(mark.status, "failed")
         self.assertEqual(mark.result.get("failure_classification"), "PREEMPTED")
         self.assertEqual(mark.result.get("error_code"), "preempted")
@@ -282,7 +282,7 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
 
         ledger, release_calls = self._run_supervisor_once(
             role="REVIEWER",
-            run_id="run-preempted-missing",
+            run_id="33333333-3333-4333-8333-333333333333",
             issue_number=42,
             process=process,
             queue=_QueueMustNotBeRead(),
@@ -294,11 +294,11 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
         self.assertTrue(process.terminate_called)
         self.assertFalse(process.kill_called)
         self.assertEqual(state_store.polled_project_item_ids, [project_item_id])
-        self.assertEqual(release_calls, [(42, "run-preempted-missing")])
+        self.assertEqual(release_calls, [(42, "33333333-3333-4333-8333-333333333333")])
 
         self.assertEqual(len(ledger.mark_results), 1)
         mark = ledger.mark_results[0]
-        self.assertEqual(mark.run_id, "run-preempted-missing")
+        self.assertEqual(mark.run_id, "33333333-3333-4333-8333-333333333333")
         self.assertEqual(mark.status, "failed")
         self.assertEqual(mark.result.get("failure_classification"), "PREEMPTED")
         self.assertEqual(mark.result.get("error_code"), "preempted")

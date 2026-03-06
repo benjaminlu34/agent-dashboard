@@ -70,6 +70,19 @@ class IntentParsingTests(unittest.TestCase):
             )
         self.assertEqual(ctx.exception.code, "intent_invalid_run_id")
 
+    def test_rejects_non_uuid_run_id(self) -> None:
+        with self.assertRaises(IntentError) as ctx:
+            parse_intent(
+                {
+                    "type": "RUN_INTENT",
+                    "role": "EXECUTOR",
+                    "run_id": "../../escape",
+                    "endpoint": "/internal/executor/claim-ready-item",
+                    "body": {"role": "EXECUTOR", "run_id": "../../escape"},
+                }
+            )
+        self.assertEqual(ctx.exception.code, "intent_invalid_run_id")
+
     def test_accepts_executor_in_review_resolve_endpoint(self) -> None:
         intent = parse_intent(
             {
