@@ -37,6 +37,14 @@ class _QueueMustNotBeRead:
         raise AssertionError("preempted runs must not read child IPC results")
 
 
+class _QueueWithPayload:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+
+    def get_nowait(self) -> dict[str, Any]:
+        return self._payload
+
+
 class _ChildProcess:
     def __init__(self, *, survive_terminate: bool) -> None:
         self.started = False
@@ -66,6 +74,16 @@ class _ChildProcess:
         self.kill_called = True
         self._alive = False
         self.exitcode = -9
+
+
+class _CompletingChildProcess(_ChildProcess):
+    def __init__(self) -> None:
+        super().__init__(survive_terminate=False)
+
+    def join(self, timeout: float | None = None) -> None:
+        super().join(timeout)
+        self._alive = False
+        self.exitcode = 0
 
 
 class _FakeSpawnContext:
@@ -234,6 +252,7 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
         mark = ledger.mark_results[0]
         self.assertEqual(mark.run_id, "11111111-1111-4111-8111-111111111111")
         self.assertEqual(mark.status, "failed")
+        self.assertEqual(mark.result.get("usage"), {})
         self.assertEqual(mark.result.get("failure_classification"), "HARD_STOP")
         self.assertEqual(mark.result.get("error_code"), "watchdog_timeout")
 
@@ -262,6 +281,7 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
         mark = ledger.mark_results[0]
         self.assertEqual(mark.run_id, "44444444-4444-4444-8444-444444444444")
         self.assertEqual(mark.status, "failed")
+        self.assertEqual(mark.result.get("usage"), {})
         self.assertEqual(mark.result.get("failure_classification"), "STALLED")
         self.assertEqual(mark.result.get("error_code"), "stall_timeout")
 
@@ -301,6 +321,7 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
         mark = ledger.mark_results[0]
         self.assertEqual(mark.run_id, "22222222-2222-4222-8222-222222222222")
         self.assertEqual(mark.status, "failed")
+        self.assertEqual(mark.result.get("usage"), {})
         self.assertEqual(mark.result.get("failure_classification"), "PREEMPTED")
         self.assertEqual(mark.result.get("error_code"), "preempted")
 
@@ -340,8 +361,42 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
         mark = ledger.mark_results[0]
         self.assertEqual(mark.run_id, "33333333-3333-4333-8333-333333333333")
         self.assertEqual(mark.status, "failed")
+        self.assertEqual(mark.result.get("usage"), {})
         self.assertEqual(mark.result.get("failure_classification"), "PREEMPTED")
         self.assertEqual(mark.result.get("error_code"), "preempted")
+
+    def test_success_result_preserves_usage_from_child_ipc(self) -> None:
+        process = _CompletingChildProcess()
+        state_store = _FakeStateStore()
+
+        ledger, release_calls = self._run_supervisor_once(
+            role="EXECUTOR",
+            run_id="55555555-5555-4555-8555-555555555555",
+            issue_number=42,
+            process=process,
+            queue=_QueueWithPayload(
+                {
+                    "run_id": "55555555-5555-4555-8555-555555555555",
+                    "role": "EXECUTOR",
+                    "status": "succeeded",
+                    "outcome": None,
+                    "summary": "ok",
+                    "urls": {},
+                    "errors": [],
+                    "usage": {"input_tokens": 13, "output_tokens": 5},
+                    "marker_verified": None,
+                }
+            ),
+            state_store=state_store,
+            watchdog_timeout_s=30,
+        )
+
+        self.assertEqual(release_calls, [(42, "55555555-5555-4555-8555-555555555555")])
+        self.assertEqual(len(ledger.mark_results), 1)
+        mark = ledger.mark_results[0]
+        self.assertEqual(mark.run_id, "55555555-5555-4555-8555-555555555555")
+        self.assertEqual(mark.status, "succeeded")
+        self.assertEqual(mark.result.get("usage"), {"input_tokens": 13, "output_tokens": 5})
 
 
 if __name__ == "__main__":

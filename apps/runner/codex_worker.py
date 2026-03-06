@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 import json
 import re
 import shlex
@@ -28,6 +28,7 @@ class WorkerResult:
     summary: str
     urls: Dict[str, str]
     errors: list[Dict[str, Any]]
+    usage: dict[str, int] = field(default_factory=dict)
     marker_verified: Optional[bool] = None
 
 
@@ -397,6 +398,51 @@ def _build_worker_result_replay_prompt() -> str:
     )
 
 
+def _coerce_usage_token_count(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        if value >= 0 and value.is_integer():
+            return int(value)
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            return int(stripped)
+    return None
+
+
+def _extract_usage_from_tool_result(tool_result: dict[str, Any]) -> dict[str, int]:
+    usage_payload = tool_result.get("usage")
+    if not isinstance(usage_payload, dict):
+        meta = tool_result.get("_meta")
+        usage_payload = meta.get("usage") if isinstance(meta, dict) else None
+    if not isinstance(usage_payload, dict):
+        return {}
+
+    usage: dict[str, int] = {}
+    for key in ("input_tokens", "output_tokens"):
+        normalized = _coerce_usage_token_count(usage_payload.get(key))
+        if normalized is not None:
+            usage[key] = normalized
+    return usage
+
+
+def _merge_usage_counts(*usage_blocks: dict[str, int]) -> dict[str, int]:
+    merged: dict[str, int] = {}
+    for usage_block in usage_blocks:
+        if not isinstance(usage_block, dict):
+            continue
+        for key in ("input_tokens", "output_tokens"):
+            value = usage_block.get(key)
+            if not isinstance(value, int) or isinstance(value, bool):
+                continue
+            merged[key] = merged.get(key, 0) + value
+    return merged
+
+
 def _extract_worker_result(*, content: str, expected_run_id: str, expected_role: str) -> WorkerResult:
     # Prefer explicit JSON-only output; otherwise scan for a prefixed payload.
     raw = str(content or "").strip()
@@ -461,6 +507,7 @@ def _extract_worker_result(*, content: str, expected_run_id: str, expected_role:
         summary=summary,
         urls={str(k): str(v) for k, v in urls.items()},
         errors=[e if isinstance(e, dict) else {"error": str(e)} for e in errors],
+        usage={},
         marker_verified=marker_verified,
     )
 
@@ -742,6 +789,7 @@ async def run_intent_with_codex_mcp_async(
             },
             timeout_s=tools_call_timeout_s,
         )
+        usage = _extract_usage_from_tool_result(tool_result)
         transcript_writer.append_tool_executed("codex")
         transcript_writer.append_system_observation("Agent response received.")
 
@@ -749,7 +797,8 @@ async def run_intent_with_codex_mcp_async(
         text = _extract_codex_text_from_tool_result(tool_result)
         transcript_writer.append_agent_thinking(_to_transcript_thinking_text(text))
         try:
-            return _extract_worker_result(content=text, expected_run_id=expected_run_id, expected_role=expected_role)
+            result = _extract_worker_result(content=text, expected_run_id=expected_run_id, expected_role=expected_role)
+            return replace(result, usage=usage)
         except CodexWorkerError:
             transcript_writer.append_system_observation(
                 "Initial agent response was not valid JSON; requesting strict JSON replay."
@@ -765,11 +814,13 @@ async def run_intent_with_codex_mcp_async(
                 },
                 timeout_s=180.0,
             )
+            usage = _merge_usage_counts(usage, _extract_usage_from_tool_result(tool_result_2))
             transcript_writer.append_tool_executed("codex-reply")
             transcript_writer.append_system_observation("Received strict JSON replay from agent.")
             text2 = _extract_codex_text_from_tool_result(tool_result_2)
             transcript_writer.append_agent_thinking(_to_transcript_thinking_text(text2))
-            return _extract_worker_result(content=text2, expected_run_id=expected_run_id, expected_role=expected_role)
+            result = _extract_worker_result(content=text2, expected_run_id=expected_run_id, expected_role=expected_role)
+            return replace(result, usage=usage)
     except Exception as exc:
         if isinstance(exc, CodexWorkerError):
             transcript_writer.append_system_observation(f"Worker failure ({exc.code}): {_clip_text(exc, max_chars=700)}")
