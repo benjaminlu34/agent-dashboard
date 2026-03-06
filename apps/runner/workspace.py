@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import re
 import subprocess
 import tempfile
 import time
@@ -8,6 +9,7 @@ from pathlib import Path
 
 from .codex_worker import CodexWorkerError
 
+_RUN_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.IGNORECASE)
 _WORKTREE_RETRY_ATTEMPTS = 5
 _WORKTREE_RETRY_MIN_DELAY_S = 0.1
 _WORKTREE_RETRY_MAX_DELAY_S = 1.0
@@ -62,6 +64,33 @@ def _workspace_error(
     return CodexWorkerError(message, code="workspace_setup_failed", details=details)
 
 
+def _resolve_worktree_path(*, run_id: str) -> str:
+    normalized_run_id = str(run_id or "").strip()
+    if not _RUN_ID_RE.fullmatch(normalized_run_id):
+        raise _workspace_error(
+            "run_id must be a UUIDv4 for worktree setup",
+            repo_root="",
+            run_id=normalized_run_id,
+            worktree_path="",
+            attempts=0,
+        )
+
+    base_dir = Path(tempfile.gettempdir()).resolve() / "agent-worktrees"
+    worktree_path = (base_dir / normalized_run_id).resolve()
+    try:
+        worktree_path.relative_to(base_dir)
+    except ValueError as exc:
+        raise _workspace_error(
+            "run_id resolved outside worktree base directory",
+            repo_root="",
+            run_id=normalized_run_id,
+            worktree_path=str(worktree_path),
+            attempts=0,
+        ) from exc
+    base_dir.mkdir(parents=True, exist_ok=True)
+    return str(worktree_path)
+
+
 def setup_worktree(repo_root: str, run_id: str) -> str:
     normalized_repo_root = str(repo_root or "").strip()
     normalized_run_id = str(run_id or "").strip()
@@ -73,20 +102,10 @@ def setup_worktree(repo_root: str, run_id: str) -> str:
             worktree_path="",
             attempts=0,
         )
-    if not normalized_run_id:
-        raise _workspace_error(
-            "run_id is required for worktree setup",
-            repo_root=normalized_repo_root,
-            run_id="",
-            worktree_path="",
-            attempts=0,
-        )
 
     resolved_repo_root = str(Path(normalized_repo_root).resolve())
-    worktree_path = str((Path(tempfile.gettempdir()) / "agent-worktrees" / normalized_run_id).resolve())
-    Path(worktree_path).parent.mkdir(parents=True, exist_ok=True)
+    worktree_path = _resolve_worktree_path(run_id=normalized_run_id)
 
-    last_error: subprocess.CalledProcessError | None = None
     for attempt in range(1, _WORKTREE_RETRY_ATTEMPTS + 1):
         try:
             subprocess.run(
@@ -99,7 +118,6 @@ def setup_worktree(repo_root: str, run_id: str) -> str:
             )
             return worktree_path
         except subprocess.CalledProcessError as exc:
-            last_error = exc
             if attempt >= _WORKTREE_RETRY_ATTEMPTS or not _is_retryable_worktree_lock_error(exc):
                 raise _workspace_error(
                     "failed to create isolated git worktree",
@@ -139,16 +157,6 @@ def setup_worktree(repo_root: str, run_id: str) -> str:
                 error=str(exc),
             ) from exc
 
-    if last_error is not None:
-        raise _workspace_error(
-            "failed to create isolated git worktree",
-            repo_root=resolved_repo_root,
-            run_id=normalized_run_id,
-            worktree_path=worktree_path,
-            attempts=_WORKTREE_RETRY_ATTEMPTS,
-            stdout=str(last_error.stdout or ""),
-            stderr=str(last_error.stderr or ""),
-        ) from last_error
     raise _workspace_error(
         "failed to create isolated git worktree",
         repo_root=resolved_repo_root,
