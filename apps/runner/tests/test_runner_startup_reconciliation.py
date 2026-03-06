@@ -34,6 +34,7 @@ def _base_config(*, repo_key: str, sprint_plan_path: str) -> RunnerConfig:
         review_stall_polls=50,
         blocked_retry_minutes=15,
         watchdog_timeout_s=60,
+        runner_stall_timeout_s=300,
         dry_run=False,
         once=False,
         ledger_path="./.runner-ledger.json",

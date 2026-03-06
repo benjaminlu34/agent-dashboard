@@ -72,12 +72,22 @@ class _FakeSpawnContext:
     def __init__(self, process: _ChildProcess, queue: Any) -> None:
         self._process = process
         self._queue = queue
+        self.value = _SharedValue(100.0)
 
     def Queue(self, maxsize: int = 1) -> Any:  # noqa: ARG002
         return self._queue
 
     def Process(self, *args, **kwargs) -> _ChildProcess:  # noqa: ANN002, ARG002
         return self._process
+
+    def Value(self, _typecode: str, value: float) -> Any:
+        self.value = _SharedValue(value)
+        return self.value
+
+
+class _SharedValue:
+    def __init__(self, value: float) -> None:
+        self.value = value
 
 
 class _FakeStateStore:
@@ -154,6 +164,7 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
         queue: Any,
         state_store: _FakeStateStore,
         watchdog_timeout_s: int,
+        stall_timeout_s: float = 300.0,
     ) -> tuple[_LedgerRecorder, list[tuple[int, str]]]:
         repo_key = "example.repo"
         queue_key = f"orchestrator:queue:intents:{role}:{repo_key}"
@@ -194,6 +205,7 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
                                                 codex_mcp_args="mcp-server",
                                                 codex_tools_call_timeout_s=120.0,
                                                 watchdog_timeout_s=watchdog_timeout_s,
+                                                stall_timeout_s=stall_timeout_s,
                                             )
 
         return ledger, release_calls
@@ -224,6 +236,34 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
         self.assertEqual(mark.status, "failed")
         self.assertEqual(mark.result.get("failure_classification"), "HARD_STOP")
         self.assertEqual(mark.result.get("error_code"), "watchdog_timeout")
+
+    def test_stall_timeout_kills_idle_worker_before_global_watchdog(self) -> None:
+        process = _ChildProcess(survive_terminate=False)
+        state_store = _FakeStateStore()
+
+        ledger, release_calls = self._run_supervisor_once(
+            role="REVIEWER",
+            run_id="44444444-4444-4444-8444-444444444444",
+            issue_number=42,
+            process=process,
+            queue=_QueueEmpty(),
+            state_store=state_store,
+            watchdog_timeout_s=30,
+            stall_timeout_s=1.0,
+        )
+
+        self.assertTrue(process.started)
+        self.assertTrue(process.terminate_called)
+        self.assertFalse(process.kill_called)
+        self.assertEqual(release_calls, [(42, "44444444-4444-4444-8444-444444444444")])
+        self.assertEqual(state_store.polled_project_item_ids, [])
+
+        self.assertEqual(len(ledger.mark_results), 1)
+        mark = ledger.mark_results[0]
+        self.assertEqual(mark.run_id, "44444444-4444-4444-8444-444444444444")
+        self.assertEqual(mark.status, "failed")
+        self.assertEqual(mark.result.get("failure_classification"), "STALLED")
+        self.assertEqual(mark.result.get("error_code"), "stall_timeout")
 
     def test_preempts_when_item_moves_to_terminal_state(self) -> None:
         project_item_id = "PVTI_42"

@@ -49,6 +49,7 @@ class RunnerDryRunTests(unittest.TestCase):
             review_stall_polls=50,
             blocked_retry_minutes=15,
             watchdog_timeout_s=60,
+            runner_stall_timeout_s=300,
             dry_run=True,
             once=True,
             ledger_path="./.runner-ledger.json",

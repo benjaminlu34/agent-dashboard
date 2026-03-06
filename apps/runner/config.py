@@ -32,6 +32,7 @@ class RunnerConfig:
     review_stall_polls: int
     blocked_retry_minutes: int
     watchdog_timeout_s: int
+    runner_stall_timeout_s: int
     dry_run: bool
     once: bool
     ledger_path: str
@@ -242,6 +243,7 @@ def load_config(
     review_stall_polls = _parse_positive_int(resolved_env, "REVIEW_STALL_POLLS", 50)
     blocked_retry_minutes = _parse_positive_int(resolved_env, "BLOCKED_RETRY_MINUTES", 15)
     watchdog_timeout_s = _parse_positive_int(resolved_env, "RUNNER_WATCHDOG_TIMEOUT_S", 900)
+    runner_stall_timeout_s = _parse_positive_int(resolved_env, "RUNNER_STALL_TIMEOUT_S", 300)
 
     dry_run = dry_run_flag or _parse_bool(resolved_env, "RUNNER_DRY_RUN", False)
     once = once_flag
@@ -277,6 +279,7 @@ def load_config(
         review_stall_polls=review_stall_polls,
         blocked_retry_minutes=blocked_retry_minutes,
         watchdog_timeout_s=watchdog_timeout_s,
+        runner_stall_timeout_s=runner_stall_timeout_s,
         dry_run=dry_run,
         once=once,
         ledger_path=ledger_path,
