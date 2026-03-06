@@ -399,6 +399,7 @@ def run_supervisor_loop(
         proc = None
         child_result_queue: Any = ctx.Queue(maxsize=1)
         timed_out = False
+        preempted = False
         task_project_item_id = ""
         try:
             existing = ledger.get(intent_obj.run_id)
@@ -439,14 +440,50 @@ def run_supervisor_loop(
                 },
             )
             proc.start()
-            proc.join(timeout=float(watchdog_timeout_s))
-            if proc.is_alive():
+            deadline = time.time() + float(watchdog_timeout_s)
+            while time.time() < deadline and proc.is_alive():
+                proc.join(timeout=5.0)
+                if not proc.is_alive():
+                    break
+                if task_project_item_id:
+                    current_state = state_store.get_item(repo_key, task_project_item_id) or {}
+                    current_status = str(current_state.get("last_seen_status") or "").strip()
+                    if not current_status or current_status not in ("In Progress", "In Review"):
+                        preempted = True
+                        proc.terminate()
+                        proc.join(timeout=2.0)
+                        if proc.is_alive():
+                            proc.kill()
+                            proc.join(timeout=2.0)
+                        break
+
+            if not preempted and proc.is_alive():
                 timed_out = True
                 proc.terminate()
                 proc.join(timeout=2.0)
                 if proc.is_alive():
                     proc.kill()
                     proc.join(timeout=2.0)
+
+            if preempted:
+                ledger.mark_result(
+                    intent_obj.run_id,
+                    status="failed",
+                    result={
+                        "status": "failed",
+                        "summary": "worker canceled because the tracked item moved out of scope externally",
+                        "urls": {},
+                        "errors": [
+                            {
+                                "code": "preempted",
+                                "message": "tracked item moved to a non-active state or was removed externally",
+                            }
+                        ],
+                        "failure_classification": "PREEMPTED",
+                        "error_code": "preempted",
+                    },
+                )
+                continue
 
             result_payload = None
             try:
