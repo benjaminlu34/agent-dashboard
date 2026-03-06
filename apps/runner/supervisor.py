@@ -21,6 +21,9 @@ from .state_store import RedisStateStore
 from .telemetry import publish_transcript_event
 from .workspace import setup_worktree, teardown_worktree
 
+_PREEMPTION_POLL_INTERVAL_S = 5.0
+_ACTIVE_TASK_STATUSES = frozenset({"In Progress", "In Review"})
+
 
 def _log_stderr(payload: dict[str, Any]) -> None:
     try:
@@ -44,6 +47,14 @@ def _decode_redis_value(value: Any) -> str:
 
 def _utc_now_iso_ms() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S.", time.gmtime()) + f"{int((time.time() % 1) * 1000):03d}Z"
+
+
+def _stop_process(proc: Any) -> None:
+    proc.terminate()
+    proc.join(timeout=2.0)
+    if proc.is_alive():
+        proc.kill()
+        proc.join(timeout=2.0)
 
 
 def _resolve_run_context_by_run_id(items: dict[str, dict[str, Any]], run_id: str) -> Optional[tuple[int, str, str]]:
@@ -442,28 +453,20 @@ def run_supervisor_loop(
             proc.start()
             deadline = time.time() + float(watchdog_timeout_s)
             while time.time() < deadline and proc.is_alive():
-                proc.join(timeout=5.0)
+                proc.join(timeout=_PREEMPTION_POLL_INTERVAL_S)
                 if not proc.is_alive():
                     break
                 if task_project_item_id:
                     current_state = state_store.get_item(repo_key, task_project_item_id) or {}
                     current_status = str(current_state.get("last_seen_status") or "").strip()
-                    if not current_status or current_status not in ("In Progress", "In Review"):
+                    if not current_status or current_status not in _ACTIVE_TASK_STATUSES:
                         preempted = True
-                        proc.terminate()
-                        proc.join(timeout=2.0)
-                        if proc.is_alive():
-                            proc.kill()
-                            proc.join(timeout=2.0)
+                        _stop_process(proc)
                         break
 
             if not preempted and proc.is_alive():
                 timed_out = True
-                proc.terminate()
-                proc.join(timeout=2.0)
-                if proc.is_alive():
-                    proc.kill()
-                    proc.join(timeout=2.0)
+                _stop_process(proc)
 
             if preempted:
                 ledger.mark_result(

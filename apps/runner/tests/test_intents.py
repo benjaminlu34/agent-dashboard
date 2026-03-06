@@ -57,6 +57,19 @@ class IntentParsingTests(unittest.TestCase):
             )
         self.assertEqual(ctx.exception.code, "intent_endpoint_not_allowed")
 
+    def test_rejects_run_id_with_reserved_prefix(self) -> None:
+        with self.assertRaises(IntentError) as ctx:
+            parse_intent(
+                {
+                    "type": "RUN_INTENT",
+                    "role": "EXECUTOR",
+                    "run_id": "__task__:PVTI_42",
+                    "endpoint": "/internal/executor/claim-ready-item",
+                    "body": {"role": "EXECUTOR", "run_id": "__task__:PVTI_42"},
+                }
+            )
+        self.assertEqual(ctx.exception.code, "intent_invalid_run_id")
+
     def test_accepts_executor_in_review_resolve_endpoint(self) -> None:
         intent = parse_intent(
             {

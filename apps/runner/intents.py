@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 
 ALLOWED_ROLES = {"EXECUTOR", "REVIEWER"}
 INTENT_TYPE = "RUN_INTENT"
+RESERVED_RUN_ID_PREFIX = "__"
 ALLOWED_ENDPOINTS_BY_ROLE = {
     "EXECUTOR": {"/internal/executor/claim-ready-item", "/internal/reviewer/resolve-linked-pr"},
     "REVIEWER": {"/internal/reviewer/resolve-linked-pr"},
@@ -64,6 +65,9 @@ def parse_intent(value: dict[str, Any]) -> RunIntent:
     run_id = value.get("run_id")
     if not isinstance(run_id, str) or not run_id.strip():
         raise IntentError("intent run_id is required", code="intent_missing_run_id")
+    normalized_run_id = run_id.strip()
+    if normalized_run_id.startswith(RESERVED_RUN_ID_PREFIX):
+        raise IntentError("intent run_id uses reserved prefix", code="intent_invalid_run_id")
 
     endpoint = value.get("endpoint")
     if not isinstance(endpoint, str) or not endpoint.strip().startswith("/internal/"):
@@ -86,13 +90,13 @@ def parse_intent(value: dict[str, Any]) -> RunIntent:
         raise IntentError("intent body.role must match intent role", code="intent_role_mismatch")
 
     body_run_id = body.get("run_id")
-    if body_run_id != run_id:
+    if body_run_id != normalized_run_id:
         raise IntentError("intent body.run_id must match intent run_id", code="intent_run_id_mismatch")
 
     return RunIntent(
         type=INTENT_TYPE,
         role=normalized_role,
-        run_id=run_id,
+        run_id=normalized_run_id,
         endpoint=normalized_endpoint,
         body=body,
         raw=value,
