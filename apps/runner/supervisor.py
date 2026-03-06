@@ -290,6 +290,7 @@ def _intent_child_main(
     codex_mcp_args: str,
     codex_tools_call_timeout_s: float,
     intent: dict[str, Any],
+    last_activity_ts: Any,
     result_queue: Any,
 ) -> None:
     redis_client = None
@@ -302,6 +303,7 @@ def _intent_child_main(
         bundle = backend.get_agent_context(role)
 
         def sink(section: str, content: str) -> None:
+            last_activity_ts.value = time.time()
             if redis_client is None:
                 return
             publish_transcript_event(
@@ -370,6 +372,7 @@ def run_supervisor_loop(
     codex_mcp_args: str,
     codex_tools_call_timeout_s: float,
     watchdog_timeout_s: int,
+    stall_timeout_s: float,
     in_flight_ttl_s: int = 3600,
 ) -> None:
     normalized_role = str(role or "").strip().upper()
@@ -427,6 +430,7 @@ def run_supervisor_loop(
         proc = None
         child_result_queue: Any = ctx.Queue(maxsize=1)
         timed_out = False
+        stalled = False
         preempted = False
         task_project_item_id = ""
         try:
@@ -454,6 +458,7 @@ def run_supervisor_loop(
                     except Exception:
                         pass
 
+            last_activity_ts = ctx.Value("d", time.time())
             proc = ctx.Process(
                 target=_intent_child_main,
                 kwargs={
@@ -464,6 +469,7 @@ def run_supervisor_loop(
                     "codex_mcp_args": codex_mcp_args,
                     "codex_tools_call_timeout_s": codex_tools_call_timeout_s,
                     "intent": intent_raw,
+                    "last_activity_ts": last_activity_ts,
                     "result_queue": child_result_queue,
                 },
             )
@@ -472,6 +478,22 @@ def run_supervisor_loop(
             while time.time() < deadline and proc.is_alive():
                 proc.join(timeout=_PREEMPTION_POLL_INTERVAL_S)
                 if not proc.is_alive():
+                    break
+                idle_time = time.time() - float(last_activity_ts.value)
+                if idle_time > stall_timeout_s:
+                    stalled = True
+                    _stop_process(proc)
+                    _log_stderr(
+                        {
+                            "type": "WORKER_STALL_TIMEOUT",
+                            "role": intent_obj.role,
+                            "run_id": intent_obj.run_id,
+                            "issue_number": int(issue_number or 0),
+                            "project_item_id": task_project_item_id,
+                            "idle_s": idle_time,
+                            "stall_timeout_s": float(stall_timeout_s),
+                        }
+                    )
                     break
                 if task_project_item_id:
                     current_state = state_store.get_item(repo_key, task_project_item_id) or {}
@@ -504,15 +526,25 @@ def run_supervisor_loop(
             except Exception:
                 result_payload = None
 
-            if timed_out or proc.exitcode not in (0, None):
+            if stalled or timed_out or proc.exitcode not in (0, None):
+                if stalled:
+                    summary = f"worker stalled due to inactivity (>{float(stall_timeout_s)}s)"
+                    code = "stall_timeout"
+                    message = f"terminated after {float(stall_timeout_s)}s without transcript heartbeat"
+                    failure_classification = "STALLED"
+                else:
+                    summary = "worker watchdog timeout" if timed_out else "worker exited unexpectedly"
+                    code = "watchdog_timeout" if timed_out else "worker_down"
+                    message = "terminated by watchdog" if timed_out else "child process exited non-zero"
+                    failure_classification = "HARD_STOP"
                 ledger.mark_result(
                     intent_obj.run_id,
                     status="failed",
                     result=_failure_result(
-                        summary="worker watchdog timeout" if timed_out else "worker exited unexpectedly",
-                        code="watchdog_timeout" if timed_out else "worker_down",
-                        message="terminated by watchdog" if timed_out else "child process exited non-zero",
-                        failure_classification="HARD_STOP",
+                        summary=summary,
+                        code=code,
+                        message=message,
+                        failure_classification=failure_classification,
                     ),
                 )
                 continue
@@ -686,6 +718,7 @@ def start_supervisors(*, config: Any) -> list[Any]:
                 "codex_mcp_args": config.codex_mcp_args,
                 "codex_tools_call_timeout_s": config.codex_tools_call_timeout_s,
                 "watchdog_timeout_s": config.watchdog_timeout_s,
+                "stall_timeout_s": float(config.runner_stall_timeout_s),
             },
             daemon=True,
             name=f"supervisor-executor",
@@ -706,6 +739,7 @@ def start_supervisors(*, config: Any) -> list[Any]:
                 "codex_mcp_args": config.codex_mcp_args,
                 "codex_tools_call_timeout_s": config.codex_tools_call_timeout_s,
                 "watchdog_timeout_s": config.watchdog_timeout_s,
+                "stall_timeout_s": float(config.runner_stall_timeout_s),
             },
             daemon=True,
             name=f"supervisor-reviewer",

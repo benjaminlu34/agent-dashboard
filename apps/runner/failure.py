@@ -8,7 +8,8 @@ from .intents import IntentError
 
 
 def classify_failure(error: Exception) -> str:
-    # Returns one of: HARD_STOP, ITEM_STOP, TRANSIENT
+    # Returns one of: HARD_STOP, ITEM_STOP, TRANSIENT. Some ledger paths also record
+    # explicit terminal classes such as STALLED without flowing through this mapper.
     if isinstance(error, IntentError):
         return "HARD_STOP"
     if isinstance(error, HttpError):
@@ -62,4 +63,3 @@ def is_retryable_failure(*, failure_classification: str, error_code: str) -> boo
 
 def error_code_for_exception(exc: Exception) -> str:
     return str(getattr(exc, "code", "") or exc.__class__.__name__)
-

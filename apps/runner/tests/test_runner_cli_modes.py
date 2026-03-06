@@ -22,6 +22,7 @@ def _base_config(*, dry_run: bool) -> RunnerConfig:
         review_stall_polls=50,
         blocked_retry_minutes=15,
         watchdog_timeout_s=60,
+        runner_stall_timeout_s=300,
         dry_run=dry_run,
         once=False,
         ledger_path="./.runner-ledger.json",

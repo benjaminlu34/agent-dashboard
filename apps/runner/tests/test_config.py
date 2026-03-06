@@ -46,6 +46,7 @@ class RunnerConfigTests(unittest.TestCase):
         self.assertEqual(config.review_stall_polls, 50)
         self.assertEqual(config.blocked_retry_minutes, 15)
         self.assertEqual(config.watchdog_timeout_s, 900)
+        self.assertEqual(config.runner_stall_timeout_s, 300)
         self.assertEqual(config.orchestrator_sanitization_regen_attempts, 2)
 
     def test_accepts_ready_buffer_override(self) -> None:
@@ -57,12 +58,14 @@ class RunnerConfigTests(unittest.TestCase):
                 "REVIEW_STALL_POLLS": "60",
                 "BLOCKED_RETRY_MINUTES": "20",
                 "RUNNER_WATCHDOG_TIMEOUT_S": "1200",
+                "RUNNER_STALL_TIMEOUT_S": "480",
             }
         )
         self.assertEqual(config.runner_ready_buffer, 3)
         self.assertEqual(config.review_stall_polls, 60)
         self.assertEqual(config.blocked_retry_minutes, 20)
         self.assertEqual(config.watchdog_timeout_s, 1200)
+        self.assertEqual(config.runner_stall_timeout_s, 480)
 
     def test_accepts_sanitization_regen_attempts_override_and_zero(self) -> None:
         config = load_config(
