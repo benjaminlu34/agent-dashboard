@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -168,6 +169,37 @@ class OrchestratorDaemon:
         self._ledger = RunLedger(redis_client, self._repo_key)
         self._allowed_status_options = _read_policy_status_options(str(Path(__file__).resolve().parents[2]))
         self._repo_root = Path(__file__).resolve().parents[2]
+        self._prune_stale_worktrees()
+
+    def _prune_stale_worktrees(self) -> None:
+        try:
+            completed = subprocess.run(
+                ["git", "worktree", "prune"],
+                cwd=str(self._repo_root.resolve()),
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except Exception as exc:
+            _log_stderr({"type": "WORKTREE_PRUNE_FAILED", "repo_key": self._repo_key, "error": str(exc)})
+            return
+
+        if int(completed.returncode or 0) != 0:
+            _log_stderr(
+                {
+                    "type": "WORKTREE_PRUNE_FAILED",
+                    "repo_key": self._repo_key,
+                    "exit_code": completed.returncode,
+                    "stdout": str(completed.stdout or "")[:1000],
+                    "stderr": str(completed.stderr or "")[:1000],
+                }
+            )
+            return
+
+        output = "\n".join(part for part in (str(completed.stdout or "").strip(), str(completed.stderr or "").strip()) if part)
+        if output:
+            _log_stderr({"type": "WORKTREE_PRUNED", "repo_key": self._repo_key, "output": output[:1000]})
 
     def run(self) -> None:
         while True:

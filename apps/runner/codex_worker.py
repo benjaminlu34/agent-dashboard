@@ -663,17 +663,21 @@ async def run_intent_with_codex_mcp_async(
     role_bundle: Dict[str, Any],
     intent: Dict[str, Any],
     tools_call_timeout_s: float = 600.0,
+    cwd: str = ".",
     repo_root: Optional[str] = None,
     transcript_event_sink: Optional[Callable[[str, str], None]] = None,
 ) -> WorkerResult:
     assert_codex_github_mcp_available(codex_bin=codex_bin)
     expected_role = str(intent.get("role") or "").strip().upper()
     expected_run_id = str(intent.get("run_id") or "").strip()
+    normalized_cwd = str(cwd or "").strip()
     if expected_role not in ("EXECUTOR", "REVIEWER"):
         raise CodexWorkerError("intent role must be EXECUTOR or REVIEWER", code="worker_invalid_intent")
     sandbox_mode = _sandbox_for_role(expected_role)
     if not expected_run_id:
         raise CodexWorkerError("intent run_id is required", code="worker_invalid_intent")
+    if not normalized_cwd:
+        raise CodexWorkerError("cwd is required", code="worker_invalid_intent")
 
     transcript_writer = _TranscriptWriter(
         repo_root=repo_root,
@@ -731,7 +735,7 @@ async def run_intent_with_codex_mcp_async(
                         "Do not read or write outside the repository workspace. "
                         "Never merge PRs or close issues. Fail closed on ambiguity."
                     ),
-                    "cwd": ".",
+                    "cwd": normalized_cwd,
                     "sandbox": sandbox_mode,
                     "approval-policy": "never",
                 },
@@ -809,6 +813,7 @@ async def generate_json_with_codex_mcp_async(
     sandbox: str = "read-only",
     approval_policy: str = "never",
     tools_call_timeout_s: float = 600.0,
+    cwd: str = ".",
     run_id: Optional[str] = None,
     repo_root: Optional[str] = None,
     transcript_event_sink: Optional[Callable[[str, str], None]] = None,
@@ -818,6 +823,9 @@ async def generate_json_with_codex_mcp_async(
         raise CodexWorkerError("prompt is required", code="codex_invalid_prompt")
     if not isinstance(developer_instructions, str) or not developer_instructions.strip():
         raise CodexWorkerError("developer_instructions is required", code="codex_invalid_prompt")
+    normalized_cwd = str(cwd or "").strip()
+    if not normalized_cwd:
+        raise CodexWorkerError("cwd is required", code="codex_invalid_prompt")
 
     transcript_writer = _TranscriptWriter(
         repo_root=repo_root,
@@ -866,7 +874,7 @@ async def generate_json_with_codex_mcp_async(
                     "prompt": prompt,
                     "base-instructions": bundle_instructions,
                     "developer-instructions": developer_instructions,
-                    "cwd": ".",
+                    "cwd": normalized_cwd,
                     "sandbox": sandbox,
                     "approval-policy": approval_policy,
                 },

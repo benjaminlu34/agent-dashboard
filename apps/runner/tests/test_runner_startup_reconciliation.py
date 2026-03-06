@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -48,6 +49,32 @@ def _base_config(*, repo_key: str, sprint_plan_path: str) -> RunnerConfig:
 
 
 class RunnerStartupReconciliationTests(unittest.TestCase):
+    def test_daemon_init_prunes_stale_worktrees(self) -> None:
+        redis = FakeRedis()
+        repo_key = "example.repo"
+        config = _base_config(repo_key=repo_key, sprint_plan_path="./.runner-sprint-plan.json")
+
+        with mock.patch(
+            "apps.runner.daemon.subprocess.run",
+            return_value=subprocess.CompletedProcess(args=["git"], returncode=0, stdout="", stderr=""),
+        ) as run_mock:
+            OrchestratorDaemon(config=config, backend=_BackendStub(), redis_client=redis)
+
+        prune_call = run_mock.call_args
+        self.assertEqual(prune_call.args[0], ["git", "worktree", "prune"])
+        self.assertEqual(prune_call.kwargs["check"], False)
+        self.assertEqual(prune_call.kwargs["text"], True)
+
+    def test_daemon_init_ignores_prune_failures(self) -> None:
+        redis = FakeRedis()
+        repo_key = "example.repo"
+        config = _base_config(repo_key=repo_key, sprint_plan_path="./.runner-sprint-plan.json")
+
+        with mock.patch("apps.runner.daemon.subprocess.run", side_effect=OSError("git missing")):
+            daemon = OrchestratorDaemon(config=config, backend=_BackendStub(), redis_client=redis)
+
+        self.assertIsInstance(daemon, OrchestratorDaemon)
+
     def test_phase_guard_fails_closed_when_pending_verification_and_poll_zero(self) -> None:
         redis = FakeRedis()
         repo_key = "example.repo"

@@ -39,6 +39,7 @@ What still needs to be done for deploy-grade alpha:
 - Node.js `>=18` (repo uses ESM).
 - `pnpm`.
 - Python `3.12+` (runner).
+- Redis `7+` reachable via `REDIS_URL` (default `redis://localhost:6379/0`).
 - GitHub token with permissions to read/write the configured target project/repo as required by routes.
   - `pnpm doctor` defaults to `GITHUB_TOKEN` (via `.agent-swarm.yml auth.github_token_env`).
   - Existing API/orchestrator flows accept `GITHUB_PAT` or `GITHUB_TOKEN`.
@@ -51,12 +52,31 @@ What still needs to be done for deploy-grade alpha:
 pnpm install
 ```
 
-2. Configure GitHub auth:
+2. Install and start Redis in WSL/Linux:
+```bash
+sudo apt update
+sudo apt install -y redis-server
+sudo service redis-server start
+```
+
+Check status:
+```bash
+sudo service redis-server status
+```
+
+The default connection string is:
+```bash
+export REDIS_URL="redis://localhost:6379/0"
+```
+
+If you start Redis with `redis-server --port 6379`, that is a foreground process for the current shell only and you must start it again next time. Using `sudo service redis-server start` runs Redis as a background service.
+
+3. Configure GitHub auth:
 ```bash
 export GITHUB_TOKEN="<token>"
 ```
 
-3. Configure CLI target repo/project identity in repo root (`./.agent-swarm.yml`):
+4. Configure CLI target repo/project identity in repo root (`./.agent-swarm.yml`):
 - Option A (recommended): run interactive init from the repo root:
 ```bash
 pnpm swarm:init
@@ -74,7 +94,7 @@ auth:
 YAML
 ```
 
-4. Configure target repo/project identity for API+orchestrator (recommended explicit mode):
+5. Configure target repo/project identity for API+orchestrator (recommended explicit mode):
 ```bash
 export TARGET_OWNER_LOGIN="<owner>"
 export TARGET_OWNER_TYPE="user"   # or org
@@ -84,7 +104,7 @@ export TARGET_TEMPLATE_PATH=".github/ISSUE_TEMPLATE/milestone-task.yml"  # optio
 export TARGET_REF="HEAD"                                                # optional
 ```
 
-5. Before `pnpm dev`, configure status-state input for dashboard/API status route:
+6. Before `pnpm dev`, configure status-state input for dashboard/API status route:
 - Option A (auto-scoped defaults from `.agent-swarm.yml`):
   - Ensure `.agent-swarm.yml` contains:
     - `target.owner`
@@ -99,39 +119,39 @@ export RUNNER_LEDGER_PATH="./.runner-ledger.json"
 ```
 - If neither scoped files nor explicit files exist yet, `GET /internal/status` returns empty objects and dashboard sections show empty states.
 
-6. Start internal API:
+7. Start internal API:
 ```bash
 pnpm dev
 ```
 
-7. Run preflight manually:
+8. Run preflight manually:
 ```bash
 curl "http://localhost:4000/internal/preflight?role=ORCHESTRATOR"
 ```
 
-8. Run CLI doctor preflight checks:
+9. Run CLI doctor preflight checks:
 ```bash
 export GITHUB_TOKEN="<token>"
 pnpm doctor
 ```
 
-9. Run orchestrator once:
+10. Run orchestrator once:
 ```bash
 export ORCHESTRATOR_SPRINT="M1"
 pnpm orchestrator
 ```
 
-10. Run orchestrator loop mode:
+11. Run orchestrator loop mode:
 ```bash
 node apps/orchestrator/src/cli.js --loop
 ```
 
-11. Run runner once (executes orchestrator intents and workers):
+12. Run runner once (executes orchestrator intents and workers):
 ```bash
 pnpm runner
 ```
 
-12. Dry-run runner (no backend write endpoints, no worker execution):
+13. Dry-run runner (no backend write endpoints, no worker execution):
 ```bash
 pnpm runner:dry
 ```
