@@ -57,6 +57,23 @@ def _stop_process(proc: Any) -> None:
         proc.join(timeout=2.0)
 
 
+def _failure_result(
+    *,
+    summary: str,
+    code: str,
+    message: str,
+    failure_classification: str,
+) -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "summary": summary,
+        "urls": {},
+        "errors": [{"code": code, "message": message}],
+        "failure_classification": failure_classification,
+        "error_code": code,
+    }
+
+
 def _resolve_run_context_by_run_id(items: dict[str, dict[str, Any]], run_id: str) -> Optional[tuple[int, str, str]]:
     normalized_run_id = str(run_id or "").strip()
     if not normalized_run_id:
@@ -472,19 +489,12 @@ def run_supervisor_loop(
                 ledger.mark_result(
                     intent_obj.run_id,
                     status="failed",
-                    result={
-                        "status": "failed",
-                        "summary": "worker canceled because the tracked item moved out of scope externally",
-                        "urls": {},
-                        "errors": [
-                            {
-                                "code": "preempted",
-                                "message": "tracked item moved to a non-active state or was removed externally",
-                            }
-                        ],
-                        "failure_classification": "PREEMPTED",
-                        "error_code": "preempted",
-                    },
+                    result=_failure_result(
+                        summary="worker canceled because the tracked item moved out of scope externally",
+                        code="preempted",
+                        message="tracked item moved to a non-active state or was removed externally",
+                        failure_classification="PREEMPTED",
+                    ),
                 )
                 continue
 
@@ -498,19 +508,12 @@ def run_supervisor_loop(
                 ledger.mark_result(
                     intent_obj.run_id,
                     status="failed",
-                    result={
-                        "status": "failed",
-                        "summary": "worker watchdog timeout" if timed_out else "worker exited unexpectedly",
-                        "urls": {},
-                        "errors": [
-                            {
-                                "code": "watchdog_timeout" if timed_out else "worker_down",
-                                "message": "terminated by watchdog" if timed_out else "child process exited non-zero",
-                            }
-                        ],
-                        "failure_classification": "HARD_STOP",
-                        "error_code": "watchdog_timeout" if timed_out else "worker_down",
-                    },
+                    result=_failure_result(
+                        summary="worker watchdog timeout" if timed_out else "worker exited unexpectedly",
+                        code="watchdog_timeout" if timed_out else "worker_down",
+                        message="terminated by watchdog" if timed_out else "child process exited non-zero",
+                        failure_classification="HARD_STOP",
+                    ),
                 )
                 continue
 
@@ -518,14 +521,12 @@ def run_supervisor_loop(
                 ledger.mark_result(
                     intent_obj.run_id,
                     status="failed",
-                    result={
-                        "status": "failed",
-                        "summary": "worker did not return result",
-                        "urls": {},
-                        "errors": [{"code": "worker_down", "message": "missing IPC result"}],
-                        "failure_classification": "HARD_STOP",
-                        "error_code": "worker_down",
-                    },
+                    result=_failure_result(
+                        summary="worker did not return result",
+                        code="worker_down",
+                        message="missing IPC result",
+                        failure_classification="HARD_STOP",
+                    ),
                 )
                 continue
 
