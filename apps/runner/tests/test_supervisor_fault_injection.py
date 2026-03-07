@@ -125,7 +125,7 @@ class _FakeStateStore:
         self.polled_project_item_ids.append(project_item_id)
         if self._polled_items:
             return self._polled_items.pop(0)
-        return None
+        return self._initial_items.get(project_item_id)
 
     def set_item(self, _repo_key: str, _project_item_id: str, _item_dict: dict[str, Any]) -> None:
         return None
@@ -154,6 +154,8 @@ class _LedgerRecorder:
         self.mark_results: list[_LedgerMark] = []
         self.mark_running_calls: list[str] = []
         self.upsert_calls: list[Any] = []
+        self.task_failure_records: list[tuple[str, str, str]] = []
+        self.task_failure_resets: list[str] = []
 
     def get(self, _run_id: str) -> None:
         return None
@@ -169,6 +171,17 @@ class _LedgerRecorder:
 
     def touch_task_last_activity(self, _project_item_id: str, *, at_iso: str) -> None:  # noqa: ARG002
         return None
+
+    def record_task_failure(self, project_item_id: str, *, run_id: str, at_iso: str) -> dict[str, Any]:
+        self.task_failure_records.append((project_item_id, run_id, at_iso))
+        return {
+            "consecutive_failures": 1,
+            "last_failure_at": at_iso,
+            "last_failure_run_id": run_id,
+        }
+
+    def reset_task_failures(self, project_item_id: str) -> None:
+        self.task_failure_resets.append(project_item_id)
 
 
 class SupervisorFaultInjectionTests(unittest.TestCase):
@@ -229,8 +242,19 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
         return ledger, release_calls
 
     def test_watchdog_escalates_terminate_to_kill(self) -> None:
+        project_item_id = "PVTI_42"
         process = _ChildProcess(survive_terminate=True)
-        state_store = _FakeStateStore()
+        state_store = _FakeStateStore(
+            initial_items={
+                project_item_id: {
+                    "last_seen_issue_number": 42,
+                    "last_seen_status": "In Review",
+                    "last_seen_at": "2026-03-06T00:00:00Z",
+                    "status_since_at": "2026-03-06T00:00:00Z",
+                    "last_run_id": "11111111-1111-4111-8111-111111111111",
+                }
+            }
+        )
 
         ledger, release_calls = self._run_supervisor_once(
             role="REVIEWER",
@@ -246,7 +270,7 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
         self.assertTrue(process.terminate_called)
         self.assertTrue(process.kill_called)
         self.assertEqual(release_calls, [(42, "11111111-1111-4111-8111-111111111111")])
-        self.assertEqual(state_store.polled_project_item_ids, [])
+        self.assertEqual(state_store.polled_project_item_ids, [project_item_id])
 
         self.assertEqual(len(ledger.mark_results), 1)
         mark = ledger.mark_results[0]
@@ -255,10 +279,23 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
         self.assertEqual(mark.result.get("usage"), {})
         self.assertEqual(mark.result.get("failure_classification"), "HARD_STOP")
         self.assertEqual(mark.result.get("error_code"), "watchdog_timeout")
+        self.assertEqual(len(ledger.task_failure_records), 1)
+        self.assertEqual(ledger.task_failure_records[0][0], project_item_id)
 
     def test_stall_timeout_kills_idle_worker_before_global_watchdog(self) -> None:
+        project_item_id = "PVTI_42"
         process = _ChildProcess(survive_terminate=False)
-        state_store = _FakeStateStore()
+        state_store = _FakeStateStore(
+            initial_items={
+                project_item_id: {
+                    "last_seen_issue_number": 42,
+                    "last_seen_status": "In Review",
+                    "last_seen_at": "2026-03-06T00:00:00Z",
+                    "status_since_at": "2026-03-06T00:00:00Z",
+                    "last_run_id": "44444444-4444-4444-8444-444444444444",
+                }
+            }
+        )
 
         ledger, release_calls = self._run_supervisor_once(
             role="REVIEWER",
@@ -284,6 +321,8 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
         self.assertEqual(mark.result.get("usage"), {})
         self.assertEqual(mark.result.get("failure_classification"), "STALLED")
         self.assertEqual(mark.result.get("error_code"), "stall_timeout")
+        self.assertEqual(len(ledger.task_failure_records), 1)
+        self.assertEqual(ledger.task_failure_records[0][0], project_item_id)
 
     def test_preempts_when_item_moves_to_terminal_state(self) -> None:
         project_item_id = "PVTI_42"
@@ -324,6 +363,8 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
         self.assertEqual(mark.result.get("usage"), {})
         self.assertEqual(mark.result.get("failure_classification"), "PREEMPTED")
         self.assertEqual(mark.result.get("error_code"), "preempted")
+        self.assertEqual(len(ledger.task_failure_records), 1)
+        self.assertEqual(ledger.task_failure_records[0][0], project_item_id)
 
     def test_preempts_when_tracked_item_disappears(self) -> None:
         project_item_id = "PVTI_42"
@@ -364,10 +405,22 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
         self.assertEqual(mark.result.get("usage"), {})
         self.assertEqual(mark.result.get("failure_classification"), "PREEMPTED")
         self.assertEqual(mark.result.get("error_code"), "preempted")
+        self.assertEqual(len(ledger.task_failure_records), 1)
+        self.assertEqual(ledger.task_failure_records[0][0], project_item_id)
 
     def test_success_result_preserves_usage_from_child_ipc(self) -> None:
         process = _CompletingChildProcess()
-        state_store = _FakeStateStore()
+        state_store = _FakeStateStore(
+            initial_items={
+                "PVTI_42": {
+                    "last_seen_issue_number": 42,
+                    "last_seen_status": "In Review",
+                    "last_seen_at": "2026-03-06T00:00:00Z",
+                    "status_since_at": "2026-03-06T00:00:00Z",
+                    "last_run_id": "55555555-5555-4555-8555-555555555555",
+                }
+            }
+        )
 
         ledger, release_calls = self._run_supervisor_once(
             role="EXECUTOR",
@@ -397,6 +450,7 @@ class SupervisorFaultInjectionTests(unittest.TestCase):
         self.assertEqual(mark.run_id, "55555555-5555-4555-8555-555555555555")
         self.assertEqual(mark.status, "succeeded")
         self.assertEqual(mark.result.get("usage"), {"input_tokens": 13, "output_tokens": 5})
+        self.assertEqual(ledger.task_failure_resets, ["PVTI_42"])
 
 
 if __name__ == "__main__":

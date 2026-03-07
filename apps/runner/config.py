@@ -31,6 +31,9 @@ class RunnerConfig:
     runner_ready_buffer: int
     review_stall_polls: int
     blocked_retry_minutes: int
+    error_retry_base_s: float
+    error_retry_max_s: float
+    error_retry_multiplier: float
     watchdog_timeout_s: int
     runner_stall_timeout_s: int
     dry_run: bool
@@ -242,6 +245,9 @@ def load_config(
     runner_ready_buffer = _parse_positive_int(resolved_env, "RUNNER_READY_BUFFER", 2)
     review_stall_polls = _parse_positive_int(resolved_env, "REVIEW_STALL_POLLS", 50)
     blocked_retry_minutes = _parse_positive_int(resolved_env, "BLOCKED_RETRY_MINUTES", 15)
+    error_retry_base_s = _parse_positive_float(resolved_env, "ERROR_RETRY_BASE_S", 60.0)
+    error_retry_max_s = _parse_positive_float(resolved_env, "ERROR_RETRY_MAX_S", 3600.0)
+    error_retry_multiplier = _parse_positive_float(resolved_env, "ERROR_RETRY_MULTIPLIER", 2.0)
     watchdog_timeout_s = _parse_positive_int(resolved_env, "RUNNER_WATCHDOG_TIMEOUT_S", 900)
     runner_stall_timeout_s = _parse_positive_int(resolved_env, "RUNNER_STALL_TIMEOUT_S", 300)
 
@@ -278,6 +284,9 @@ def load_config(
         runner_ready_buffer=runner_ready_buffer,
         review_stall_polls=review_stall_polls,
         blocked_retry_minutes=blocked_retry_minutes,
+        error_retry_base_s=error_retry_base_s,
+        error_retry_max_s=error_retry_max_s,
+        error_retry_multiplier=error_retry_multiplier,
         watchdog_timeout_s=watchdog_timeout_s,
         runner_stall_timeout_s=runner_stall_timeout_s,
         dry_run=dry_run,

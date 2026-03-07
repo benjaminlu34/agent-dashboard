@@ -3,7 +3,7 @@ import unittest
 from apps.runner.http_client import HttpError
 from apps.runner.intents import IntentError
 from apps.runner.codex_worker import CodexWorkerError
-from apps.runner.failure import classify_failure
+from apps.runner.failure import classify_failure, is_retryable_failure
 
 
 class FailureClassificationTests(unittest.TestCase):
@@ -27,3 +27,6 @@ class FailureClassificationTests(unittest.TestCase):
 
     def test_codex_timeout_is_item_stop(self) -> None:
         self.assertEqual(classify_failure(CodexWorkerError("timeout", code="mcp_timeout")), "ITEM_STOP")
+
+    def test_watchdog_timeout_is_retryable_for_backoff_recovery(self) -> None:
+        self.assertTrue(is_retryable_failure(failure_classification="HARD_STOP", error_code="watchdog_timeout"))

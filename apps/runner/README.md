@@ -22,8 +22,11 @@ Optional:
 - `RUNNER_MAX_REVIEWERS` (default `2`)
 - `RUNNER_READY_BUFFER` (default `2`) - minimum number of `Ready` items runner tries to maintain via promotion
 - `REVIEW_STALL_POLLS` (default `50`) - after this many `In Review` polls, allow one retry reviewer dispatch; if still stalled, escalate
-- `BLOCKED_RETRY_MINUTES` (default `15`) - cooldown before auto-retrying retryable `Blocked` items back to `Ready`
-- `RUNNER_WATCHDOG_TIMEOUT_S` (default `900`) - watchdog cutoff for stale `running` worker runs; `EXECUTOR` timeouts force `In Progress/In Review -> Blocked`, `REVIEWER` timeouts record `INCOMPLETE` and clear stale dispatch markers for re-dispatch
+- `BLOCKED_RETRY_MINUTES` (default `15`) - legacy flat cooldown setting retained for compatibility; retryable fault recovery now uses `ERROR_RETRY_*`
+- `ERROR_RETRY_BASE_S` (default `60`) - first retry delay for retryable worker/system fault recovery
+- `ERROR_RETRY_MAX_S` (default `3600`) - cap for retryable worker/system fault recovery delay
+- `ERROR_RETRY_MULTIPLIER` (default `2.0`) - exponential multiplier for retryable worker/system fault recovery delay
+- `RUNNER_WATCHDOG_TIMEOUT_S` (default `900`) - watchdog cutoff for stale `running` worker runs; `EXECUTOR` timeouts force `In Progress/In Review -> Blocked`, `REVIEWER` timeouts enter delayed recovery and are redispatched after backoff
 - `RUNNER_STALL_TIMEOUT_S` (default `300`) - per-operation idle watchdog; kills a worker when transcript heartbeats stop between active LLM/tool operations
 - `RUNNER_DRY_RUN` (default `false`)
 - `RUNNER_LEDGER_PATH` (default `./.runner-ledger.json`)
@@ -126,7 +129,7 @@ Worker sandbox policy:
 - Applies dependency-graph sanitization before promotion and can request external regeneration when cycles remain (`{ORCHESTRATOR_STATE_PATH}.regen-request.json`).
 - Rehydrates local orchestrator state from remote GitHub Project metadata on startup before dispatching loop intents.
 - Runs resiliency handlers (recovery/retries/watchdog/escalation) on dispatch summaries even when `RUNNER_AUTOPROMOTE=false`.
-- Retries retryable Blocked items after `BLOCKED_RETRY_MINUTES` based on ledger classification.
+- Retries retryable Blocked items with exponential backoff plus jitter based on per-item failure history.
 - Escalates long-running In Review stalls after `REVIEW_STALL_POLLS` and bounded reviewer retries.
 - Blocks items that exceed the review cycle cap (5 cycles).
 - Enforces a watchdog timeout for stale running intents (`RUNNER_WATCHDOG_TIMEOUT_S`).

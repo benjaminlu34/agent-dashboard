@@ -25,7 +25,7 @@ from .promotion import maybe_autopromote_ready
 from .redis_keys import orchestrator_control_key, orchestrator_intents_queue_key
 from .scheduler import SchedulerError, build_run_plan, merge_runner_managed_item_fields
 from .state_store import RedisStateStore
-from .time_utils import is_after_iso, minutes_since, normalize_iso, seconds_since
+from .time_utils import calculate_backoff_delay, is_after_iso, minutes_since, normalize_iso, seconds_since
 
 
 def _log_stderr(payload: dict[str, Any]) -> None:
@@ -819,6 +819,34 @@ class OrchestratorDaemon:
                 }
             )
 
+    def _resolve_error_backoff(
+        self,
+        *,
+        project_item_id: str,
+        now_iso: str,
+        fallback_failure_at: Any,
+    ) -> Optional[dict[str, Any]]:
+        failure_state = self._ledger.get_task_failure_state(project_item_id)
+        failure_at = normalize_iso(failure_state.get("last_failure_at")) or normalize_iso(fallback_failure_at)
+        attempt_count = failure_state.get("consecutive_failures")
+        if not failure_at:
+            return None
+        normalized_attempt_count = max(1, int(attempt_count) if isinstance(attempt_count, int) else 0)
+
+        delay_s = calculate_backoff_delay(
+            normalized_attempt_count,
+            self._config.error_retry_base_s,
+            self._config.error_retry_max_s,
+            self._config.error_retry_multiplier,
+        )
+        elapsed_s = seconds_since(failure_at, now_iso=now_iso)
+        return {
+            "attempt_count": normalized_attempt_count,
+            "failure_at": failure_at,
+            "delay_s": delay_s,
+            "elapsed_s": elapsed_s,
+        }
+
     def _recover_passed_in_review_items(self, *, summary: dict[str, Any]) -> None:
         processed_items = summary.get("processed_items")
         if not isinstance(processed_items, list):
@@ -1041,6 +1069,7 @@ class OrchestratorDaemon:
 
             elapsed_seconds = seconds_since(state_item.get("last_dispatched_at"), now_iso=now_iso)
 
+            retryable_recovery = False
             ledger_entry = self._ledger.get(stale_run_id)
             if isinstance(ledger_entry, dict):
                 ledger_status = str(ledger_entry.get("status") or "").strip().lower()
@@ -1048,20 +1077,77 @@ class OrchestratorDaemon:
                     continue
                 result = ledger_entry.get("result")
                 reviewer_outcome = ""
+                failure_classification = ""
+                error_code = ""
                 if isinstance(result, dict):
                     outcome_value = result.get("reviewer_outcome")
                     if isinstance(outcome_value, str) and outcome_value.strip():
                         reviewer_outcome = str(outcome_value).strip().upper()
+                    failure_classification = str(result.get("failure_classification") or "")
+                    error_code = str(result.get("error_code") or "")
                 if reviewer_outcome in ("PASS", "FAIL", "INCOMPLETE"):
                     continue
+                retryable_recovery = ledger_status == "failed" and is_retryable_failure(
+                    failure_classification=failure_classification,
+                    error_code=error_code,
+                )
                 recovery_reason = f"ledger_status_{ledger_status or 'unknown'}_without_outcome"
             else:
+                retryable_recovery = True
                 recovery_reason = "ledger_entry_missing"
 
+            if not retryable_recovery:
+                continue
+
+            failure_at = normalize_iso(state_item.get("last_dispatched_at")) or now_iso
+            retry_state = self._ledger.record_task_failure(project_item_id, run_id=stale_run_id, at_iso=failure_at)
+            backoff = self._resolve_error_backoff(
+                project_item_id=project_item_id,
+                now_iso=now_iso,
+                fallback_failure_at=retry_state.get("last_failure_at") or failure_at,
+            )
+            if backoff is not None and backoff["elapsed_s"] < backoff["delay_s"]:
+                _log_stderr(
+                    {
+                        "type": "REVIEW_DISPATCH_RECOVERY_DEFERRED",
+                        "issue_number": issue_number,
+                        "project_item_id": project_item_id,
+                        "stale_run_id": stale_run_id,
+                        "elapsed_s": backoff["elapsed_s"],
+                        "retry_delay_s": backoff["delay_s"],
+                        "attempt_count": backoff["attempt_count"],
+                        "reason": recovery_reason,
+                    }
+                )
+                continue
+
+            review_cycle_count = state_item.get("review_cycle_count")
+            next_cycle_count = int(review_cycle_count) if isinstance(review_cycle_count, int) and review_cycle_count >= 0 else 0
+            next_cycle_count += 1
             updated = dict(state_item)
-            updated.update({"last_dispatched_role": "", "last_dispatched_status": "", "last_dispatched_at": "", "last_dispatched_poll": 0})
+            updated.update(
+                {
+                    "last_reviewer_outcome": "INCOMPLETE",
+                    "last_reviewer_feedback_at": retry_state.get("last_failure_at") or failure_at,
+                    "review_cycle_count": next_cycle_count,
+                    "last_dispatched_role": "",
+                    "last_dispatched_status": "",
+                    "last_dispatched_at": "",
+                    "last_dispatched_poll": 0,
+                }
+            )
             self._state_store.set_item(self._repo_key, project_item_id, updated)
-            _log_stderr({"type": "REVIEW_DISPATCH_RECOVERED", "issue_number": issue_number, "project_item_id": project_item_id, "stale_run_id": stale_run_id, "elapsed_s": elapsed_seconds, "reason": recovery_reason})
+            _log_stderr(
+                {
+                    "type": "REVIEW_DISPATCH_RECOVERED",
+                    "issue_number": issue_number,
+                    "project_item_id": project_item_id,
+                    "stale_run_id": stale_run_id,
+                    "elapsed_s": elapsed_seconds,
+                    "attempt_count": backoff["attempt_count"] if backoff is not None else 1,
+                    "reason": recovery_reason,
+                }
+            )
 
     def _handle_blocked_retries(self, *, summary: dict[str, Any]) -> None:
         processed_items = summary.get("processed_items")
@@ -1086,8 +1172,6 @@ class OrchestratorDaemon:
             if not isinstance(state_item, dict):
                 continue
             blocked_minutes = minutes_since(state_item.get("status_since_at"), now_iso=now_iso)
-            if blocked_minutes < int(self._config.blocked_retry_minutes):
-                continue
 
             run_id = str(state_item.get("last_run_id") or "")
             if not run_id:
@@ -1101,6 +1185,26 @@ class OrchestratorDaemon:
             failure_classification = str(result.get("failure_classification") or "")
             error_code = str(result.get("error_code") or "")
             if not is_retryable_failure(failure_classification=failure_classification, error_code=error_code):
+                continue
+            backoff = self._resolve_error_backoff(
+                project_item_id=project_item_id,
+                now_iso=now_iso,
+                fallback_failure_at=state_item.get("status_since_at"),
+            )
+            if backoff is not None and backoff["elapsed_s"] < backoff["delay_s"]:
+                _log_stderr(
+                    {
+                        "type": "BLOCKED_RETRY_DEFERRED",
+                        "issue_number": issue_number,
+                        "project_item_id": project_item_id,
+                        "blocked_minutes": blocked_minutes,
+                        "elapsed_s": backoff["elapsed_s"],
+                        "retry_delay_s": backoff["delay_s"],
+                        "attempt_count": backoff["attempt_count"],
+                        "failure_classification": failure_classification,
+                        "error_code": error_code,
+                    }
+                )
                 continue
 
             try:
@@ -1211,24 +1315,19 @@ class OrchestratorDaemon:
             _log_stderr({"type": "WORKER_WATCHDOG_TIMEOUT", "repo_key": self._repo_key, "run_id": run_id, "role": run_role, "issue_number": issue_number, "project_item_id": project_item_id, "elapsed_s": elapsed_seconds, "timeout_s": int(self._config.watchdog_timeout_s)})
 
             if run_role == "REVIEWER":
-                review_cycle_count = state_item.get("review_cycle_count")
-                next_cycle_count = int(review_cycle_count) if isinstance(review_cycle_count, int) and review_cycle_count >= 0 else 0
-                next_cycle_count += 1
-                updated = dict(state_item)
-                updated.update(
+                self._ledger.record_task_failure(project_item_id, run_id=run_id, at_iso=now_iso)
+                _log_stderr(
                     {
-                        "last_reviewer_outcome": "INCOMPLETE",
-                        "last_reviewer_feedback_at": now_iso,
-                        "review_cycle_count": next_cycle_count,
-                        "last_dispatched_role": "",
-                        "last_dispatched_status": "",
-                        "last_dispatched_at": "",
-                        "last_dispatched_poll": 0,
+                        "type": "WORKER_WATCHDOG_TIMEOUT_RECOVERY",
+                        "run_id": run_id,
+                        "role": "REVIEWER",
+                        "issue_number": issue_number,
+                        "project_item_id": project_item_id,
+                        "action": "deferred_to_review_dispatch_recovery",
                     }
                 )
-                self._state_store.set_item(self._repo_key, project_item_id, updated)
-                _log_stderr({"type": "WORKER_WATCHDOG_TIMEOUT_RECOVERY", "run_id": run_id, "role": "REVIEWER", "issue_number": issue_number, "project_item_id": project_item_id, "action": "mark_incomplete_and_clear_dispatch"})
             else:
+                self._ledger.record_task_failure(project_item_id, run_id=run_id, at_iso=now_iso)
                 self._transition_executor_failure_to_blocked(
                     run_id=run_id,
                     issue_number=int(issue_number),
