@@ -1,13 +1,18 @@
 import { asObject } from "./utils.js";
 
-export function createBackgroundAnimator({ canvas, ctx }) {
+export function createBackgroundAnimator({
+  canvas,
+  ctx,
+  runtimeWindow = globalThis.window,
+  performanceApi = globalThis.performance,
+} = {}) {
   const nodes = [];
   let canvasWidth = 0;
   let canvasHeight = 0;
   let animationFrameId = 0;
   let activityTarget = 0.12;
   let activityCurrent = 0.12;
-  let lastFrameTime = performance.now();
+  let lastFrameTime = typeof performanceApi?.now === "function" ? performanceApi.now() : Date.now();
 
   function setActivityTargetValue(nextTarget) {
     const normalized = Number(nextTarget);
@@ -34,9 +39,9 @@ export function createBackgroundAnimator({ canvas, ctx }) {
       return;
     }
 
-    const dpr = Math.max(1, window.devicePixelRatio || 1);
-    canvasWidth = window.innerWidth;
-    canvasHeight = window.innerHeight;
+    const dpr = Math.max(1, runtimeWindow?.devicePixelRatio || 1);
+    canvasWidth = runtimeWindow?.innerWidth || 0;
+    canvasHeight = runtimeWindow?.innerHeight || 0;
     canvas.width = Math.floor(canvasWidth * dpr);
     canvas.height = Math.floor(canvasHeight * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -117,25 +122,29 @@ export function createBackgroundAnimator({ canvas, ctx }) {
       ctx.fill();
     }
 
-    animationFrameId = window.requestAnimationFrame(animate);
+    if (typeof runtimeWindow?.requestAnimationFrame !== "function") {
+      animationFrameId = 0;
+      return;
+    }
+    animationFrameId = runtimeWindow.requestAnimationFrame(animate);
   }
 
   function start() {
-    if (!canvas || !ctx) {
+    if (!canvas || !ctx || typeof runtimeWindow?.requestAnimationFrame !== "function") {
       return;
     }
     if (animationFrameId) {
       return;
     }
-    lastFrameTime = performance.now();
-    animationFrameId = window.requestAnimationFrame(animate);
+    lastFrameTime = typeof performanceApi?.now === "function" ? performanceApi.now() : Date.now();
+    animationFrameId = runtimeWindow.requestAnimationFrame(animate);
   }
 
   function stop() {
-    if (!animationFrameId) {
+    if (!animationFrameId || typeof runtimeWindow?.cancelAnimationFrame !== "function") {
       return;
     }
-    window.cancelAnimationFrame(animationFrameId);
+    runtimeWindow.cancelAnimationFrame(animationFrameId);
     animationFrameId = 0;
   }
 

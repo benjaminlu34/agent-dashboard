@@ -1,266 +1,204 @@
-# Agent Swarm Infra Repo
+# Agent Dashboard Control Plane
 
-This repository is the control-plane and policy runtime for a local, GitHub-backed agent swarm.
+This repository is the control-plane runtime for a local, GitHub-backed agent swarm.
 
-It is not an application product repo. It is infrastructure that orchestrates role-scoped agent workflows (`ORCHESTRATOR`, `EXECUTOR`, `REVIEWER`) against a target GitHub repository/project.
+It is not the product application repository. It provides the policy bundle, backend routes, orchestrator, runner, CLI tooling, and dashboard used to drive role-scoped agent work against a target GitHub repository and Project V2 board.
 
-## Current Stage
+## What Lives Here
 
-Current maturity is **alpha (local/internal)**, not deploy-complete production alpha.
-
-What exists now:
-- Policy-gated internal API (`apps/api`) with preflight, planner/apply, executor claim, reviewer PR resolution, and status update endpoints.
-- Orchestrator CLI (`apps/orchestrator`) that emits deterministic JSON run intents for worker roles.
-- Python runner (`apps/runner`) that consumes orchestrator JSONL intents, executes Codex MCP workers, handles kickoff planning, maintains a run ledger, and manages resiliency loops (review stalls, blocked retries, watchdogs).
-- Target-repo identity overrides via env (`TARGET_*`) with fail-closed validation.
-- Preflight template validation against the **target repo on GitHub**.
-- Test suite for policy, linkage, preflight, orchestrator loop behavior.
-
-What still needs to be done for deploy-grade alpha:
-- CI workflow(s) for test/lint/typecheck gates on PRs (no `.github/workflows/*` currently).
-- Runtime auth hardening for internal API endpoints (currently token-based GitHub access only; no service auth layer documented).
-- Deployment packaging/runtime manifests (no Dockerfile/compose/K8s manifests in repo).
-- Persistent orchestrator state backend if multi-runner or restart durability is needed (current state is local JSON file).
-- Operational observability baseline (structured logs exist, but no metrics/alerts pipeline documented).
-
-## Repo Layout
-
-- `AGENTS.md`: global governance contract.
-- `agents/*.md`: role overlays.
-- `policy/*.json`: machine-readable policy (project schema, transitions, permissions, target identity fallback).
-- `apps/api`: Fastify internal control-plane API.
-- `apps/orchestrator`: scheduler/dispatcher CLI that emits JSON run intents.
-- `apps/runner`: Python runner that executes run intents and automates promotion/review handling.
-- `apps/web`: scaffold only (not active runtime).
-- `docs/`: design, runbooks, and orchestration docs.
+- `apps/api`: Fastify backend for internal orchestration routes, configuration, metadata, status, kickoff, and logs. It also serves the local dashboard UI.
+- `apps/orchestrator`: Node CLI that reads policy plus target state and emits deterministic `RUN_INTENT` JSONL for worker roles.
+- `apps/runner`: Python runner that executes orchestrator intents through Codex MCP, manages kickoff, autopromotion, in-flight serialization, watchdogs, retries, and recovery.
+- `apps/cli`: local operator CLI for `init` and `doctor`.
+- `apps/web`: static dashboard assets served by `apps/api`. In this repo it is control-plane UI only, not a product app.
+- `agents/` and `policy/`: role overlays and machine-readable policy consumed verbatim by the backend and runner.
+- `docs/`: runbooks and contracts for orchestrator, runner, kickoff, and target-repo operation.
 
 ## Prerequisites
 
-- Node.js `>=18` (repo uses ESM).
-- `pnpm`.
-- Python `3.12+` (runner).
-- Redis `7+` reachable via `REDIS_URL` (default `redis://localhost:6379/0`).
-- GitHub token with permissions to read/write the configured target project/repo as required by routes.
-  - `pnpm doctor` defaults to `GITHUB_TOKEN` (via `.agent-swarm.yml auth.github_token_env`).
-  - Existing API/orchestrator flows accept `GITHUB_PAT` or `GITHUB_TOKEN`.
-- Codex CLI with MCP servers `github` and `github_projects` enabled (runner).
+- Node.js `>=18`
+- `pnpm`
+- Python `3.12+`
+- Redis `7+` reachable at `REDIS_URL` (default `redis://localhost:6379/0`)
+- GitHub token with access to the target repository and Project V2
+- Codex CLI with `github` and `github_projects` MCP servers enabled for non-dry-run runner execution
 
 ## Quick Start
 
 1. Install dependencies:
+
 ```bash
 pnpm install
+pip install -r apps/runner/requirements.txt
 ```
 
-2. Install and start Redis in WSL/Linux:
+2. Start Redis:
+
 ```bash
 sudo apt update
 sudo apt install -y redis-server
 sudo service redis-server start
+export REDIS_URL=redis://localhost:6379/0
 ```
-
-Check status:
-```bash
-sudo service redis-server status
-```
-
-The default connection string is:
-```bash
-export REDIS_URL="redis://localhost:6379/0"
-```
-
-If you start Redis with `redis-server --port 6379`, that is a foreground process for the current shell only and you must start it again next time. Using `sudo service redis-server start` runs Redis as a background service.
 
 3. Configure GitHub auth:
+
 ```bash
-export GITHUB_TOKEN="<token>"
+export GITHUB_TOKEN=<token>
 ```
 
-4. Configure CLI target repo/project identity in repo root (`./.agent-swarm.yml`):
-- Option A (recommended): run interactive init from the repo root:
+4. Configure the target repo and project in the repo root:
+
+Recommended:
+
 ```bash
 pnpm swarm:init
 ```
-- Option B: create the file manually:
-```bash
-cat > .agent-swarm.yml <<'YAML'
-version: "1.0"
-target:
-  owner: "<owner>"
-  repo: "<repo>"
-  project_v2_number: 1
-auth:
-  github_token_env: "GITHUB_TOKEN"
-YAML
-```
 
-5. Configure target repo/project identity for API+orchestrator (recommended explicit mode):
-```bash
-export TARGET_OWNER_LOGIN="<owner>"
-export TARGET_OWNER_TYPE="user"   # or org
-export TARGET_REPO_NAME="<repo>"
-export TARGET_PROJECT_NAME="<project-v2-title>"
-export TARGET_TEMPLATE_PATH=".github/ISSUE_TEMPLATE/milestone-task.yml"  # optional
-export TARGET_REF="HEAD"                                                # optional
-```
+This writes `./.agent-swarm.yml` and the required issue template path for local bootstrap.
 
-6. Before `pnpm dev`, configure status-state input for dashboard/API status route:
-- Option A (auto-scoped defaults from `.agent-swarm.yml`):
-  - Ensure `.agent-swarm.yml` contains:
-    - `target.owner`
-    - `target.repo`
-  - The status endpoint will read:
-    - `./.orchestrator-state.<sanitized-owner>.<sanitized-repo>.json`
-    - `./.runner-ledger.<sanitized-owner>.<sanitized-repo>.json`
-- Option B (explicit state file paths via env):
-```bash
-export ORCHESTRATOR_STATE_PATH="./.orchestrator-state.json"
-export RUNNER_LEDGER_PATH="./.runner-ledger.json"
-```
-- If neither scoped files nor explicit files exist yet, `GET /internal/status` returns empty objects and dashboard sections show empty states.
+5. Start the backend:
 
-7. Start internal API:
 ```bash
 pnpm dev
 ```
 
-8. Run preflight manually:
-```bash
-curl "http://localhost:4000/internal/preflight?role=ORCHESTRATOR"
-```
+Then open `http://localhost:4000`.
 
-9. Run CLI doctor preflight checks:
+`pnpm dev` starts the backend and serves the dashboard. From the UI, `Start Kickoff Loop (Step 2)` and `Start Runner Loop (No Kickoff)` will start the runner daemon automatically if it is not already running.
+
+6. Run preflight checks:
+
 ```bash
-export GITHUB_TOKEN="<token>"
 pnpm doctor
 ```
 
-10. Run orchestrator once:
+`doctor` validates:
+
+- token presence and active scopes
+- read/write access to the configured target repo
+- required issue template presence at `.github/ISSUE_TEMPLATE/milestone-task.yml`
+
+7. Run the orchestration flow:
+
+From the dashboard UI you can:
+
+- open `Settings` and save target owner, repo, project number, token, and worker counts
+- save a sprint goal
+- click `Start Kickoff Loop (Step 2)` for a new sprint
+- click `Start Runner Loop (No Kickoff)` when tasks already exist
+- seal a pending-verification sprint
+- stop active runner or kickoff loops
+
+The UI still assumes the backend from step 5 is already running. It cannot start `pnpm dev` for you because the dashboard is served by that backend.
+
+8. CLI alternatives:
+
+Run orchestrator once:
+
 ```bash
-export ORCHESTRATOR_SPRINT="M1"
+export ORCHESTRATOR_SPRINT=M1
 pnpm orchestrator
 ```
 
-11. Run orchestrator loop mode:
-```bash
-node apps/orchestrator/src/cli.js --loop
-```
+Run the runner once:
 
-12. Run runner once (executes orchestrator intents and workers):
 ```bash
+export ORCHESTRATOR_SPRINT=M1
 pnpm runner
 ```
 
-13. Dry-run runner (no backend write endpoints, no worker execution):
+Dry-run the runner:
+
 ```bash
+export ORCHESTRATOR_SPRINT=M1
 pnpm runner:dry
 ```
 
-## CLI Doctor
+Run kickoff plus the loop directly from the runner:
 
-`pnpm doctor` reads `.agent-swarm.yml` in your current working directory and runs three preflight checks:
-- Check 1: token presence/auth/scopes using `auth.github_token_env` (defaults to `GITHUB_TOKEN`).
-- Check 2: read/write connectivity for `target.owner` + `target.repo`.
-- Check 3: required template presence at `.github/ISSUE_TEMPLATE/milestone-task.yml`.
+```bash
+python3 -m apps.runner --kickoff --sprint M1 --goal-file ./goal.txt --loop
+```
 
-Doctor exit codes:
-- `0`: all checks passed.
-- `1`: one or more checks failed.
+Use these CLI commands when you want a one-shot/manual flow instead of driving execution from the dashboard.
 
-Remediation output is intentionally safe-by-default:
-- Template fix remediation uses `mktemp`, creates a dedicated branch, and does not push to the default branch.
-- The script refuses to overwrite an existing template file.
-- A human review/approval step is still required before merge.
+## Root Commands
 
-## Orchestrator Runtime Config
+Use the root `package.json` scripts as the repo entrypoints.
 
-Required:
-- `ORCHESTRATOR_SPRINT`
+- `pnpm dev`: start `apps/api` on port `4000`
+- `pnpm swarm:init`: create or update local `.agent-swarm.yml`
+- `pnpm doctor`: verify auth, repo access, and required template
+- `pnpm orchestrator`: run the orchestrator once
+- `pnpm runner`: run the Python runner once
+- `pnpm runner:dry`: dry-run the runner once
+- `pnpm test`: run API tests
+- `pnpm test:cli`: run CLI tests
+- `pnpm test:web`: run dashboard unit tests
+- `pnpm test:web:e2e`: run Playwright dashboard tests
+- `pnpm test:all`: run API tests plus dashboard unit and e2e tests
 
-Optional:
-- `ORCHESTRATOR_BACKEND_BASE_URL` (default `http://localhost:4000`)
-- `ORCHESTRATOR_REPO_ROOT` (default repo root)
-- `ORCHESTRATOR_MAX_EXECUTORS` (default `1`)
-- `ORCHESTRATOR_MAX_REVIEWERS` (default `1`)
-- `ORCHESTRATOR_POLL_INTERVAL_MS` (default `15000`)
-- `ORCHESTRATOR_STALL_MINUTES` (default `120`)
-- `ORCHESTRATOR_REVIEW_CHURN_POLLS` (default `3`)
-- `ORCHESTRATOR_REVIEWER_RETRY_POLLS` (default `20`)
-- `ORCHESTRATOR_EXECUTOR_RETRY_POLLS` (default `20`)
-- `ORCHESTRATOR_MAX_REVIEWER_DISPATCHES_PER_STATUS` (default `2`)
-- `ORCHESTRATOR_STATE_PATH` (default `./.orchestrator-state.json`)
-- `ORCHESTRATOR_ITEMS_FILE` (fixture JSON for local testing)
+Runner tests are separate:
 
-Exit codes:
-- `0`: normal completion/run success
-- `2`: preflight/identity/validation hard stop
-- `3`: malformed sprint-scoped item data
-- `4`: transient preflight/template retries exhausted
+```bash
+python3 -m apps.runner.tests
+```
 
-## Runner Runtime Config
+To run the persistent runner daemon manually instead of letting the dashboard start it:
 
-Required:
-- `ORCHESTRATOR_SPRINT` (or pass `--sprint`)
+```bash
+python3 -m apps.runner --sprint M1
+```
 
-Optional:
-- `BACKEND_BASE_URL` (default `http://localhost:4000`)
-- `BACKEND_TIMEOUT_S` (default `120`)
-- `RUNNER_MAX_EXECUTORS` (default `3`)
-- `RUNNER_MAX_REVIEWERS` (default `2`)
-- `RUNNER_READY_BUFFER` (default `2`)
-- `REVIEW_STALL_POLLS` (default `50`)
-- `BLOCKED_RETRY_MINUTES` (default `15`)
-- `RUNNER_WATCHDOG_TIMEOUT_S` (default `900`)
-- `RUNNER_DRY_RUN` (default `false`)
-- `RUNNER_LEDGER_PATH` (default `./.runner-ledger.json`)
-- `RUNNER_SPRINT_PLAN_PATH` (default `./.runner-sprint-plan.json`)
-- `RUNNER_AUTOPROMOTE` (default `true`)
-- `ORCHESTRATOR_STATE_PATH` (default `./.orchestrator-state.json`)
-- `RUNNER_ORCHESTRATOR_CMD` (default `node apps/orchestrator/src/cli.js --loop`)
-- `CODEX_BIN` (default `codex`)
-- `CODEX_MCP_ARGS` (default `mcp-server`)
-- `CODEX_TOOLS_CALL_TIMEOUT_S` (default `1800`)
-- `ORCHESTRATOR_SANITIZATION_REGEN_ATTEMPTS` (default `2`)
+## Configuration Notes
 
-Watchdog tuning note:
-- `RUNNER_WATCHDOG_TIMEOUT_S` should be configured for worst-case worker runtime (especially reviewer runs). If set too low, repeated reviewer watchdog timeouts can increase review cycles and push items into cycle-cap blocking.
+### `.agent-swarm.yml`
 
-## API Endpoints (Internal)
+The local CLI reads `./.agent-swarm.yml` for:
 
-- `GET /internal/preflight?role=<ROLE>`
-- `POST /internal/run`
-- `POST /internal/plan-apply`
-- `POST /internal/project-item/update-field`
-- `GET /internal/agent-context?role=<ROLE>`
-- `POST /internal/executor/claim-ready-item`
-- `POST /internal/reviewer/resolve-linked-pr`
-- `POST /internal/kickoff/start-loop`
-- `POST /internal/runner/start-loop`
+- target owner
+- target repo
+- Project V2 number
+- which environment variable contains the GitHub token
 
-## Commands
+### `TARGET_*` identity overrides
 
-- Run API: `pnpm dev`
-- Run tests: `pnpm test`
-- Run CLI config parser test: `pnpm test:cli`
-- Init `.agent-swarm.yml` + required template: `pnpm swarm:init`
-- Run doctor preflight checks: `pnpm doctor`
-- Run orchestrator once: `pnpm orchestrator`
-- Run runner once: `pnpm runner`
-- Run runner dry-run: `pnpm runner:dry`
-- Start runner loop without kickoff: `python3 -m apps.runner --sprint M1 --loop`
+The backend and orchestrator can also run in explicit env-override mode. If any required `TARGET_*` variable is set, all required target identity variables must be set. Otherwise identity falls back to policy configuration.
 
-## Notes on Identity Resolution
+Common variables:
 
-Target identity precedence is deterministic:
-- If any required `TARGET_*` identity env is set, env override mode is used and all required target identity vars must be present.
-- Otherwise, fallback to `policy/github-project.json`.
+- `TARGET_OWNER_LOGIN`
+- `TARGET_OWNER_TYPE`
+- `TARGET_REPO_NAME`
+- `TARGET_PROJECT_NAME`
+- `TARGET_TEMPLATE_PATH`
+- `TARGET_REF`
+
+### State and ledger files
+
+The control plane uses local JSON files for stateful coordination:
+
+- orchestrator state: `./.orchestrator-state*.json`
+- runner ledger: `./.runner-ledger*.json`
+- sprint plan cache: `./.runner-sprint-plan.json`
+
+When `.agent-swarm.yml` is present, the default orchestrator and ledger paths are scoped by owner and repo.
+
+## Runtime Responsibilities
+
+- Backend routes enforce preflight, project field validation, transition rules, claim locking, PR linkage validation, and kickoff/metadata contracts.
+- Orchestrator emits strict role-scoped intents and keeps local scheduler state, including corruption recovery and runner-managed field merge behavior.
+- Runner executes intents via Codex MCP, maintains per-issue serialization, promotes `Backlog` work to `Ready` when configured, and applies recovery flows for stalled or failed work.
 
 ## Key Docs
 
-- `docs/running-orchestrator-against-target-repo.md`
-- `docs/infra-repo-direction.md`
-- `docs/executor-v1.md`
-- `docs/reviewer-v1-runbook.md`
+- `docs/quickstart.md`
 - `docs/agent-orchestrator.md`
 - `docs/runner-contract.md`
+- `docs/infra-repo-direction.md`
+- `docs/running-orchestrator-against-target-repo.md`
+- `docs/agent-context-bundle.md`
+- `docs/executor-v1.md`
+- `docs/reviewer-v1-runbook.md`
 - `apps/runner/README.md`

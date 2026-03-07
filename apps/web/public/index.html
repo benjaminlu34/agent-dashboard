@@ -256,7 +256,7 @@
               <div>
                 <h2 class="text-xl font-semibold tracking-tight text-white">Sprint Configuration &amp; Kickoff</h2>
                 <p class="mt-1 text-sm text-zinc-400">
-                  Step 1 saves your high-level sprint goal. Step 2 starts kickoff execution. If tasks already exist, start the runner loop directly.
+                  Step 1 saves your high-level sprint goal. Step 2 starts kickoff execution. If the runner daemon is not up yet, the UI will start it before enqueuing work. If tasks already exist, start the runner loop directly.
                 </p>
               </div>
               <div class="inline-flex items-center gap-2 rounded-full border border-zinc-800 bg-black px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-400">
@@ -314,7 +314,7 @@
               <div id="kickoff-start-workflow-hint" class="mt-3 rounded-lg border border-zinc-800 bg-black px-3 py-2 text-xs text-zinc-400">
                 <p class="font-semibold uppercase tracking-[0.16em] text-zinc-300">Start Workflow</p>
                 <p class="mt-1">
-                  Click <span class="font-semibold text-zinc-200">Start Kickoff Loop (Step 2)</span> to launch kickoff from the GUI. Manual fallback:
+                  Click <span class="font-semibold text-zinc-200">Start Kickoff Loop (Step 2)</span> to launch kickoff from the GUI. The dashboard will auto-start the runner daemon if needed. Manual fallback:
                   `python3 -m apps.runner --kickoff --sprint M1 --goal-file ./goal.txt --loop`
                 </p>
                 <p class="mt-1">
