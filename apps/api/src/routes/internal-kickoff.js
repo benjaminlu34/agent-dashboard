@@ -64,7 +64,7 @@ async function startRunnerDaemon({
   pythonBin = DEFAULT_RUNNER_PYTHON_BIN,
   env = process.env,
 } = {}) {
-  return await new Promise((resolveStart, rejectStart) => {
+  return new Promise((resolveStart, rejectStart) => {
     let settled = false;
     const child = spawnImpl(pythonBin, ["-m", "apps.runner", "--sprint", sprint], {
       cwd: repoRoot,
