@@ -107,10 +107,7 @@ class RunLedger:
         return raw if isinstance(raw, str) else str(raw)
 
     def get_task_last_activity(self, project_item_id: str) -> str:
-        parsed = self._get_task_metadata(project_item_id)
-        if not isinstance(parsed, dict):
-            return ""
-        value = parsed.get("last_activity_at")
+        value = self._get_task_metadata(project_item_id).get("last_activity_at")
         return value if isinstance(value, str) else ""
 
     def touch_task_last_activity(self, project_item_id: str, *, at_iso: str) -> None:
