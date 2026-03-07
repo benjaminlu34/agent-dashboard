@@ -829,11 +829,9 @@ class OrchestratorDaemon:
         failure_state = self._ledger.get_task_failure_state(project_item_id)
         failure_at = normalize_iso(failure_state.get("last_failure_at")) or normalize_iso(fallback_failure_at)
         attempt_count = failure_state.get("consecutive_failures")
-        normalized_attempt_count = attempt_count if isinstance(attempt_count, int) and attempt_count > 0 else 0
-        if normalized_attempt_count <= 0 and failure_at:
-            normalized_attempt_count = 1
-        if normalized_attempt_count <= 0 or not failure_at:
+        if not failure_at:
             return None
+        normalized_attempt_count = max(1, int(attempt_count) if isinstance(attempt_count, int) else 0)
 
         delay_s = calculate_backoff_delay(
             normalized_attempt_count,
