@@ -81,7 +81,10 @@ class _FakeClient:
             if name == "codex":
                 prompt = (params or {}).get("arguments", {}).get("prompt")
                 if prompt == "json-prompt":
-                    return {"structuredContent": {"threadId": "thread-1", "content": json.dumps({"ok": True})}}
+                    return {
+                        "structuredContent": {"threadId": "thread-1", "content": json.dumps({"ok": True})},
+                        "usage": {"input_tokens": 3, "output_tokens": 2},
+                    }
                 return {
                     "structuredContent": {
                         "threadId": "thread-1",
@@ -96,10 +99,14 @@ class _FakeClient:
                                 "marker_verified": None,
                             }
                         ),
-                    }
+                    },
+                    "usage": {"input_tokens": 11, "output_tokens": "7"},
                 }
             if name == "codex-reply":
-                return {"structuredContent": {"threadId": "thread-1", "content": json.dumps({"ok": True})}}
+                return {
+                    "structuredContent": {"threadId": "thread-1", "content": json.dumps({"ok": True})},
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
         return {}
 
     async def notify(self, method: str, params: dict | None = None) -> None:
@@ -159,6 +166,7 @@ class CodexWorkerPromptTests(unittest.TestCase):
             expected_role="REVIEWER",
         )
         self.assertEqual(result.outcome, "PASS")
+        self.assertEqual(result.usage, {})
 
     def test_extract_worker_result_accepts_executor_marker_verified(self) -> None:
         result = _extract_worker_result(
@@ -171,6 +179,7 @@ class CodexWorkerPromptTests(unittest.TestCase):
             expected_role="EXECUTOR",
         )
         self.assertEqual(result.marker_verified, True)
+        self.assertEqual(result.usage, {})
 
     def test_extract_worker_result_strips_markdown_fences(self) -> None:
         result = _extract_worker_result(
@@ -218,8 +227,77 @@ class CodexWorkerPromptTests(unittest.TestCase):
                             )
 
             self.assertEqual(result.run_id, "run-123")
+            self.assertEqual(result.usage, {"input_tokens": 11, "output_tokens": 7})
             tools_call = next(call for call in _FakeClient.instances[0].calls if call[0] == "tools/call")
             self.assertEqual(tools_call[1]["arguments"]["cwd"], "/tmp/agent-worktrees/run-123")
+
+        asyncio.run(run_test())
+
+    def test_run_intent_with_codex_mcp_async_aggregates_usage_across_replay(self) -> None:
+        class _ReplayClient:
+            def __init__(self, _proc) -> None:  # noqa: ANN001
+                self.calls: list[tuple[str, dict | None]] = []
+
+            async def call(self, method: str, params: dict | None = None, *, timeout_s: float = 120.0) -> dict:
+                _ = timeout_s
+                self.calls.append((method, params))
+                if method == "initialize":
+                    return {"protocolVersion": _MCP_PROTOCOL_VERSION}
+                if method == "tools/list":
+                    return {"tools": [{"name": "codex"}]}
+                if method == "tools/call":
+                    name = str((params or {}).get("name") or "")
+                    if name == "codex":
+                        return {
+                            "structuredContent": {"threadId": "thread-1", "content": "not-json"},
+                            "usage": {"input_tokens": 10, "output_tokens": 3},
+                        }
+                    if name == "codex-reply":
+                        return {
+                            "structuredContent": {
+                                "threadId": "thread-1",
+                                "content": json.dumps(
+                                    {
+                                        "run_id": "run-123",
+                                        "role": "EXECUTOR",
+                                        "status": "succeeded",
+                                        "summary": "ok",
+                                        "urls": {},
+                                        "errors": [],
+                                        "marker_verified": None,
+                                    }
+                                ),
+                            },
+                            "_meta": {"usage": {"input_tokens": "2", "output_tokens": 1.0}},
+                        }
+                return {}
+
+            async def notify(self, method: str, params: dict | None = None) -> None:
+                self.calls.append((method, params))
+
+            async def close(self) -> None:
+                return None
+
+        async def run_test() -> None:
+            with patch("apps.runner.codex_worker.assert_codex_github_mcp_available", return_value=None):
+                with patch("apps.runner.codex_worker._spawn_codex_mcp_server", return_value=_FakeProc()):
+                    with patch("apps.runner.codex_worker._AsyncJsonRpcClient", _ReplayClient):
+                        with patch("apps.runner.codex_worker.asyncio.create_task", side_effect=_fake_create_task):
+                            result = await run_intent_with_codex_mcp_async(
+                                codex_bin="codex",
+                                codex_mcp_args="mcp-server",
+                                backend_base_url="http://localhost:4000",
+                                role_bundle={"role": "EXECUTOR", "files": []},
+                                intent={
+                                    "type": "RUN_INTENT",
+                                    "role": "EXECUTOR",
+                                    "run_id": "run-123",
+                                    "endpoint": "/internal/executor/claim-ready-item",
+                                    "body": {"role": "EXECUTOR", "run_id": "run-123", "sprint": "M1"},
+                                },
+                            )
+
+            self.assertEqual(result.usage, {"input_tokens": 12, "output_tokens": 4})
 
         asyncio.run(run_test())
 

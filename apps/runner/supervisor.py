@@ -69,6 +69,7 @@ def _failure_result(
         "summary": summary,
         "urls": {},
         "errors": [{"code": code, "message": message}],
+        "usage": {},
         "failure_classification": failure_classification,
         "error_code": code,
     }
@@ -346,6 +347,7 @@ def _intent_child_main(
             "summary": str(exc),
             "urls": {},
             "errors": [{"code": error_code, "message": str(exc)}],
+            "usage": {},
             "marker_verified": None,
         }
         try:
@@ -570,6 +572,7 @@ def run_supervisor_loop(
                 summary=str(result_payload.get("summary") or ""),
                 urls=result_payload.get("urls") if isinstance(result_payload.get("urls"), dict) else {},
                 errors=result_payload.get("errors") if isinstance(result_payload.get("errors"), list) else [],
+                usage=result_payload.get("usage") if isinstance(result_payload.get("usage"), dict) else {},
                 marker_verified=result_payload.get("marker_verified"),
             )
 
@@ -628,6 +631,7 @@ def run_supervisor_loop(
                     "summary": worker_result.summary,
                     "urls": worker_result.urls,
                     "errors": worker_result.errors,
+                    "usage": worker_result.usage,
                     "reviewer_outcome": reviewer_outcome,
                     "last_reviewer_feedback_at": completed_at if intent_obj.role == "REVIEWER" else None,
                     "last_executor_response_at": completed_at if intent_obj.role == "EXECUTOR" else None,
@@ -671,6 +675,7 @@ def run_supervisor_loop(
                         "summary": str(exc),
                         "urls": {},
                         "errors": [{"error": str(exc), "code": code}],
+                        "usage": {},
                         "failure_classification": failure_classification,
                         "error_code": code,
                         "reviewer_outcome": "INCOMPLETE" if intent_obj.role == "REVIEWER" else None,

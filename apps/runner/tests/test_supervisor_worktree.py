@@ -82,6 +82,7 @@ class SupervisorWorktreeTests(unittest.TestCase):
         teardown_mock.assert_called_once()
         self.assertEqual(teardown_mock.call_args.kwargs["worktree_path"], "/tmp/agent-worktrees/run-123")
         self.assertEqual(result_queue.payloads[0]["status"], "succeeded")
+        self.assertEqual(result_queue.payloads[0]["usage"], {})
         self.assertTrue(redis_client.closed)
 
     def test_intent_child_main_tears_down_after_worker_failure(self) -> None:
@@ -116,6 +117,7 @@ class SupervisorWorktreeTests(unittest.TestCase):
         self.assertEqual(teardown_mock.call_args.kwargs["worktree_path"], "/tmp/agent-worktrees/run-123")
         self.assertEqual(result_queue.payloads[0]["status"], "failed")
         self.assertEqual(result_queue.payloads[0]["summary"], "boom")
+        self.assertEqual(result_queue.payloads[0]["usage"], {})
         self.assertTrue(redis_client.closed)
 
     def test_intent_child_main_skips_worker_when_worktree_setup_fails(self) -> None:
@@ -153,6 +155,7 @@ class SupervisorWorktreeTests(unittest.TestCase):
         teardown_mock.assert_not_called()
         self.assertEqual(result_queue.payloads[0]["status"], "failed")
         self.assertEqual(result_queue.payloads[0]["summary"], "setup failed")
+        self.assertEqual(result_queue.payloads[0]["usage"], {})
         self.assertTrue(redis_client.closed)
 
     def test_intent_child_main_updates_heartbeat_from_transcript_sink(self) -> None:
@@ -203,3 +206,4 @@ class SupervisorWorktreeTests(unittest.TestCase):
         self.assertEqual(heartbeat.value, 1234.5)
         publish_mock.assert_called_once()
         self.assertEqual(result_queue.payloads[0]["status"], "succeeded")
+        self.assertEqual(result_queue.payloads[0]["usage"], {})
