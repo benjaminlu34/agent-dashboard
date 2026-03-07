@@ -7,65 +7,7 @@ import {
   UI_STORAGE_KEY_SOUND_NEEDS_HUMAN_APPROVAL,
   UI_STORAGE_KEY_TERMINAL_ACTIVE_ONLY,
 } from "./constants.js";
-import {
-  canvas,
-  ctx,
-  errorBannerEl,
-  kickoffButtonLabelEl,
-  kickoffButtonSpinnerEl,
-  kickoffDetailsEl,
-  kickoffFormEl,
-  kickoffGoalEl,
-  kickoffMessageEl,
-  kickoffRequireVerificationEl,
-  kickoffRunnerLoopContainerEl,
-  kickoffSprintEl,
-  kickoffStartLoopButtonEl,
-  kickoffStartLoopLabelEl,
-  kickoffStartLoopSpinnerEl,
-  kickoffStartRunnerLoopButtonEl,
-  kickoffStartRunnerLoopLabelEl,
-  kickoffStartRunnerLoopSpinnerEl,
-  kickoffStartWorkflowHintEl,
-  kickoffStopForceEl,
-  kickoffStopOrchestratorsButtonEl,
-  kickoffStopOrchestratorsLabelEl,
-  kickoffStopOrchestratorsSpinnerEl,
-  kickoffSubmitButtonEl,
-  lastRefreshEl,
-  orchestratorItemsEl,
-  orchestratorSprintEl,
-  orchestratorSummaryEl,
-  runnerCountEl,
-  runnerRunsEl,
-  sealControlsEl,
-  sealErrorsContainerEl,
-  sealSprintButtonEl,
-  sealSprintEl,
-  sealSprintLabelEl,
-  sealSprintSpinnerEl,
-  settingsBackdropEl,
-  settingsCancelButtonEl,
-  settingsCloseButtonEl,
-  settingsFormEl,
-  settingsGithubTokenEl,
-  settingsMaxExecutorsEl,
-  settingsMaxReviewersEl,
-  settingsMessageEl,
-  settingsModalEl,
-  settingsOpenButtonEl,
-  settingsProjectNumberEl,
-  settingsSaveButtonEl,
-  settingsSoundNeedsHumanApprovalEl,
-  settingsTargetOwnerEl,
-  settingsTargetRepoEl,
-  targetRepoEl,
-  terminalActiveOnlyToggleEl,
-  terminalHealthBannerEl,
-  terminalOutputEl,
-  terminalTabsEl,
-  terminalWindowEl,
-} from "./dom.js";
+import { getDashboardDom } from "./dom.js";
 import { createBackgroundAnimator } from "./background.js";
 import {
   asObject,
@@ -76,6 +18,97 @@ import {
   statusBadgeClasses,
   toTimestampMs,
 } from "./utils.js";
+
+function createNoopBackground() {
+  return {
+    resize() {},
+    start() {},
+    stop() {},
+    setActivityFromData() {},
+    setActivityTarget() {},
+  };
+}
+
+let runtimeWindow = globalThis.window ?? null;
+let runtimeDocument = globalThis.document ?? null;
+let runtimeFetch = typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : null;
+let runtimeStorage = runtimeWindow?.localStorage ?? null;
+let EventSourceCtor = globalThis.EventSource ?? null;
+let confirmImpl = typeof runtimeWindow?.confirm === "function" ? runtimeWindow.confirm.bind(runtimeWindow) : () => true;
+let setTimeoutImpl = globalThis.setTimeout.bind(globalThis);
+let clearTimeoutImpl = globalThis.clearTimeout.bind(globalThis);
+let setIntervalImpl = globalThis.setInterval.bind(globalThis);
+let clearIntervalImpl = globalThis.clearInterval.bind(globalThis);
+let isDocumentHidden = () => Boolean(runtimeDocument?.hidden);
+let createAudioContextImpl = () => {
+  const AudioContextCtor = runtimeWindow?.AudioContext || runtimeWindow?.webkitAudioContext;
+  return AudioContextCtor ? new AudioContextCtor() : null;
+};
+let backgroundAnimatorFactory = createBackgroundAnimator;
+let background = createNoopBackground();
+let statusPollIntervalMs = POLL_INTERVAL_MS;
+let terminalStreamReconnectMs = TERMINAL_STREAM_RECONNECT_MS;
+let statusPollIntervalId = null;
+const disposers = [];
+
+let canvas = null;
+let ctx = null;
+let errorBannerEl = null;
+let kickoffButtonLabelEl = null;
+let kickoffButtonSpinnerEl = null;
+let kickoffDetailsEl = null;
+let kickoffFormEl = null;
+let kickoffGoalEl = null;
+let kickoffMessageEl = null;
+let kickoffRequireVerificationEl = null;
+let kickoffRunnerLoopContainerEl = null;
+let kickoffSprintEl = null;
+let kickoffStartLoopButtonEl = null;
+let kickoffStartLoopLabelEl = null;
+let kickoffStartLoopSpinnerEl = null;
+let kickoffStartRunnerLoopButtonEl = null;
+let kickoffStartRunnerLoopLabelEl = null;
+let kickoffStartRunnerLoopSpinnerEl = null;
+let kickoffStartWorkflowHintEl = null;
+let kickoffStopForceEl = null;
+let kickoffStopOrchestratorsButtonEl = null;
+let kickoffStopOrchestratorsLabelEl = null;
+let kickoffStopOrchestratorsSpinnerEl = null;
+let kickoffSubmitButtonEl = null;
+let lastRefreshEl = null;
+let orchestratorItemsEl = null;
+let orchestratorSprintEl = null;
+let orchestratorSummaryEl = null;
+let runnerCountEl = null;
+let runnerRunsEl = null;
+let sealControlsEl = null;
+let sealErrorsContainerEl = null;
+let sealSprintButtonEl = null;
+let sealSprintEl = null;
+let sealSprintLabelEl = null;
+let sealSprintSpinnerEl = null;
+let settingsBackdropEl = null;
+let settingsCancelButtonEl = null;
+let settingsCloseButtonEl = null;
+let settingsFormEl = null;
+let settingsGithubTokenEl = null;
+let settingsMaxExecutorsEl = null;
+let settingsMaxReviewersEl = null;
+let settingsMessageEl = null;
+let settingsModalEl = null;
+let settingsOpenButtonEl = null;
+let settingsProjectNumberEl = null;
+let settingsSaveButtonEl = null;
+let settingsSoundNeedsHumanApprovalEl = null;
+let settingsTargetOwnerEl = null;
+let settingsTargetRepoEl = null;
+let targetRepoEl = null;
+let terminalActiveOnlyToggleEl = null;
+let terminalHealthBannerEl = null;
+let terminalOutputEl = null;
+let terminalTabsEl = null;
+let terminalWindowEl = null;
+let settingsFieldByName = {};
 
 let isSettingsOpen = false;
 let activeTerminalRunId = "";
@@ -89,16 +122,6 @@ let terminalStreamReconnectTimerId = 0;
 let terminalStreamSessionId = 0;
 let terminalOnlyActiveRuns = true;
 let latestRunnerEntries = [];
-const settingsFieldByName = {
-  targetOwner: settingsTargetOwnerEl,
-  targetRepo: settingsTargetRepoEl,
-  projectNumber: settingsProjectNumberEl,
-  githubToken: settingsGithubTokenEl,
-  maxExecutors: settingsMaxExecutorsEl,
-  maxReviewers: settingsMaxReviewersEl,
-};
-
-const background = createBackgroundAnimator({ canvas, ctx });
 
 let soundNeedsHumanApprovalEnabled = true;
 let notificationAudioContext = null;
@@ -112,9 +135,153 @@ function normalizeStatus(value) {
   return String(value ?? "").trim().toUpperCase();
 }
 
+function addDisposer(disposer) {
+  if (typeof disposer === "function") {
+    disposers.push(disposer);
+  }
+}
+
+function addManagedEventListener(target, type, listener, options) {
+  if (!target || typeof target.addEventListener !== "function") {
+    return;
+  }
+  target.addEventListener(type, listener, options);
+  addDisposer(() => target.removeEventListener(type, listener, options));
+}
+
+function resetDashboardState() {
+  isSettingsOpen = false;
+  activeTerminalRunId = "";
+  terminalRunIds = [];
+  terminalLogCache.clear();
+  terminalLogSeqByRun.clear();
+  terminalRunMetaById.clear();
+  terminalStreamSource = null;
+  terminalStreamRunId = "";
+  terminalStreamReconnectTimerId = 0;
+  terminalStreamSessionId = 0;
+  terminalOnlyActiveRuns = true;
+  latestRunnerEntries = [];
+  soundNeedsHumanApprovalEnabled = true;
+  notificationAudioContext = null;
+  hasOrchestratorSnapshot = false;
+  previousOrchestratorStatusByItemId.clear();
+  kickoffWasAutoCollapsed = false;
+  latestOrchestratorSnapshot = {};
+  sealIsLoading = false;
+}
+
+function bindDashboardRuntime(options = {}) {
+  runtimeWindow = options.window ?? globalThis.window ?? null;
+  runtimeDocument = options.document ?? runtimeWindow?.document ?? globalThis.document ?? null;
+  runtimeFetch =
+    options.fetch ??
+    (typeof runtimeWindow?.fetch === "function" ? runtimeWindow.fetch.bind(runtimeWindow) : null) ??
+    (typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : null);
+  runtimeStorage = options.localStorage ?? runtimeWindow?.localStorage ?? null;
+  EventSourceCtor = options.EventSource ?? runtimeWindow?.EventSource ?? globalThis.EventSource ?? null;
+  confirmImpl =
+    options.confirm ??
+    (typeof runtimeWindow?.confirm === "function" ? runtimeWindow.confirm.bind(runtimeWindow) : () => true);
+  setTimeoutImpl = options.setTimeout ?? globalThis.setTimeout.bind(globalThis);
+  clearTimeoutImpl = options.clearTimeout ?? globalThis.clearTimeout.bind(globalThis);
+  setIntervalImpl = options.setInterval ?? globalThis.setInterval.bind(globalThis);
+  clearIntervalImpl = options.clearInterval ?? globalThis.clearInterval.bind(globalThis);
+  isDocumentHidden = typeof options.isDocumentHidden === "function" ? options.isDocumentHidden : () => Boolean(runtimeDocument?.hidden);
+  createAudioContextImpl =
+    typeof options.createAudioContext === "function"
+      ? options.createAudioContext
+      : () => {
+          const AudioContextCtor = runtimeWindow?.AudioContext || runtimeWindow?.webkitAudioContext;
+          return AudioContextCtor ? new AudioContextCtor() : null;
+        };
+  backgroundAnimatorFactory = options.backgroundAnimatorFactory ?? createBackgroundAnimator;
+  statusPollIntervalMs = Number.isFinite(options.pollIntervalMs) ? Math.max(250, Number(options.pollIntervalMs)) : POLL_INTERVAL_MS;
+  terminalStreamReconnectMs = Number.isFinite(options.terminalStreamReconnectMs)
+    ? Math.max(50, Number(options.terminalStreamReconnectMs))
+    : TERMINAL_STREAM_RECONNECT_MS;
+
+  const dom = options.dom ?? getDashboardDom(runtimeDocument);
+  ({
+    canvas,
+    ctx,
+    errorBannerEl,
+    kickoffButtonLabelEl,
+    kickoffButtonSpinnerEl,
+    kickoffDetailsEl,
+    kickoffFormEl,
+    kickoffGoalEl,
+    kickoffMessageEl,
+    kickoffRequireVerificationEl,
+    kickoffRunnerLoopContainerEl,
+    kickoffSprintEl,
+    kickoffStartLoopButtonEl,
+    kickoffStartLoopLabelEl,
+    kickoffStartLoopSpinnerEl,
+    kickoffStartRunnerLoopButtonEl,
+    kickoffStartRunnerLoopLabelEl,
+    kickoffStartRunnerLoopSpinnerEl,
+    kickoffStartWorkflowHintEl,
+    kickoffStopForceEl,
+    kickoffStopOrchestratorsButtonEl,
+    kickoffStopOrchestratorsLabelEl,
+    kickoffStopOrchestratorsSpinnerEl,
+    kickoffSubmitButtonEl,
+    lastRefreshEl,
+    orchestratorItemsEl,
+    orchestratorSprintEl,
+    orchestratorSummaryEl,
+    runnerCountEl,
+    runnerRunsEl,
+    sealControlsEl,
+    sealErrorsContainerEl,
+    sealSprintButtonEl,
+    sealSprintEl,
+    sealSprintLabelEl,
+    sealSprintSpinnerEl,
+    settingsBackdropEl,
+    settingsCancelButtonEl,
+    settingsCloseButtonEl,
+    settingsFormEl,
+    settingsGithubTokenEl,
+    settingsMaxExecutorsEl,
+    settingsMaxReviewersEl,
+    settingsMessageEl,
+    settingsModalEl,
+    settingsOpenButtonEl,
+    settingsProjectNumberEl,
+    settingsSaveButtonEl,
+    settingsSoundNeedsHumanApprovalEl,
+    settingsTargetOwnerEl,
+    settingsTargetRepoEl,
+    targetRepoEl,
+    terminalActiveOnlyToggleEl,
+    terminalHealthBannerEl,
+    terminalOutputEl,
+    terminalTabsEl,
+    terminalWindowEl,
+  } = dom);
+
+  settingsFieldByName = {
+    targetOwner: settingsTargetOwnerEl,
+    targetRepo: settingsTargetRepoEl,
+    projectNumber: settingsProjectNumberEl,
+    githubToken: settingsGithubTokenEl,
+    maxExecutors: settingsMaxExecutorsEl,
+    maxReviewers: settingsMaxReviewersEl,
+  };
+
+  background = backgroundAnimatorFactory({
+    canvas,
+    ctx,
+    runtimeWindow,
+    performanceApi: options.performanceApi ?? runtimeWindow?.performance ?? globalThis.performance,
+  });
+}
+
 function readStoredBoolean(key, defaultValue) {
   try {
-    const raw = window.localStorage.getItem(key);
+    const raw = runtimeStorage?.getItem?.(key);
     if (raw === null) {
       return defaultValue;
     }
@@ -133,7 +300,7 @@ function readStoredBoolean(key, defaultValue) {
 
 function writeStoredBoolean(key, value) {
   try {
-    window.localStorage.setItem(key, value ? "1" : "0");
+    runtimeStorage?.setItem?.(key, value ? "1" : "0");
   } catch {
     // ignore storage failures (private mode, quota, etc.)
   }
@@ -155,12 +322,11 @@ function ensureNotificationAudioContext() {
     return notificationAudioContext;
   }
 
-  const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
-  if (!AudioContextCtor) {
+  const nextContext = createAudioContextImpl();
+  if (!nextContext) {
     return null;
   }
-
-  notificationAudioContext = new AudioContextCtor();
+  notificationAudioContext = nextContext;
   return notificationAudioContext;
 }
 
@@ -658,7 +824,7 @@ function syncTerminalRuns(runnerEntries) {
 
 function clearTerminalStreamReconnectTimer() {
   if (terminalStreamReconnectTimerId) {
-    window.clearTimeout(terminalStreamReconnectTimerId);
+    clearTimeoutImpl(terminalStreamReconnectTimerId);
     terminalStreamReconnectTimerId = 0;
   }
 }
@@ -680,7 +846,7 @@ function capTerminalLogs(logs) {
 }
 
 async function loadTerminalSnapshot(runId, sessionId) {
-  const response = await fetch(`/internal/logs/${encodeURIComponent(runId)}`, { cache: "no-store" });
+  const response = await runtimeFetch(`/internal/logs/${encodeURIComponent(runId)}`, { cache: "no-store" });
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}`);
   }
@@ -694,23 +860,26 @@ async function loadTerminalSnapshot(runId, sessionId) {
   }
 }
 
-function scheduleTerminalStreamReconnect(sessionId, delayMs = TERMINAL_STREAM_RECONNECT_MS) {
+function scheduleTerminalStreamReconnect(sessionId, delayMs = terminalStreamReconnectMs) {
   clearTerminalStreamReconnectTimer();
-  terminalStreamReconnectTimerId = window.setTimeout(() => {
+  terminalStreamReconnectTimerId = setTimeoutImpl(() => {
     if (sessionId !== terminalStreamSessionId) {
       return;
     }
     void startTerminalStreamSession(sessionId);
-  }, Math.max(250, Number(delayMs) || 0));
+  }, Math.max(50, Number(delayMs) || terminalStreamReconnectMs));
 }
 
 function connectTerminalStream(runId, sessionId) {
-  if (document.hidden || !runId || runId !== activeTerminalRunId || sessionId !== terminalStreamSessionId) {
+  if (isDocumentHidden() || !runId || runId !== activeTerminalRunId || sessionId !== terminalStreamSessionId) {
+    return;
+  }
+  if (typeof EventSourceCtor !== "function") {
     return;
   }
 
   const after = terminalLogSeqByRun.get(runId) ?? 0;
-  const source = new EventSource(`/internal/logs/stream/${encodeURIComponent(runId)}?after=${encodeURIComponent(after)}`);
+  const source = new EventSourceCtor(`/internal/logs/stream/${encodeURIComponent(runId)}?after=${encodeURIComponent(after)}`);
   terminalStreamSource = source;
   terminalStreamRunId = runId;
 
@@ -755,7 +924,7 @@ function connectTerminalStream(runId, sessionId) {
 
 async function startTerminalStreamSession(sessionId) {
   const runId = activeTerminalRunId;
-  if (!runId || document.hidden || sessionId !== terminalStreamSessionId) {
+  if (!runId || isDocumentHidden() || sessionId !== terminalStreamSessionId) {
     return;
   }
   try {
@@ -770,7 +939,7 @@ async function startTerminalStreamSession(sessionId) {
     scheduleTerminalStreamReconnect(sessionId);
     return;
   }
-  if (sessionId !== terminalStreamSessionId || runId !== activeTerminalRunId || document.hidden) {
+  if (sessionId !== terminalStreamSessionId || runId !== activeTerminalRunId || isDocumentHidden()) {
     return;
   }
   connectTerminalStream(runId, sessionId);
@@ -781,7 +950,7 @@ function restartTerminalStreamNow() {
   const sessionId = terminalStreamSessionId;
   closeTerminalStream();
   clearTerminalStreamReconnectTimer();
-  if (!activeTerminalRunId || document.hidden) {
+  if (!activeTerminalRunId || isDocumentHidden()) {
     return;
   }
   void startTerminalStreamSession(sessionId);
@@ -920,7 +1089,7 @@ function clearError() {
 function setSettingsOpen(nextOpen) {
   isSettingsOpen = Boolean(nextOpen);
   settingsModalEl.classList.toggle("hidden", !isSettingsOpen);
-  document.body.classList.toggle("overflow-hidden", isSettingsOpen);
+  runtimeDocument?.body?.classList.toggle("overflow-hidden", isSettingsOpen);
 
   if (isSettingsOpen) {
     settingsTargetOwnerEl.focus();
@@ -1149,7 +1318,7 @@ async function submitKickoff(event) {
   setKickoffLoading(true);
 
   try {
-    const response = await fetch("/internal/kickoff", {
+      const response = await runtimeFetch("/internal/kickoff", {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -1203,7 +1372,7 @@ async function startKickoffLoop() {
 
   try {
     const requireVerification = Boolean(kickoffRequireVerificationEl?.checked);
-    const response = await fetch("/internal/kickoff/start-loop", {
+    const response = await runtimeFetch("/internal/kickoff/start-loop", {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -1278,7 +1447,7 @@ async function startRunnerLoop() {
   setRunnerLoopLoading(true);
 
   try {
-    const response = await fetch("/internal/runner/start-loop", {
+    const response = await runtimeFetch("/internal/runner/start-loop", {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -1340,7 +1509,7 @@ async function stopOrchestrators() {
   const confirmMessage = force
     ? "Force-stop all agent loops for this repo? This bypasses PID sanity checks and may kill unrelated processes if the loop state is corrupt."
     : "Stop runner/kickoff loops (and their orchestrators) for this repo?";
-  if (!window.confirm(confirmMessage)) {
+  if (!confirmImpl(confirmMessage)) {
     return;
   }
 
@@ -1354,7 +1523,7 @@ async function stopOrchestrators() {
     ];
 
     for (const endpoint of endpoints) {
-      const response = await fetch(endpoint.url, {
+      const response = await runtimeFetch(endpoint.url, {
         method: "POST",
         headers: {
           "content-type": "application/json",
@@ -1413,7 +1582,7 @@ async function sealSprint() {
   setSealLoading(true);
 
   try {
-    const response = await fetch("/internal/sprint/seal", {
+    const response = await runtimeFetch("/internal/sprint/seal", {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -1485,7 +1654,7 @@ function toPositiveInteger(value) {
 async function loadConfig() {
   clearSettingsFieldValidation();
   try {
-    const response = await fetch("/internal/config", { cache: "no-store" });
+    const response = await runtimeFetch("/internal/config", { cache: "no-store" });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
@@ -1563,7 +1732,7 @@ async function submitConfig(event) {
 
   setSettingsLoading(true);
   try {
-    const response = await fetch("/internal/config", {
+    const response = await runtimeFetch("/internal/config", {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -1616,7 +1785,7 @@ async function submitConfig(event) {
 
 async function loadStatus() {
   try {
-    const response = await fetch("/internal/status", { cache: "no-store" });
+    const response = await runtimeFetch("/internal/status", { cache: "no-store" });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
@@ -1662,69 +1831,108 @@ async function loadStatus() {
   }
 }
 
-window.addEventListener("resize", () => background.resize(), { passive: true });
-settingsOpenButtonEl.addEventListener("click", () => {
-  clearSettingsMessage();
-  setSettingsOpen(true);
-});
-settingsCloseButtonEl.addEventListener("click", () => setSettingsOpen(false));
-settingsCancelButtonEl.addEventListener("click", () => setSettingsOpen(false));
-settingsBackdropEl.addEventListener("click", () => setSettingsOpen(false));
-settingsFormEl.addEventListener("submit", submitConfig);
-settingsSoundNeedsHumanApprovalEl?.addEventListener("change", () => {
-  soundNeedsHumanApprovalEnabled = Boolean(settingsSoundNeedsHumanApprovalEl.checked);
-  writeStoredBoolean(UI_STORAGE_KEY_SOUND_NEEDS_HUMAN_APPROVAL, soundNeedsHumanApprovalEnabled);
-  if (soundNeedsHumanApprovalEnabled) {
-    void unlockNotificationAudio();
-  }
-});
-kickoffFormEl.addEventListener("submit", submitKickoff);
-sealSprintButtonEl.addEventListener("click", sealSprint);
-kickoffStartLoopButtonEl.addEventListener("click", startKickoffLoop);
-kickoffStartRunnerLoopButtonEl.addEventListener("click", startRunnerLoop);
-kickoffStopOrchestratorsButtonEl.addEventListener("click", stopOrchestrators);
-terminalTabsEl.addEventListener("click", (event) => {
-  if (!(event.target instanceof Element)) {
-    return;
-  }
-  const button = event.target.closest("button[data-run-id]");
-  if (!button) {
-    return;
-  }
-  setActiveTerminalRun(button.getAttribute("data-run-id"));
-});
-terminalActiveOnlyToggleEl?.addEventListener("change", () => {
-  terminalOnlyActiveRuns = Boolean(terminalActiveOnlyToggleEl.checked);
-  writeStoredBoolean(UI_STORAGE_KEY_TERMINAL_ACTIVE_ONLY, terminalOnlyActiveRuns);
-  syncTerminalRuns(latestRunnerEntries);
-});
-window.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && isSettingsOpen) {
-    setSettingsOpen(false);
-  }
-});
-
-background.resize();
-background.start();
-
-loadUiPreferences();
-window.addEventListener("pointerdown", handleNotificationAudioUnlockGesture, { passive: true });
-window.addEventListener("keydown", handleNotificationAudioUnlockGesture, { passive: true });
-loadConfig();
-loadStatus();
-setInterval(loadStatus, POLL_INTERVAL_MS);
-restartTerminalStreamNow();
-document.addEventListener("visibilitychange", () => {
-  if (document.hidden) {
-    closeTerminalStream();
-    clearTerminalStreamReconnectTimer();
-  } else {
-    restartTerminalStreamNow();
-  }
-});
-
-window.addEventListener("beforeunload", () => {
+export function destroyDashboard() {
   background.stop();
   closeTerminalStream();
   clearTerminalStreamReconnectTimer();
-});
+  if (statusPollIntervalId) {
+    clearIntervalImpl(statusPollIntervalId);
+    statusPollIntervalId = null;
+  }
+  while (disposers.length > 0) {
+    const disposer = disposers.pop();
+    try {
+      disposer?.();
+    } catch {}
+  }
+  runtimeDocument?.body?.classList.remove("overflow-hidden");
+  isSettingsOpen = false;
+}
+
+function registerDashboardListeners() {
+  addManagedEventListener(runtimeWindow, "resize", () => background.resize(), { passive: true });
+  addManagedEventListener(settingsOpenButtonEl, "click", () => {
+    clearSettingsMessage();
+    setSettingsOpen(true);
+  });
+  addManagedEventListener(settingsCloseButtonEl, "click", () => setSettingsOpen(false));
+  addManagedEventListener(settingsCancelButtonEl, "click", () => setSettingsOpen(false));
+  addManagedEventListener(settingsBackdropEl, "click", () => setSettingsOpen(false));
+  addManagedEventListener(settingsFormEl, "submit", submitConfig);
+  addManagedEventListener(settingsSoundNeedsHumanApprovalEl, "change", () => {
+    soundNeedsHumanApprovalEnabled = Boolean(settingsSoundNeedsHumanApprovalEl.checked);
+    writeStoredBoolean(UI_STORAGE_KEY_SOUND_NEEDS_HUMAN_APPROVAL, soundNeedsHumanApprovalEnabled);
+    if (soundNeedsHumanApprovalEnabled) {
+      void unlockNotificationAudio();
+    }
+  });
+  addManagedEventListener(kickoffFormEl, "submit", submitKickoff);
+  addManagedEventListener(sealSprintButtonEl, "click", sealSprint);
+  addManagedEventListener(kickoffStartLoopButtonEl, "click", startKickoffLoop);
+  addManagedEventListener(kickoffStartRunnerLoopButtonEl, "click", startRunnerLoop);
+  addManagedEventListener(kickoffStopOrchestratorsButtonEl, "click", stopOrchestrators);
+  addManagedEventListener(terminalTabsEl, "click", (event) => {
+    const ElementCtor = runtimeWindow?.Element ?? globalThis.Element;
+    if (!ElementCtor || !(event.target instanceof ElementCtor)) {
+      return;
+    }
+    const button = event.target.closest("button[data-run-id]");
+    if (!button) {
+      return;
+    }
+    setActiveTerminalRun(button.getAttribute("data-run-id"));
+  });
+  addManagedEventListener(terminalActiveOnlyToggleEl, "change", () => {
+    terminalOnlyActiveRuns = Boolean(terminalActiveOnlyToggleEl.checked);
+    writeStoredBoolean(UI_STORAGE_KEY_TERMINAL_ACTIVE_ONLY, terminalOnlyActiveRuns);
+    syncTerminalRuns(latestRunnerEntries);
+  });
+  addManagedEventListener(runtimeWindow, "keydown", (event) => {
+    if (event.key === "Escape" && isSettingsOpen) {
+      setSettingsOpen(false);
+    }
+  });
+  addManagedEventListener(runtimeWindow, "pointerdown", handleNotificationAudioUnlockGesture, { passive: true });
+  addManagedEventListener(runtimeWindow, "keydown", handleNotificationAudioUnlockGesture, { passive: true });
+  addManagedEventListener(runtimeDocument, "visibilitychange", () => {
+    if (isDocumentHidden()) {
+      closeTerminalStream();
+      clearTerminalStreamReconnectTimer();
+    } else {
+      restartTerminalStreamNow();
+    }
+  });
+  addManagedEventListener(runtimeWindow, "beforeunload", () => {
+    background.stop();
+    closeTerminalStream();
+    clearTerminalStreamReconnectTimer();
+  });
+}
+
+export function bootstrapDashboard(options = {}) {
+  destroyDashboard();
+  resetDashboardState();
+  bindDashboardRuntime(options);
+  if (!runtimeDocument) {
+    throw new Error("dashboard bootstrap requires a document");
+  }
+  if (typeof runtimeFetch !== "function") {
+    throw new Error("dashboard bootstrap requires fetch");
+  }
+
+  registerDashboardListeners();
+  background.resize();
+  background.start();
+  loadUiPreferences();
+
+  const ready = Promise.allSettled([loadConfig(), loadStatus()]).then(() => undefined);
+  statusPollIntervalId = setIntervalImpl(loadStatus, statusPollIntervalMs);
+  restartTerminalStreamNow();
+
+  return {
+    destroy: destroyDashboard,
+    loadConfig,
+    loadStatus,
+    ready,
+  };
+}

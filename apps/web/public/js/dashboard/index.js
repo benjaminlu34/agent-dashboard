@@ -1,1 +1,3 @@
-import "./app.js";
+import { bootstrapDashboard } from "./app.js";
+
+bootstrapDashboard();

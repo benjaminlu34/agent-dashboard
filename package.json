@@ -9,6 +9,10 @@
     "dev": "node apps/api/src/index.js",
     "swarm:init": "node apps/cli/src/index.js init",
     "test": "node --test apps/api/test/*.test.js",
+    "test:web": "node --test apps/web/test/*.test.js",
+    "test:web:e2e": "playwright test",
+    "test:web:e2e:install": "playwright install chromium",
+    "test:all": "pnpm test && pnpm test:web && pnpm test:web:e2e",
     "test:cli": "node --test apps/cli/test/*.test.js",
     "orchestrator": "node apps/orchestrator/src/cli.js --once",
     "doctor": "node apps/cli/src/index.js doctor",
@@ -22,5 +26,9 @@
     "fastify": "^4.26.0",
     "ioredis": "^5.3.2",
     "yaml": "^2.5.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "jsdom": "^28.1.0"
   }
 }
