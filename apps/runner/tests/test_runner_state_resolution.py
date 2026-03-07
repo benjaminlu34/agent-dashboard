@@ -1,6 +1,7 @@
 import unittest
 
 from apps.runner.state_store import RedisStateStore
+from apps.runner.ledger import RunLedger
 from apps.runner.supervisor import _record_reviewer_outcome_state
 
 from .fake_redis import FakeRedis
@@ -11,6 +12,7 @@ class RunnerStateResolutionTests(unittest.TestCase):
         redis = FakeRedis()
         repo_key = "example.repo"
         state_store = RedisStateStore(redis)
+        ledger = RunLedger(redis, repo_key)
 
         items = {
             "PVTI_old": {
@@ -38,6 +40,7 @@ class RunnerStateResolutionTests(unittest.TestCase):
 
         _record_reviewer_outcome_state(
             state_store=state_store,
+            ledger=ledger,
             repo_key=repo_key,
             items=items,
             issue_number=2,

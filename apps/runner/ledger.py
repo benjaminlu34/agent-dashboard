@@ -107,26 +107,89 @@ class RunLedger:
         return raw if isinstance(raw, str) else str(raw)
 
     def get_task_last_activity(self, project_item_id: str) -> str:
-        if not isinstance(project_item_id, str) or not project_item_id.strip():
-            return ""
-        raw = self._redis.hget(self._key, f"__task__:{project_item_id.strip()}")
-        parsed = _parse_json_object(raw)
+        parsed = self._get_task_metadata(project_item_id)
         if not isinstance(parsed, dict):
             return ""
         value = parsed.get("last_activity_at")
         return value if isinstance(value, str) else ""
 
     def touch_task_last_activity(self, project_item_id: str, *, at_iso: str) -> None:
-        if not isinstance(project_item_id, str) or not project_item_id.strip():
-            raise LedgerError("project_item_id is required")
         normalized_at = str(at_iso or "").strip()
         if not normalized_at:
             raise LedgerError("at_iso is required")
+        self._set_task_metadata(project_item_id, {"last_activity_at": normalized_at})
+
+    def get_task_failure_state(self, project_item_id: str) -> Dict[str, Any]:
+        parsed = self._get_task_metadata(project_item_id)
+        consecutive_failures = parsed.get("consecutive_failures")
+        last_failure_at = parsed.get("last_failure_at")
+        last_failure_run_id = parsed.get("last_failure_run_id")
+        return {
+            "consecutive_failures": consecutive_failures if isinstance(consecutive_failures, int) and consecutive_failures >= 0 else 0,
+            "last_failure_at": last_failure_at if isinstance(last_failure_at, str) else "",
+            "last_failure_run_id": last_failure_run_id if isinstance(last_failure_run_id, str) else "",
+        }
+
+    def record_task_failure(self, project_item_id: str, *, run_id: str, at_iso: str) -> Dict[str, Any]:
+        normalized_run_id = str(run_id or "").strip()
+        normalized_at = str(at_iso or "").strip()
+        if not normalized_at:
+            raise LedgerError("at_iso is required")
+
+        metadata = self._get_task_metadata(project_item_id)
+        tracked_run_id = str(metadata.get("last_failure_run_id") or "").strip()
+        tracked_at = str(metadata.get("last_failure_at") or "").strip()
+        consecutive_failures = metadata.get("consecutive_failures")
+        current_count = consecutive_failures if isinstance(consecutive_failures, int) and consecutive_failures >= 0 else 0
+
+        if normalized_run_id and tracked_run_id == normalized_run_id and tracked_at:
+            next_count = current_count if current_count > 0 else 1
+        else:
+            next_count = current_count + 1
+
+        metadata.update(
+            {
+                "consecutive_failures": next_count,
+                "last_failure_at": normalized_at,
+                "last_failure_run_id": normalized_run_id,
+            }
+        )
+        self._write_task_metadata(project_item_id, metadata)
+        return {
+            "consecutive_failures": next_count,
+            "last_failure_at": normalized_at,
+            "last_failure_run_id": normalized_run_id,
+        }
+
+    def reset_task_failures(self, project_item_id: str) -> None:
+        metadata = self._get_task_metadata(project_item_id)
+        metadata.update(
+            {
+                "consecutive_failures": 0,
+                "last_failure_at": "",
+                "last_failure_run_id": "",
+            }
+        )
+        self._write_task_metadata(project_item_id, metadata)
+
+    def _get_task_metadata(self, project_item_id: str) -> Dict[str, Any]:
+        if not isinstance(project_item_id, str) or not project_item_id.strip():
+            raise LedgerError("project_item_id is required")
+        raw = self._redis.hget(self._key, f"__task__:{project_item_id.strip()}")
+        parsed = _parse_json_object(raw)
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _set_task_metadata(self, project_item_id: str, fields: Dict[str, Any]) -> None:
+        metadata = self._get_task_metadata(project_item_id)
+        metadata.update(fields)
+        self._write_task_metadata(project_item_id, metadata)
+
+    def _write_task_metadata(self, project_item_id: str, payload: Dict[str, Any]) -> None:
+        if not isinstance(project_item_id, str) or not project_item_id.strip():
+            raise LedgerError("project_item_id is required")
         field = f"__task__:{project_item_id.strip()}"
-        payload = {"last_activity_at": normalized_at}
         self._redis.hset(
             self._key,
             field,
             json.dumps(payload, separators=(",", ":"), ensure_ascii=True),
         )
-

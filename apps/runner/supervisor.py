@@ -112,6 +112,7 @@ def _resolve_project_item_id_for_issue(items: dict[str, dict[str, Any]], issue_n
 def _record_reviewer_outcome_state(
     *,
     state_store: RedisStateStore,
+    ledger: RunLedger,
     repo_key: str,
     items: dict[str, dict[str, Any]],
     issue_number: int,
@@ -135,11 +136,13 @@ def _record_reviewer_outcome_state(
         }
     )
     state_store.set_item(repo_key, project_item_id, updated)
+    ledger.reset_task_failures(project_item_id)
 
 
 def _record_executor_response_state(
     *,
     state_store: RedisStateStore,
+    ledger: RunLedger,
     repo_key: str,
     items: dict[str, dict[str, Any]],
     run_id: str,
@@ -149,14 +152,33 @@ def _record_executor_response_state(
     if not context:
         return
     _issue_number, project_item_id, status = context
-    if status != "In Review":
-        return
     state_item = items.get(project_item_id)
     if not isinstance(state_item, dict):
         return
     updated = dict(state_item)
-    updated["last_executor_response_at"] = recorded_at
+    if status == "In Review":
+        updated["last_executor_response_at"] = recorded_at
     state_store.set_item(repo_key, project_item_id, updated)
+    ledger.reset_task_failures(project_item_id)
+
+
+def _record_task_failure_state(
+    *,
+    ledger: RunLedger,
+    project_item_id: str,
+    run_id: str,
+    recorded_at: str,
+) -> None:
+    normalized_project_item_id = str(project_item_id or "").strip()
+    normalized_run_id = str(run_id or "").strip()
+    normalized_at = str(recorded_at or "").strip()
+    if not normalized_project_item_id or not normalized_at:
+        return
+    ledger.record_task_failure(
+        normalized_project_item_id,
+        run_id=normalized_run_id,
+        at_iso=normalized_at,
+    )
 
 
 def _transition_executor_failure_to_blocked(
@@ -520,6 +542,12 @@ def run_supervisor_loop(
                         failure_classification="PREEMPTED",
                     ),
                 )
+                _record_task_failure_state(
+                    ledger=ledger,
+                    project_item_id=task_project_item_id,
+                    run_id=intent_obj.run_id,
+                    recorded_at=_utc_now_iso_ms(),
+                )
                 continue
 
             result_payload = None
@@ -549,6 +577,12 @@ def run_supervisor_loop(
                         failure_classification=failure_classification,
                     ),
                 )
+                _record_task_failure_state(
+                    ledger=ledger,
+                    project_item_id=task_project_item_id,
+                    run_id=intent_obj.run_id,
+                    recorded_at=_utc_now_iso_ms(),
+                )
                 continue
 
             if not isinstance(result_payload, dict):
@@ -561,6 +595,12 @@ def run_supervisor_loop(
                         message="missing IPC result",
                         failure_classification="HARD_STOP",
                     ),
+                )
+                _record_task_failure_state(
+                    ledger=ledger,
+                    project_item_id=task_project_item_id,
+                    run_id=intent_obj.run_id,
+                    recorded_at=_utc_now_iso_ms(),
                 )
                 continue
 
@@ -593,6 +633,7 @@ def run_supervisor_loop(
                     raise CodexWorkerError("reviewer outcome is required", code="worker_invalid_output")
                 _record_reviewer_outcome_state(
                     state_store=state_store,
+                    ledger=ledger,
                     repo_key=repo_key,
                     items=items_snapshot,
                     issue_number=int(issue_number or 0),
@@ -615,6 +656,7 @@ def run_supervisor_loop(
             if intent_obj.role == "EXECUTOR":
                 _record_executor_response_state(
                     state_store=state_store,
+                    ledger=ledger,
                     repo_key=repo_key,
                     items=items_snapshot,
                     run_id=intent_obj.run_id,
@@ -646,6 +688,12 @@ def run_supervisor_loop(
                     pass
 
             if intent_obj.role == "EXECUTOR" and worker_result.status != "succeeded":
+                _record_task_failure_state(
+                    ledger=ledger,
+                    project_item_id=task_project_item_id,
+                    run_id=intent_obj.run_id,
+                    recorded_at=completed_at,
+                )
                 _transition_executor_failure_to_blocked(
                     backend=backend,
                     items=items_snapshot,
@@ -685,6 +733,12 @@ def run_supervisor_loop(
                 )
             except Exception:
                 pass
+            _record_task_failure_state(
+                ledger=ledger,
+                project_item_id=task_project_item_id,
+                run_id=intent_obj.run_id,
+                recorded_at=_utc_now_iso_ms(),
+            )
             if task_project_item_id:
                 try:
                     ledger.touch_task_last_activity(task_project_item_id, at_iso=_utc_now_iso_ms())

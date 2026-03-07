@@ -45,6 +45,9 @@ class RunnerConfigTests(unittest.TestCase):
         self.assertEqual(config.runner_ready_buffer, 2)
         self.assertEqual(config.review_stall_polls, 50)
         self.assertEqual(config.blocked_retry_minutes, 15)
+        self.assertEqual(config.error_retry_base_s, 60.0)
+        self.assertEqual(config.error_retry_max_s, 3600.0)
+        self.assertEqual(config.error_retry_multiplier, 2.0)
         self.assertEqual(config.watchdog_timeout_s, 900)
         self.assertEqual(config.runner_stall_timeout_s, 300)
         self.assertEqual(config.orchestrator_sanitization_regen_attempts, 2)
@@ -57,6 +60,9 @@ class RunnerConfigTests(unittest.TestCase):
                 "RUNNER_READY_BUFFER": "3",
                 "REVIEW_STALL_POLLS": "60",
                 "BLOCKED_RETRY_MINUTES": "20",
+                "ERROR_RETRY_BASE_S": "90",
+                "ERROR_RETRY_MAX_S": "900",
+                "ERROR_RETRY_MULTIPLIER": "3",
                 "RUNNER_WATCHDOG_TIMEOUT_S": "1200",
                 "RUNNER_STALL_TIMEOUT_S": "480",
             }
@@ -64,6 +70,9 @@ class RunnerConfigTests(unittest.TestCase):
         self.assertEqual(config.runner_ready_buffer, 3)
         self.assertEqual(config.review_stall_polls, 60)
         self.assertEqual(config.blocked_retry_minutes, 20)
+        self.assertEqual(config.error_retry_base_s, 90.0)
+        self.assertEqual(config.error_retry_max_s, 900.0)
+        self.assertEqual(config.error_retry_multiplier, 3.0)
         self.assertEqual(config.watchdog_timeout_s, 1200)
         self.assertEqual(config.runner_stall_timeout_s, 480)
 

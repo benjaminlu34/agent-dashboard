@@ -58,6 +58,9 @@ def is_retryable_failure(*, failure_classification: str, error_code: str) -> boo
         "backend_unreachable",
         "mcp_stdio_unavailable",
         "mcp_error_response",
+        "watchdog_timeout",
+        "stall_timeout",
+        "worker_down",
     }
 
 

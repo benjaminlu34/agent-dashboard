@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from apps.runner.config import RunnerConfig
 from apps.runner.daemon import OrchestratorDaemon
+from apps.runner.ledger import LedgerEntry
 from apps.runner.state_store import RedisStateStore
 
 from .fake_redis import FakeRedis
@@ -42,6 +43,9 @@ def _base_config(*, repo_key: str) -> RunnerConfig:
         runner_ready_buffer=2,
         review_stall_polls=50,
         blocked_retry_minutes=15,
+        error_retry_base_s=60.0,
+        error_retry_max_s=3600.0,
+        error_retry_multiplier=2.0,
         watchdog_timeout_s=60,
         runner_stall_timeout_s=300,
         dry_run=False,
@@ -120,3 +124,195 @@ class RunnerReviewAndStallTests(unittest.TestCase):
         self.assertEqual(len(update_calls), 1)
         self.assertEqual(update_calls[0][1]["value"], "Needs Human Approval")
         self.assertIn('"type":"REVIEW_PASS_RECOVERED"', stderr.getvalue())
+
+    def test_retryable_blocked_item_is_deferred_inside_backoff_window(self) -> None:
+        backend = _BackendStub()
+        redis = FakeRedis()
+        repo_key = "example.repo"
+        daemon = OrchestratorDaemon(config=_base_config(repo_key=repo_key), backend=backend, redis_client=redis)
+        state_store = RedisStateStore(redis)
+        state_store.set_item(
+            repo_key,
+            "PVTI_3",
+            {
+                "last_seen_issue_number": 3,
+                "last_seen_status": "Blocked",
+                "status_since_at": "2026-03-07T00:09:00.000Z",
+                "last_run_id": "blocked-run",
+            },
+        )
+        daemon._ledger.upsert(  # pylint: disable=protected-access
+            LedgerEntry(
+                run_id="blocked-run",
+                role="EXECUTOR",
+                intent_hash="hash",
+                received_at="2026-03-07T00:09:00.000Z",
+                status="failed",
+                result={
+                    "status": "failed",
+                    "failure_classification": "TRANSIENT",
+                    "error_code": "backend_unreachable",
+                },
+            )
+        )
+        daemon._ledger.record_task_failure("PVTI_3", run_id="blocked-run", at_iso="2026-03-07T00:09:00.000Z")  # pylint: disable=protected-access
+
+        summary = {"processed_items": [{"issue_number": 3, "project_item_id": "PVTI_3", "status": "Blocked"}]}
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with patch("apps.runner.daemon._utc_now_iso_ms", return_value="2026-03-07T00:10:00.000Z"):
+                with patch("apps.runner.daemon.calculate_backoff_delay", return_value=120.0):
+                    daemon._handle_blocked_retries(summary=summary)  # pylint: disable=protected-access
+
+        update_calls = [call for call in backend.calls if call[0] == "/internal/project-item/update-field"]
+        self.assertEqual(update_calls, [])
+        self.assertIn('"type":"BLOCKED_RETRY_DEFERRED"', stderr.getvalue())
+
+    def test_retryable_blocked_item_retries_after_backoff_window(self) -> None:
+        backend = _BackendStub()
+        redis = FakeRedis()
+        repo_key = "example.repo"
+        daemon = OrchestratorDaemon(config=_base_config(repo_key=repo_key), backend=backend, redis_client=redis)
+        state_store = RedisStateStore(redis)
+        state_store.set_item(
+            repo_key,
+            "PVTI_4",
+            {
+                "last_seen_issue_number": 4,
+                "last_seen_status": "Blocked",
+                "status_since_at": "2026-03-07T00:05:00.000Z",
+                "last_run_id": "blocked-run-ok",
+            },
+        )
+        daemon._ledger.upsert(  # pylint: disable=protected-access
+            LedgerEntry(
+                run_id="blocked-run-ok",
+                role="EXECUTOR",
+                intent_hash="hash",
+                received_at="2026-03-07T00:05:00.000Z",
+                status="failed",
+                result={
+                    "status": "failed",
+                    "failure_classification": "TRANSIENT",
+                    "error_code": "backend_unreachable",
+                },
+            )
+        )
+        daemon._ledger.record_task_failure("PVTI_4", run_id="blocked-run-ok", at_iso="2026-03-07T00:05:00.000Z")  # pylint: disable=protected-access
+
+        summary = {"processed_items": [{"issue_number": 4, "project_item_id": "PVTI_4", "status": "Blocked"}]}
+
+        with patch("apps.runner.daemon._utc_now_iso_ms", return_value="2026-03-07T00:10:00.000Z"):
+            with patch("apps.runner.daemon.calculate_backoff_delay", return_value=120.0):
+                daemon._handle_blocked_retries(summary=summary)  # pylint: disable=protected-access
+
+        update_calls = [call for call in backend.calls if call[0] == "/internal/project-item/update-field"]
+        self.assertEqual(len(update_calls), 1)
+        self.assertEqual(update_calls[0][1]["value"], "Ready")
+
+    def test_reviewer_dispatch_recovery_is_deferred_inside_backoff_window(self) -> None:
+        backend = _BackendStub()
+        redis = FakeRedis()
+        repo_key = "example.repo"
+        daemon = OrchestratorDaemon(config=_base_config(repo_key=repo_key), backend=backend, redis_client=redis)
+        state_store = RedisStateStore(redis)
+        state_store.set_item(
+            repo_key,
+            "PVTI_5",
+            {
+                "last_seen_issue_number": 5,
+                "last_seen_status": "In Review",
+                "last_reviewer_outcome": "",
+                "review_cycle_count": 0,
+                "last_dispatched_role": "REVIEWER",
+                "last_dispatched_status": "In Review",
+                "last_dispatched_at": "2026-03-07T00:09:00.000Z",
+                "last_dispatched_poll": 1,
+                "last_run_id": "review-run",
+            },
+        )
+        daemon._ledger.upsert(  # pylint: disable=protected-access
+            LedgerEntry(
+                run_id="review-run",
+                role="REVIEWER",
+                intent_hash="hash",
+                received_at="2026-03-07T00:09:00.000Z",
+                status="failed",
+                result={
+                    "status": "failed",
+                    "failure_classification": "TRANSIENT",
+                    "error_code": "backend_unreachable",
+                    "reviewer_outcome": "",
+                },
+            )
+        )
+
+        summary = {
+            "poll_count": 2,
+            "processed_items": [{"issue_number": 5, "project_item_id": "PVTI_5", "status": "In Review"}],
+        }
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with patch("apps.runner.daemon._utc_now_iso_ms", return_value="2026-03-07T00:10:00.000Z"):
+                with patch("apps.runner.daemon.calculate_backoff_delay", return_value=120.0):
+                    daemon._recover_lost_in_review_reviewer_dispatches(summary=summary)  # pylint: disable=protected-access
+
+        reloaded = state_store.get_item(repo_key, "PVTI_5")
+        assert reloaded is not None
+        self.assertEqual(reloaded["last_dispatched_role"], "REVIEWER")
+        self.assertEqual(reloaded["last_reviewer_outcome"], "")
+        self.assertIn('"type":"REVIEW_DISPATCH_RECOVERY_DEFERRED"', stderr.getvalue())
+
+    def test_reviewer_dispatch_recovery_applies_after_backoff_window(self) -> None:
+        backend = _BackendStub()
+        redis = FakeRedis()
+        repo_key = "example.repo"
+        daemon = OrchestratorDaemon(config=_base_config(repo_key=repo_key), backend=backend, redis_client=redis)
+        state_store = RedisStateStore(redis)
+        state_store.set_item(
+            repo_key,
+            "PVTI_6",
+            {
+                "last_seen_issue_number": 6,
+                "last_seen_status": "In Review",
+                "last_reviewer_outcome": "",
+                "review_cycle_count": 0,
+                "last_dispatched_role": "REVIEWER",
+                "last_dispatched_status": "In Review",
+                "last_dispatched_at": "2026-03-07T00:05:00.000Z",
+                "last_dispatched_poll": 1,
+                "last_run_id": "review-run-ok",
+            },
+        )
+        daemon._ledger.upsert(  # pylint: disable=protected-access
+            LedgerEntry(
+                run_id="review-run-ok",
+                role="REVIEWER",
+                intent_hash="hash",
+                received_at="2026-03-07T00:05:00.000Z",
+                status="failed",
+                result={
+                    "status": "failed",
+                    "failure_classification": "TRANSIENT",
+                    "error_code": "backend_unreachable",
+                    "reviewer_outcome": "",
+                },
+            )
+        )
+
+        summary = {
+            "poll_count": 2,
+            "processed_items": [{"issue_number": 6, "project_item_id": "PVTI_6", "status": "In Review"}],
+        }
+
+        with patch("apps.runner.daemon._utc_now_iso_ms", return_value="2026-03-07T00:10:00.000Z"):
+            with patch("apps.runner.daemon.calculate_backoff_delay", return_value=120.0):
+                daemon._recover_lost_in_review_reviewer_dispatches(summary=summary)  # pylint: disable=protected-access
+
+        reloaded = state_store.get_item(repo_key, "PVTI_6")
+        assert reloaded is not None
+        self.assertEqual(reloaded["last_dispatched_role"], "")
+        self.assertEqual(reloaded["last_reviewer_outcome"], "INCOMPLETE")
+        self.assertEqual(reloaded["review_cycle_count"], 1)

@@ -34,3 +34,28 @@ class LedgerTests(unittest.TestCase):
 
         payload = redis.hgetall(orchestrator_ledger_key(repo_key))
         self.assertIn(run_id, payload)
+
+    def test_task_failure_state_is_idempotent_per_run_and_resettable(self) -> None:
+        redis = FakeRedis()
+        repo_key = "example.repo"
+        ledger = RunLedger(redis, repo_key)
+
+        ledger.touch_task_last_activity("PVTI_9", at_iso="2026-03-07T00:00:00.000Z")
+        first = ledger.record_task_failure("PVTI_9", run_id="run-1", at_iso="2026-03-07T00:01:00.000Z")
+        duplicate = ledger.record_task_failure("PVTI_9", run_id="run-1", at_iso="2026-03-07T00:01:00.000Z")
+        second = ledger.record_task_failure("PVTI_9", run_id="run-2", at_iso="2026-03-07T00:02:00.000Z")
+
+        self.assertEqual(first["consecutive_failures"], 1)
+        self.assertEqual(duplicate["consecutive_failures"], 1)
+        self.assertEqual(second["consecutive_failures"], 2)
+        self.assertEqual(ledger.get_task_last_activity("PVTI_9"), "2026-03-07T00:00:00.000Z")
+
+        ledger.reset_task_failures("PVTI_9")
+        self.assertEqual(
+            ledger.get_task_failure_state("PVTI_9"),
+            {
+                "consecutive_failures": 0,
+                "last_failure_at": "",
+                "last_failure_run_id": "",
+            },
+        )
