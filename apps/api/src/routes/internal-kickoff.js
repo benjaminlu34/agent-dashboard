@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -9,6 +10,7 @@ const DEFAULT_REPO_ROOT = resolve(MODULE_DIRNAME, "../../../../");
 const KICKOFF_ROLE = "ORCHESTRATOR";
 const SPRINT_RE = /^M[1-4]$/;
 const DEFAULT_READY_LIMIT = 3;
+const DEFAULT_RUNNER_PYTHON_BIN = process.env.RUNNER_PYTHON_BIN || "python3";
 
 function normalizeSprint(value) {
   if (typeof value !== "string") {
@@ -22,6 +24,11 @@ function hasNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function parsePid(value) {
+  const parsed = Number.parseInt(String(value ?? "").trim(), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
 function resolveRootStateKey(repoKey) {
   return `orchestrator:state:${repoKey}:root`;
 }
@@ -32,6 +39,89 @@ function resolveControlKey(repoKey) {
 
 async function enqueueControl(redis, repoKey, payload) {
   await redis.lpush(resolveControlKey(repoKey), JSON.stringify(payload));
+}
+
+function isProcessAlive(pid, { processKill = process.kill } = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+
+  try {
+    processKill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "EPERM") {
+      return true;
+    }
+    return false;
+  }
+}
+
+async function startRunnerDaemon({
+  repoRoot,
+  sprint,
+  spawnImpl = spawn,
+  pythonBin = DEFAULT_RUNNER_PYTHON_BIN,
+  env = process.env,
+} = {}) {
+  return await new Promise((resolveStart, rejectStart) => {
+    let settled = false;
+    const child = spawnImpl(pythonBin, ["-m", "apps.runner", "--sprint", sprint], {
+      cwd: repoRoot,
+      detached: true,
+      stdio: "ignore",
+      env: {
+        ...env,
+        ORCHESTRATOR_SPRINT: sprint,
+      },
+    });
+
+    child.once("error", (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      rejectStart(error);
+    });
+
+    child.once("spawn", () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (typeof child.unref === "function") {
+        child.unref();
+      }
+      resolveStart({
+        status: "started",
+        pid: parsePid(child.pid),
+      });
+    });
+  });
+}
+
+async function ensureRunnerService({
+  repoRoot,
+  redis,
+  repoKey,
+  sprint,
+  processKill,
+  startRunnerService = startRunnerDaemon,
+} = {}) {
+  const rootState = await redis.hgetall(resolveRootStateKey(repoKey));
+  const daemonPid = parsePid(rootState?.daemon_pid);
+  if (daemonPid && isProcessAlive(daemonPid, { processKill })) {
+    return {
+      status: "already_running",
+      pid: daemonPid,
+    };
+  }
+
+  const started = await startRunnerService({ repoRoot, sprint });
+  return {
+    status: "started",
+    pid: parsePid(started?.pid),
+  };
 }
 
 export function buildInternalKickoffHandler({ repoRoot = DEFAULT_REPO_ROOT, preflightCheck, redis } = {}) {
@@ -107,7 +197,13 @@ function resolvePreflightCheck({ preflightCheck, repoRoot }) {
   );
 }
 
-export function buildInternalKickoffStartLoopHandler({ repoRoot = DEFAULT_REPO_ROOT, preflightCheck, redis } = {}) {
+export function buildInternalKickoffStartLoopHandler({
+  repoRoot = DEFAULT_REPO_ROOT,
+  preflightCheck,
+  redis,
+  processKill,
+  startRunnerService,
+} = {}) {
   const resolvedPreflightCheck = resolvePreflightCheck({ preflightCheck, repoRoot });
 
   return async function internalKickoffStartLoopHandler(request, reply) {
@@ -150,6 +246,23 @@ export function buildInternalKickoffStartLoopHandler({ repoRoot = DEFAULT_REPO_R
       return { error: "kickoff goal is missing; save a kickoff goal first" };
     }
 
+    let runnerService;
+    try {
+      runnerService = await ensureRunnerService({
+        repoRoot,
+        redis: redisClient,
+        repoKey,
+        sprint,
+        processKill,
+        startRunnerService,
+      });
+    } catch (error) {
+      reply.code(500);
+      return {
+        error: `unable to start runner service: ${error instanceof Error ? error.message : "unknown error"}`,
+      };
+    }
+
     await enqueueControl(redisClient, repoKey, {
       command: "START",
       mode: "KICKOFF",
@@ -164,11 +277,18 @@ export function buildInternalKickoffStartLoopHandler({ repoRoot = DEFAULT_REPO_R
       status: "ENQUEUED",
       message: "Kickoff loop start request enqueued.",
       sprint,
+      runner_service: runnerService,
     };
   };
 }
 
-export function buildInternalRunnerStartLoopHandler({ repoRoot = DEFAULT_REPO_ROOT, preflightCheck, redis } = {}) {
+export function buildInternalRunnerStartLoopHandler({
+  repoRoot = DEFAULT_REPO_ROOT,
+  preflightCheck,
+  redis,
+  processKill,
+  startRunnerService,
+} = {}) {
   const resolvedPreflightCheck = resolvePreflightCheck({ preflightCheck, repoRoot });
 
   return async function internalRunnerStartLoopHandler(request, reply) {
@@ -199,6 +319,24 @@ export function buildInternalRunnerStartLoopHandler({ repoRoot = DEFAULT_REPO_RO
     }
 
     const { repoKey } = repoKeyResult;
+
+    let runnerService;
+    try {
+      runnerService = await ensureRunnerService({
+        repoRoot,
+        redis: redisClient,
+        repoKey,
+        sprint,
+        processKill,
+        startRunnerService,
+      });
+    } catch (error) {
+      reply.code(500);
+      return {
+        error: `unable to start runner service: ${error instanceof Error ? error.message : "unknown error"}`,
+      };
+    }
+
     await enqueueControl(redisClient, repoKey, {
       command: "START",
       mode: "RUNNER",
@@ -210,6 +348,7 @@ export function buildInternalRunnerStartLoopHandler({ repoRoot = DEFAULT_REPO_RO
       status: "ENQUEUED",
       message: "Runner loop start request enqueued.",
       sprint,
+      runner_service: runnerService,
     };
   };
 }
@@ -286,4 +425,3 @@ export async function registerInternalKickoffRoute(fastify, options = {}) {
   fastify.post("/internal/kickoff/stop-loop", buildInternalKickoffStopLoopHandler(options));
   fastify.post("/internal/runner/stop-loop", buildInternalRunnerStopLoopHandler(options));
 }
-

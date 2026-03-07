@@ -173,12 +173,17 @@ test("POST /internal/kickoff/start-loop enqueues START control message and retur
 
   const redis = new FakeRedis();
   await redis.hset(`orchestrator:state:${repoKey}:root`, { kickoff_goal: "Kick off sprint goals" });
+  let startRunnerServiceCalls = 0;
 
   const app = buildApp();
   let requestedRole = "";
   await registerInternalKickoffRoute(app, {
     repoRoot,
     redis,
+    startRunnerService: async ({ sprint }) => {
+      startRunnerServiceCalls += 1;
+      return { status: "started", pid: sprint === "M3" ? 32101 : 0 };
+    },
     preflightCheck: async ({ role }) => {
       requestedRole = String(role ?? "");
       return { statusCode: 200, payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] } };
@@ -193,6 +198,8 @@ test("POST /internal/kickoff/start-loop enqueues START control message and retur
   assert.equal(requestedRole, "ORCHESTRATOR");
   assert.equal(result.status, "ENQUEUED");
   assert.equal(result.sprint, "M3");
+  assert.deepEqual(result.runner_service, { status: "started", pid: 32101 });
+  assert.equal(startRunnerServiceCalls, 1);
 
   const controlKey = `orchestrator:control:${repoKey}`;
   const queued = redis._snapshotList(controlKey);
@@ -217,6 +224,7 @@ test("POST /internal/runner/start-loop enqueues START RUNNER control message and
   await registerInternalKickoffRoute(app, {
     repoRoot,
     redis,
+    startRunnerService: async () => ({ status: "started", pid: 45678 }),
     preflightCheck: async () => ({ statusCode: 200, payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] } }),
   });
 
@@ -227,10 +235,47 @@ test("POST /internal/runner/start-loop enqueues START RUNNER control message and
   assert.equal(reply.statusCode, 202);
   assert.equal(result.status, "ENQUEUED");
   assert.equal(result.sprint, "M2");
+  assert.deepEqual(result.runner_service, { status: "started", pid: 45678 });
 
   const queued = redis._snapshotList(`orchestrator:control:${repoKey}`);
   assert.equal(queued.length, 1);
   assert.deepEqual(JSON.parse(queued[0]), { command: "START", mode: "RUNNER", sprint: "M2" });
+});
+
+test("POST /internal/runner/start-loop reuses an already-running daemon pid", async () => {
+  const repoRoot = await mkdtemp(join(tmpdir(), "internal-runner-start-loop-existing-"));
+  const repoKey = await writeAgentSwarm(repoRoot);
+
+  const redis = new FakeRedis();
+  await redis.hset(`orchestrator:state:${repoKey}:root`, {
+    daemon_pid: "9876",
+    daemon_status: "IDLE",
+  });
+
+  let startRunnerServiceCalls = 0;
+  const app = buildApp();
+  await registerInternalKickoffRoute(app, {
+    repoRoot,
+    redis,
+    processKill(pid, signal) {
+      assert.equal(pid, 9876);
+      assert.equal(signal, 0);
+      return true;
+    },
+    startRunnerService: async () => {
+      startRunnerServiceCalls += 1;
+      return { status: "started", pid: 1111 };
+    },
+    preflightCheck: async () => ({ statusCode: 200, payload: { role: "ORCHESTRATOR", status: "PASS", errors: [] } }),
+  });
+
+  const startLoopHandler = getPostHandler(app, "/internal/runner/start-loop");
+  const reply = buildReply();
+  const result = await startLoopHandler({ body: { sprint: "M1" } }, reply);
+
+  assert.equal(reply.statusCode, 202);
+  assert.deepEqual(result.runner_service, { status: "already_running", pid: 9876 });
+  assert.equal(startRunnerServiceCalls, 0);
 });
 
 test("POST /internal/kickoff/stop-loop enqueues STOP and returns 202", async () => {
@@ -274,4 +319,3 @@ test("POST /internal/runner/stop-loop enqueues STOP and returns 202", async () =
   assert.deepEqual(result, { status: "ENQUEUED" });
   assert.deepEqual(JSON.parse(redis._snapshotList(`orchestrator:control:${repoKey}`)[0]), { command: "STOP" });
 });
-

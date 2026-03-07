@@ -306,6 +306,20 @@ function writeStoredBoolean(key, value) {
   }
 }
 
+function buildRunnerServicePrefix(payload) {
+  const service = asObject(payload?.runner_service);
+  const status = String(service?.status ?? "").trim().toLowerCase();
+  if (status === "started") {
+    const pid = Number(service?.pid);
+    return Number.isInteger(pid) && pid > 0 ? `Runner service started (PID ${pid}). ` : "Runner service started. ";
+  }
+  if (status === "already_running") {
+    const pid = Number(service?.pid);
+    return Number.isInteger(pid) && pid > 0 ? `Runner service already running (PID ${pid}). ` : "Runner service already running. ";
+  }
+  return "";
+}
+
 function loadUiPreferences() {
   soundNeedsHumanApprovalEnabled = readStoredBoolean(UI_STORAGE_KEY_SOUND_NEEDS_HUMAN_APPROVAL, true);
   if (settingsSoundNeedsHumanApprovalEl) {
@@ -1411,6 +1425,7 @@ async function startKickoffLoop() {
       typeof payload.message === "string" && payload.message.trim().length > 0
         ? payload.message.trim()
         : "Kickoff loop started.";
+    const runnerServicePrefix = buildRunnerServicePrefix(payload);
     const statusParts = [];
     if (typeof payload.sprint === "string" && payload.sprint.trim().length > 0) {
       statusParts.push(`Sprint ${payload.sprint.trim()}`);
@@ -1420,7 +1435,7 @@ async function startKickoffLoop() {
       statusParts.push(`PID ${pid}`);
     }
     const suffix = statusParts.length > 0 ? ` (${statusParts.join(", ")})` : "";
-    showKickoffMessage(`${successMessage}${suffix}`);
+    showKickoffMessage(`${runnerServicePrefix}${successMessage}${suffix}`);
     collapseKickoffSection({ force: true });
   } catch (error) {
     if (kickoffDetailsEl) {
@@ -1485,6 +1500,7 @@ async function startRunnerLoop() {
       typeof payload.message === "string" && payload.message.trim().length > 0
         ? payload.message.trim()
         : "Runner loop started.";
+    const runnerServicePrefix = buildRunnerServicePrefix(payload);
     const statusParts = [];
     if (typeof payload.sprint === "string" && payload.sprint.trim().length > 0) {
       statusParts.push(`Sprint ${payload.sprint.trim()}`);
@@ -1494,7 +1510,7 @@ async function startRunnerLoop() {
       statusParts.push(`PID ${pid}`);
     }
     const suffix = statusParts.length > 0 ? ` (${statusParts.join(", ")})` : "";
-    showKickoffMessage(`${successMessage}${suffix}`);
+    showKickoffMessage(`${runnerServicePrefix}${successMessage}${suffix}`);
   } catch (error) {
     showKickoffMessage(`Failed to start runner loop: ${error?.message ?? "Unknown error"}`, "error");
   } finally {
