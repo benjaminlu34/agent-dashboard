@@ -437,7 +437,7 @@ def _merge_usage_counts(*usage_blocks: dict[str, int]) -> dict[str, int]:
             continue
         for key in ("input_tokens", "output_tokens"):
             value = usage_block.get(key)
-            if not isinstance(value, int) or isinstance(value, bool):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 continue
             merged[key] = merged.get(key, 0) + value
     return merged
