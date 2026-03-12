@@ -11,4 +11,4 @@ Use this file when the recommended docs are not enough and you need a direct cod
 | Orchestrator dispatch | `apps/orchestrator/src/cli.js`, `apps/orchestrator/src/sanitize-dependency-graph.js` | Computes dispatches, scheduler state, and dependency sanitization. | `docs/contracts/orchestrator-dispatch.md` |
 | Runner supervisor loop | `apps/runner/supervisor.py`, `apps/runner/daemon.py` | Pulls intents, manages worktrees, watchdogs, retries, and ledger updates. | `docs/contracts/runner-contract.md` |
 | Codex worker prompt + MCP | `apps/runner/codex_worker.py`, `apps/runner/http_client.py` | Builds worker prompts and calls Codex MCP + backend endpoints. | `docs/runbooks/executor-v1.md` |
-| Kickoff planning | `apps/runner/kickoff.py`, `apps/runner/kickoff_runtime.py`, `apps/api/src/routes/internal-plan-apply.js` | Generates sprint plans and applies tasks through the backend. | `docs/runbooks/add-agent-role.md` |
+| Kickoff planning | `apps/runner/kickoff.py`, `apps/runner/kickoff_runtime.py`, `apps/api/src/routes/internal-plan-apply.js` | Generates sprint plans and applies tasks through the backend. | `apps/runner/README.md` |
