@@ -116,7 +116,7 @@ python3 -m apps.runner.tests
 ## MCP status
 
 Non-dry-run execution spawns `codex mcp-server` per intent and calls the MCP `codex` tool once per intent.
-See `docs/runner-contract.md`.
+See `docs/contracts/runner-contract.md`.
 
 Worker sandbox policy:
 - `EXECUTOR` runs with `danger-full-access` sandbox so backend endpoint calls can succeed.

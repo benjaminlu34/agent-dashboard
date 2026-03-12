@@ -1,4 +1,4 @@
-# Adding Agent Roles
+# Add an Agent Role
 
 ## 1) Overview
 This document defines the required process for adding a new AI agent role to this repository architecture (bundle loader, preflight, policy gating, and runner endpoints).

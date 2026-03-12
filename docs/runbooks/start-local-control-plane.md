@@ -1,4 +1,4 @@
-# Quickstart
+# Start Local Control Plane
 
 This guide covers the fastest setup path using the local dashboard.
 

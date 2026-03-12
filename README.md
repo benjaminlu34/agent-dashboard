@@ -32,7 +32,7 @@ What still needs to be done for deploy-grade alpha:
 - `apps/orchestrator`: scheduler/dispatcher CLI that emits JSON run intents.
 - `apps/runner`: Python runner that executes run intents and automates promotion/review handling.
 - `apps/web`: scaffold only (not active runtime).
-- `docs/`: design, runbooks, and orchestration docs.
+- `docs/`: layered agent docs with runbooks, contracts, architecture notes, and navigation metadata.
 
 ## Prerequisites
 
@@ -257,10 +257,15 @@ Target identity precedence is deterministic:
 
 ## Key Docs
 
-- `docs/running-orchestrator-against-target-repo.md`
-- `docs/infra-repo-direction.md`
-- `docs/executor-v1.md`
-- `docs/reviewer-v1-runbook.md`
-- `docs/agent-orchestrator.md`
-- `docs/runner-contract.md`
+- `docs/README.md`
+- `docs/runbooks/start-local-control-plane.md`
+- `docs/runbooks/run-against-target-repo.md`
+- `docs/runbooks/executor-v1.md`
+- `docs/runbooks/reviewer-v1.md`
+- `docs/contracts/runner-contract.md`
+- `docs/contracts/orchestrator-dispatch.md`
+- `docs/contracts/agent-context-bundle.md`
+- `docs/contracts/endpoint-contracts.md`
+- `docs/architecture/infra-repo-direction.md`
+- `docs/architecture/module-map.md`
 - `apps/runner/README.md`
