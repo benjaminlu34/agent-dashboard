@@ -1,4 +1,4 @@
-# Infra Repo Direction (Phase 2)
+# Infra Repo Direction
 
 ## Candidate Models
 

@@ -1,4 +1,4 @@
-# Reviewer v1 Runbook (Single Issue)
+# Reviewer v1 Runbook
 
 This runbook defines a minimal Reviewer v1 workflow. Reviewer is comment-only for review artifacts; runner performs status handoff on reviewer `PASS`.
 

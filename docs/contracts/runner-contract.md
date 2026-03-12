@@ -1,4 +1,4 @@
-# Runner Contract (Mode A)
+# Runner Contract
 
 This document defines the runner's inputs/outputs and the non-negotiable safety contract.
 

@@ -1,3 +1,5 @@
+# Orchestrator Dispatch Contract
+
 ## 1. Purpose
 Define how the orchestrator runs role-scoped agents by wrapping the base prompt with role and policy context, so behavior is deterministic, auditable, and governance-compliant.
 

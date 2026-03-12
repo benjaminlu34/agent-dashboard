@@ -1,3 +1,23 @@
+## Agent Command Center
+
+### Repo Map
+- **API** (`apps/api`): policy enforcement, internal routes, preflight, metadata, and state transitions.
+- **Runner** (`apps/runner`): Python worker execution loop, Codex MCP calls, watchdogs, and recovery paths.
+- **Orchestrator** (`apps/orchestrator`): dispatch planning, scheduler state, and `RUN_INTENT` emission.
+
+### Common Task Navigation
+| Task | Primary Doc | Key Files |
+| --- | --- | --- |
+| Modify Agent Logic | `docs/runbooks/executor-v1.md` | `apps/runner/codex_worker.py` |
+| Update API Routes | `docs/contracts/endpoint-contracts.md` | `apps/api/src/index.js`, `apps/api/src/routes/` |
+| Change Permissions | `docs/contracts/agent-context-bundle.md` | `policy/role-permissions.json` |
+| Adjust Transitions | `docs/contracts/task-ownership.md` | `policy/transitions.json` |
+
+### Invariants
+- The six-file bundle order is fixed and authoritative for every role run.
+- Backend state mutations must go through internal API routes; orchestrator and runner do not write GitHub project fields directly.
+- Changes under `apps/api` or runner intent/result contracts require corresponding tests in `apps/api/test/` or `apps/runner/tests/`.
+
 ## Repo Scope
 - DO NOT treat this repository as the product application repo; it is control-plane infrastructure for agent orchestration.
 - DO NOT add product features to `apps/web`; it is scaffold-only in this repo.
